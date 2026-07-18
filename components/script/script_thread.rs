@@ -20,10 +20,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::default::Default;
+#[cfg(feature = "v8-shadow")]
+use std::ffi::c_void;
 use std::option::Option;
 use std::rc::{Rc, Weak};
 use std::result::Result;
 use std::sync::Arc;
+#[cfg(feature = "v8-shadow")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -48,6 +52,8 @@ use embedder_traits::{
 use encoding_rs::Encoding;
 use fonts::{FontContext, SystemFontServiceProxy};
 use headers::{HeaderMapExt, LastModified, ReferrerPolicy as ReferrerPolicyHeader};
+#[cfg(feature = "v8-shadow")]
+use html5ever::local_name;
 use http::header::REFRESH;
 use hyper_serde::Serde;
 use ipc_channel::router::ROUTER;
@@ -56,6 +62,8 @@ use js::glue::GetWindowProxyClass;
 use js::jsapi::{GCReason, JSContext as UnsafeJSContext};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
+#[cfg(feature = "v8-shadow")]
+use js::rust::wrappers2::JS_IsExceptionPending;
 use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
@@ -122,6 +130,8 @@ use crate::dom::bindings::conversions::{
     ConversionResult, FromJSValConvertible, StringificationBehavior,
 };
 use crate::dom::bindings::inheritance::Castable;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
@@ -185,6 +195,99 @@ pub(crate) fn with_script_thread<R: Default>(f: impl FnOnce(&ScriptThread) -> R)
 // thread during parsing. For this reason, we don't trace the
 // incomplete parser contexts during GC.
 pub(crate) struct IncompleteParserContexts(RefCell<Vec<(PipelineId, ParserContext)>>);
+
+#[cfg(feature = "v8-shadow")]
+struct V8ShadowState {
+    runtime: servo_v8::Runtime,
+    realms: FxHashMap<PipelineId, V8ShadowRealm>,
+}
+
+#[cfg(feature = "v8-shadow")]
+struct V8ShadowRealm {
+    id: servo_v8::RealmId,
+    document_hidden_stats: Rc<V8DocumentHiddenStats>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[derive(Default)]
+struct V8DocumentHiddenStats {
+    getter_calls: Cell<u64>,
+    bg_color_getter_calls: Cell<u64>,
+    bg_color_setter_calls: Cell<u64>,
+}
+
+#[cfg(feature = "v8-shadow")]
+struct V8DocumentHost {
+    document: Trusted<Document>,
+    stats: Rc<V8DocumentHiddenStats>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: This host stays on the Document's originating script thread, roots
+// only for a synchronous callback, and never retains the ephemeral JSContext
+// or touches the V8 sidecar RefCell. The mutation path runs Servo's production
+// CEReactions wrapper and reports a SpiderMonkey exception as callback failure.
+unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
+    fn hidden(&self) -> bool {
+        self.stats
+            .getter_calls
+            .set(self.stats.getter_calls.get().wrapping_add(1));
+        self.document.root().hidden_state_for_v8()
+    }
+
+    fn bg_color(&self) -> String {
+        self.stats
+            .bg_color_getter_calls
+            .set(self.stats.bg_color_getter_calls.get().wrapping_add(1));
+        self.document
+            .root()
+            .get_body_attribute(&local_name!("bgcolor"))
+            .into()
+    }
+
+    unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative run API supplies its synchronously
+        // borrowed JSContext wrapper and clears the pointer before returning.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        self.stats
+            .bg_color_setter_calls
+            .set(self.stats.bg_color_setter_calls.get().wrapping_add(1));
+        let reactions = ScriptThread::custom_element_reaction_stack();
+        reactions.push_new_element_queue();
+        self.document.root().set_body_attribute(
+            cx,
+            &local_name!("bgcolor"),
+            DOMString::from(value),
+        );
+        reactions.pop_current_element_queue(cx);
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+}
+
+#[cfg(feature = "v8-document-hidden-diagnostic")]
+struct V8DocumentHiddenQueryGuard<'a>(&'a Cell<bool>);
+
+#[cfg(feature = "v8-document-hidden-diagnostic")]
+impl Drop for V8DocumentHiddenQueryGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+struct V8AuthoritativeScriptGuard<'a>(&'a Cell<bool>);
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+impl Drop for V8AuthoritativeScriptGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
 
 unsafe_no_jsmanaged_fields!(TaskQueue<MainThreadScriptMsg>);
 
@@ -324,6 +427,27 @@ pub struct ScriptThread {
     /// The JavaScript runtime.
     js_runtime: Rc<Runtime>,
 
+    /// A V8 compile shadow with an experimental production Document host.
+    /// SpiderMonkey remains authoritative except for explicitly selected
+    /// DOM getter experiments.
+    #[cfg(feature = "v8-shadow")]
+    #[no_trace]
+    v8_shadow: RefCell<Option<V8ShadowState>>,
+
+    /// Prevents nested borrowing of the V8 sidecar while V8 calls a native
+    /// Document host during an authoritative classic-script run.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    in_v8_authoritative_script: Cell<bool>,
+
+    /// Guards the synchronous V8 -> Rust `Document.hidden` callback against
+    /// accidentally borrowing the V8 sidecar recursively.
+    #[cfg(feature = "v8-document-hidden-diagnostic")]
+    in_v8_document_hidden: Cell<bool>,
+    #[cfg(feature = "v8-document-hidden-diagnostic")]
+    v8_document_hidden_reentrant_attempts: Cell<u64>,
+    #[cfg(feature = "v8-document-hidden-diagnostic")]
+    v8_document_hidden_fallbacks: Cell<u64>,
+
     /// List of pipelines that have been owned and closed by this script thread.
     #[no_trace]
     closed_pipelines: DomRefCell<FxHashSet<PipelineId>>,
@@ -428,11 +552,19 @@ pub struct ScriptThread {
 struct BHMExitSignal {
     closing: Arc<AtomicBool>,
     js_context: ThreadSafeJSContext,
+    #[cfg(feature = "v8-shadow")]
+    v8_interrupt: Arc<Mutex<Option<servo_v8::InterruptHandle>>>,
 }
 
 impl BackgroundHangMonitorExitSignal for BHMExitSignal {
     fn signal_to_exit(&self) {
         self.closing.store(true, Ordering::SeqCst);
+        #[cfg(feature = "v8-shadow")]
+        if let Ok(interrupt) = self.v8_interrupt.lock()
+            && let Some(interrupt) = interrupt.as_ref()
+        {
+            let _ = interrupt.terminate_execution();
+        }
         self.js_context.request_interrupt_callback();
     }
 }
@@ -467,6 +599,12 @@ impl<'a> ScriptMemoryFailsafe<'a> {
 impl Drop for ScriptMemoryFailsafe<'_> {
     fn drop(&mut self) {
         if let Some(owner) = self.owner {
+            #[cfg(feature = "v8-shadow")]
+            // V8 hosts contain Trusted<Document> roots. Make all V8 contexts
+            // inert and release those roots before SpiderMonkey realms are
+            // forcibly deallocated during panic unwinding.
+            drop(owner.v8_shadow.borrow_mut().take());
+
             for (_, document) in owner.documents.borrow().iter() {
                 document.window().clear_js_runtime_for_script_deallocation();
             }
@@ -548,6 +686,327 @@ impl ScriptThread {
 
     pub(crate) fn microtask_queue() -> Rc<MicrotaskQueue> {
         with_script_thread(|script_thread| script_thread.microtask_queue.clone())
+    }
+
+    /// Compile a real page script in V8 without executing it. Failures are
+    /// diagnostic only and never replace SpiderMonkey's result.
+    #[cfg(feature = "v8-shadow")]
+    pub(crate) fn shadow_compile_classic_script(
+        pipeline_id: PipelineId,
+        source: &str,
+        url: &ServoUrl,
+        line_number: u32,
+    ) {
+        with_optional_script_thread(|script_thread| {
+            let Some(script_thread) = script_thread else {
+                return;
+            };
+            let mut shadow = script_thread.v8_shadow.borrow_mut();
+            let Some(shadow) = shadow.as_mut() else {
+                return;
+            };
+            let Some(realm_id) = shadow.realms.get(&pipeline_id).map(|realm| realm.id) else {
+                debug!("V8 shadow has no realm for {pipeline_id}; skipping {url}:{line_number}");
+                return;
+            };
+            let result =
+                shadow
+                    .runtime
+                    .compile_in_realm(realm_id, source, url.as_str(), line_number);
+            if let Err(error) = result {
+                warn!("V8 shadow compile failed for {url}:{line_number}: {error}");
+            } else {
+                debug!("V8 shadow compiled {url}:{line_number}");
+            }
+        });
+    }
+
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn compile_authoritative_classic_script(
+        pipeline_id: PipelineId,
+        source: &str,
+        url: &ServoUrl,
+        line_number: u32,
+    ) -> Result<(servo_v8::RealmId, servo_v8::ScriptCompileOutcome), String> {
+        with_optional_script_thread(|script_thread| {
+            let script_thread = script_thread
+                .ok_or_else(|| "no current ScriptThread for authoritative V8 compile".to_owned())?;
+            if script_thread.in_v8_authoritative_script.get() {
+                return Err("re-entrant authoritative V8 classic-script compile".to_owned());
+            }
+            let mut slot = script_thread.v8_shadow.borrow_mut();
+            let shadow = slot
+                .as_mut()
+                .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned())?;
+            let realm_id = shadow
+                .realms
+                .get(&pipeline_id)
+                .map(|realm| realm.id)
+                .ok_or_else(|| format!("V8 shadow has no realm for {pipeline_id}"))?;
+            let outcome = shadow
+                .runtime
+                .compile_script_in_realm(realm_id, source, url.as_str(), line_number)
+                .map_err(|error| error.to_string())?;
+            Ok((realm_id, outcome))
+        })
+    }
+
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn run_authoritative_classic_script(
+        pipeline_id: PipelineId,
+        expected_realm_id: servo_v8::RealmId,
+        script_id: servo_v8::ScriptId,
+        cx: &mut JSContext,
+    ) -> Result<servo_v8::ScriptRunOutcome, String> {
+        with_optional_script_thread(|script_thread| {
+            let script_thread = script_thread
+                .ok_or_else(|| "no current ScriptThread for authoritative V8 run".to_owned())?;
+            if script_thread.in_v8_authoritative_script.replace(true) {
+                return Err("re-entrant authoritative V8 classic-script run".to_owned());
+            }
+            let _guard = V8AuthoritativeScriptGuard(&script_thread.in_v8_authoritative_script);
+            let mut slot = script_thread.v8_shadow.borrow_mut();
+            let shadow = slot
+                .as_mut()
+                .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned())?;
+            let actual_realm_id = shadow
+                .realms
+                .get(&pipeline_id)
+                .map(|realm| realm.id)
+                .ok_or_else(|| format!("V8 shadow has no realm for {pipeline_id}"))?;
+            if actual_realm_id != expected_realm_id {
+                return Err(format!(
+                    "V8 realm changed for {pipeline_id}: compiled in {expected_realm_id:?}, \
+                     current realm is {actual_realm_id:?}"
+                ));
+            }
+            // SAFETY: cx is synchronously borrowed for this call, the bridge
+            // clears it on every return path, and generated hosts cannot retain it.
+            unsafe {
+                shadow.runtime.run_script_in_realm_with_host_context(
+                    actual_realm_id,
+                    script_id,
+                    (cx as *mut JSContext).cast(),
+                )
+            }
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    #[cfg(feature = "v8-shadow")]
+    fn create_v8_shadow_realm(&self, pipeline_id: PipelineId, document: &Document) {
+        let mut reset_entire_state = false;
+        let result = {
+            let mut slot = self.v8_shadow.borrow_mut();
+            let shadow = slot
+                .as_mut()
+                .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned());
+            shadow.and_then(|shadow| {
+                if shadow.realms.contains_key(&pipeline_id) {
+                    return Err(format!("V8 shadow realm already exists for {pipeline_id}"));
+                }
+
+                let realm_id = shadow
+                    .runtime
+                    .create_realm()
+                    .map_err(|error| format!("realm creation failed: {error}"))?;
+                let stats = Rc::new(V8DocumentHiddenStats::default());
+                let host = V8DocumentHost {
+                    document: Trusted::new(document),
+                    stats: Rc::clone(&stats),
+                };
+                if let Err(error) = shadow.runtime.install_document_host(realm_id, host) {
+                    if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                        reset_entire_state = true;
+                        return Err(format!(
+                            "Document host installation failed: {error}; fresh realm cleanup \
+                             also failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(format!("Document host installation failed: {error}"));
+                }
+
+                let native_hidden = document.hidden_state_for_v8();
+                match shadow.runtime.document_hidden(realm_id) {
+                    Ok(v8_hidden) if v8_hidden == native_hidden => {},
+                    Ok(v8_hidden) => {
+                        if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                            reset_entire_state = true;
+                            return Err(format!(
+                                "initial Document.hidden mismatch (native={native_hidden}, \
+                                 V8={v8_hidden}); realm cleanup also failed: {cleanup_error}"
+                            ));
+                        }
+                        return Err(format!(
+                            "initial Document.hidden mismatch (native={native_hidden}, \
+                             V8={v8_hidden})"
+                        ));
+                    },
+                    Err(error) => {
+                        if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                            reset_entire_state = true;
+                            return Err(format!(
+                                "initial Document.hidden read failed: {error}; realm cleanup \
+                                 also failed: {cleanup_error}"
+                            ));
+                        }
+                        return Err(format!("initial Document.hidden read failed: {error}"));
+                    },
+                }
+
+                shadow.realms.insert(
+                    pipeline_id,
+                    V8ShadowRealm {
+                        id: realm_id,
+                        document_hidden_stats: stats,
+                    },
+                );
+                Ok(())
+            })
+        };
+
+        if reset_entire_state {
+            drop(self.v8_shadow.borrow_mut().take());
+        }
+
+        match result {
+            Ok(()) => debug!("V8 shadow created realm and Document host for {pipeline_id}"),
+            Err(error) => {
+                #[cfg(any(
+                    feature = "v8-classic-script-authoritative",
+                    feature = "v8-document-hidden-authoritative"
+                ))]
+                panic!("authoritative V8 realm initialization failed: {error}");
+
+                #[cfg(not(any(
+                    feature = "v8-classic-script-authoritative",
+                    feature = "v8-document-hidden-authoritative"
+                )))]
+                warn!("V8 shadow initialization failed for {pipeline_id}: {error}");
+            },
+        }
+    }
+
+    #[cfg(feature = "v8-shadow")]
+    fn destroy_v8_shadow_realm(&self, pipeline_id: PipelineId) {
+        let destruction_error = {
+            let mut slot = self.v8_shadow.borrow_mut();
+            let Some(shadow) = slot.as_mut() else {
+                return;
+            };
+            let Some(realm_id) = shadow.realms.get(&pipeline_id).map(|realm| realm.id) else {
+                return;
+            };
+            match shadow.runtime.destroy_realm(realm_id) {
+                Ok(()) => {
+                    let realm = shadow.realms.remove(&pipeline_id).unwrap();
+                    debug!(
+                        "V8 shadow destroyed realm for {pipeline_id} after {} Document.hidden, \
+                         {} Document.bgColor getter, and {} Document.bgColor setter host calls",
+                        realm.document_hidden_stats.getter_calls.get(),
+                        realm.document_hidden_stats.bg_color_getter_calls.get(),
+                        realm.document_hidden_stats.bg_color_setter_calls.get()
+                    );
+                    None
+                },
+                Err(error) => Some(error.to_string()),
+            }
+        };
+
+        if let Some(error) = destruction_error {
+            // A failed per-realm detach must not let its Trusted<Document>
+            // outlive SpiderMonkey teardown. Disposing the entire sidecar
+            // first makes every V8 context inert and drops every host.
+            drop(self.v8_shadow.borrow_mut().take());
+            warn!(
+                "V8 shadow realm destruction failed for {pipeline_id}; disposed the entire \
+                 sidecar before Document removal: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "v8-document-hidden-diagnostic")]
+    fn query_v8_document_hidden(&self, pipeline_id: PipelineId) -> Result<bool, String> {
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        if self.in_v8_authoritative_script.get() {
+            return Err(format!(
+                "cannot re-enter V8 Document.hidden during an authoritative script for \
+                 {pipeline_id}"
+            ));
+        }
+        if self.in_v8_document_hidden.get() {
+            let attempts = self
+                .v8_document_hidden_reentrant_attempts
+                .get()
+                .wrapping_add(1);
+            self.v8_document_hidden_reentrant_attempts.set(attempts);
+            return Err(format!(
+                "re-entrant V8 Document.hidden query for {pipeline_id} (attempt {attempts})"
+            ));
+        }
+
+        self.in_v8_document_hidden.set(true);
+        let _guard = V8DocumentHiddenQueryGuard(&self.in_v8_document_hidden);
+        let mut slot = self.v8_shadow.borrow_mut();
+        let shadow = slot
+            .as_mut()
+            .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned())?;
+        let realm_id = shadow
+            .realms
+            .get(&pipeline_id)
+            .map(|realm| realm.id)
+            .ok_or_else(|| format!("V8 shadow has no realm for {pipeline_id}"))?;
+        shadow
+            .runtime
+            .document_hidden(realm_id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(all(
+        feature = "v8-document-hidden-diagnostic",
+        not(feature = "v8-document-hidden-authoritative")
+    ))]
+    pub(crate) fn diagnose_v8_document_hidden(pipeline_id: PipelineId, native: bool) {
+        with_optional_script_thread(|script_thread| {
+            let Some(script_thread) = script_thread else {
+                warn!("cannot diagnose V8 Document.hidden without a current ScriptThread");
+                return;
+            };
+            match script_thread.query_v8_document_hidden(pipeline_id) {
+                Ok(v8) if v8 == native => {},
+                Ok(v8) => {
+                    warn!("V8 Document.hidden mismatch for {pipeline_id}: native={native}, V8={v8}")
+                },
+                Err(error) => {
+                    let fallbacks = script_thread
+                        .v8_document_hidden_fallbacks
+                        .get()
+                        .wrapping_add(1);
+                    script_thread.v8_document_hidden_fallbacks.set(fallbacks);
+                    warn!(
+                        "V8 Document.hidden diagnostic fell back to native for {pipeline_id} \
+                         (fallback {fallbacks}): {error}"
+                    );
+                },
+            }
+        });
+    }
+
+    #[cfg(feature = "v8-document-hidden-authoritative")]
+    pub(crate) fn v8_document_hidden_strict(pipeline_id: PipelineId) -> bool {
+        let result = with_optional_script_thread(|script_thread| {
+            script_thread.map(|script_thread| script_thread.query_v8_document_hidden(pipeline_id))
+        });
+        match result {
+            Some(Ok(hidden)) => hidden,
+            Some(Err(error)) => {
+                panic!("authoritative V8 Document.hidden query failed for {pipeline_id}: {error}")
+            },
+            None => panic!(
+                "authoritative V8 Document.hidden query has no current ScriptThread for \
+                 {pipeline_id}"
+            ),
+        }
     }
 
     pub(crate) fn shared_style_locks(&self) -> &SharedRwLocks {
@@ -922,9 +1381,13 @@ impl ScriptThread {
         let task_queue = TaskQueue::new(self_receiver, self_sender.clone());
 
         let closing = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "v8-shadow")]
+        let v8_interrupt = Arc::new(Mutex::new(None));
         let background_hang_monitor_exit_signal = BHMExitSignal {
             closing: closing.clone(),
             js_context: runtime.thread_safe_js_context(),
+            #[cfg(feature = "v8-shadow")]
+            v8_interrupt: Arc::clone(&v8_interrupt),
         };
 
         let background_hang_monitor = background_hang_monitor_register.register_component(
@@ -994,6 +1457,35 @@ impl ScriptThread {
                 },
             ));
 
+        #[cfg(feature = "v8-shadow")]
+        let v8_shadow = match servo_v8::Runtime::new(servo_v8::Options::default()) {
+            Ok(runtime) => {
+                *v8_interrupt.lock().unwrap() = Some(runtime.interrupt_handle());
+                Some(V8ShadowState {
+                    runtime,
+                    realms: FxHashMap::default(),
+                })
+            },
+            Err(error) => {
+                #[cfg(any(
+                    feature = "v8-classic-script-authoritative",
+                    feature = "v8-document-hidden-authoritative"
+                ))]
+                {
+                    panic!("authoritative V8 runtime initialization failed: {error}");
+                }
+
+                #[cfg(not(any(
+                    feature = "v8-classic-script-authoritative",
+                    feature = "v8-document-hidden-authoritative"
+                )))]
+                {
+                    warn!("V8 shadow runtime initialization failed: {error}");
+                    None
+                }
+            },
+        };
+
         (
             Rc::new_cyclic(|weak_script_thread| {
                 runtime.set_script_thread(weak_script_thread.clone());
@@ -1014,6 +1506,16 @@ impl ScriptThread {
                     timer_scheduler: Default::default(),
                     microtask_queue,
                     js_runtime: Rc::new(runtime),
+                    #[cfg(feature = "v8-shadow")]
+                    v8_shadow: RefCell::new(v8_shadow),
+                    #[cfg(feature = "v8-classic-script-authoritative")]
+                    in_v8_authoritative_script: Cell::new(false),
+                    #[cfg(feature = "v8-document-hidden-diagnostic")]
+                    in_v8_document_hidden: Cell::new(false),
+                    #[cfg(feature = "v8-document-hidden-diagnostic")]
+                    v8_document_hidden_reentrant_attempts: Cell::new(0),
+                    #[cfg(feature = "v8-document-hidden-diagnostic")]
+                    v8_document_hidden_fallbacks: Cell::new(0),
                     closed_pipelines: DomRefCell::new(FxHashSet::default()),
                     mutation_observers: Default::default(),
                     system_font_service: Arc::new(state.system_font_service.to_proxy()),
@@ -1061,6 +1563,11 @@ impl ScriptThread {
 
     /// We are closing, ensure no script can run and potentially hang.
     fn prepare_for_shutdown_inner(&self) {
+        #[cfg(feature = "v8-shadow")]
+        // Shutdown can bypass normal per-pipeline exit. Detach V8 first while
+        // every Trusted<Document> still refers to a live SpiderMonkey realm.
+        drop(self.v8_shadow.borrow_mut().take());
+
         let docs = self.documents.borrow();
         for (_, document) in docs.iter() {
             document
@@ -1328,10 +1835,10 @@ impl ScriptThread {
             .iter()
             .any(|(_, document)| document.needs_rendering_update(no_gc));
         let running_animations = self.documents.borrow().iter().any(|(_, document)| {
-            document.is_fully_active() &&
-                !document.window().throttled() &&
-                (document.animations().running_animation_count() != 0 ||
-                    document.has_active_request_animation_frame_callbacks())
+            document.is_fully_active()
+                && !document.window().throttled()
+                && (document.animations().running_animation_count() != 0
+                    || document.has_active_request_animation_frame_callbacks())
         });
 
         // If we are not running animations and no rendering update is
@@ -1769,9 +2276,9 @@ impl ScriptThread {
         };
         let task_duration = start.elapsed();
         for (doc_id, doc) in self.documents.borrow().iter() {
-            if let Some(pipeline_id) = pipeline_id &&
-                pipeline_id == doc_id &&
-                task_duration.as_nanos() > MAX_TASK_NS
+            if let Some(pipeline_id) = pipeline_id
+                && pipeline_id == doc_id
+                && task_duration.as_nanos() > MAX_TASK_NS
             {
                 if opts::get()
                     .debug
@@ -1952,9 +2459,9 @@ impl ScriptThread {
                     document.handle_no_longer_waiting_on_asynchronous_image_updates();
                 }
             },
-            msg @ ScriptThreadMessage::SpawnPipeline(..) |
-            msg @ ScriptThreadMessage::ExitFullScreen(..) |
-            msg @ ScriptThreadMessage::ExitScriptThread => {
+            msg @ ScriptThreadMessage::SpawnPipeline(..)
+            | msg @ ScriptThreadMessage::ExitFullScreen(..)
+            | msg @ ScriptThreadMessage::ExitScriptThread => {
                 panic!("should have handled {:?} already", msg)
             },
             ScriptThreadMessage::SetScrollStates(pipeline_id, scroll_states) => {
@@ -3228,6 +3735,9 @@ impl ScriptThread {
     ) {
         debug!("{pipeline_id}: Starting pipeline exit.");
 
+        #[cfg(feature = "v8-shadow")]
+        self.destroy_v8_shadow_realm(pipeline_id);
+
         // Abort the parser, if any,
         // to prevent any further incoming networking messages from being handled.
         let document = self.documents.borrow_mut().remove(pipeline_id);
@@ -3645,6 +4155,9 @@ impl ScriptThread {
 
         window.init_document(&document);
 
+        #[cfg(feature = "v8-shadow")]
+        self.create_v8_shadow_realm(incomplete.pipeline_id, &document);
+
         // Initialize the browsing context for the window.
         let window_proxy = self.window_proxies.local_window_proxy(
             cx,
@@ -4022,8 +4535,8 @@ impl ScriptThread {
             // we need to register an iframe entry to the performance timeline if present
             if let Some(window_proxy) = context
                 .get_document()
-                .and_then(|document| document.browsing_context()) &&
-                let Some(frame_element) = window_proxy.frame_element()
+                .and_then(|document| document.browsing_context())
+                && let Some(frame_element) = window_proxy.frame_element()
             {
                 let iframe_ctx = IframeContext::new(
                     frame_element
@@ -4226,8 +4739,8 @@ impl ScriptThread {
             return;
         };
 
-        if let Some(window) = self.documents.borrow().find_window(pipeline_id) &&
-            window.live_devtools_updates()
+        if let Some(window) = self.documents.borrow().find_window(pipeline_id)
+            && window.live_devtools_updates()
         {
             let css_error = CSSError {
                 filename,
@@ -4454,6 +4967,11 @@ impl ScriptThread {
 
 impl Drop for ScriptThread {
     fn drop(&mut self) {
+        #[cfg(feature = "v8-shadow")]
+        // Field declaration order would otherwise drop documents and the
+        // SpiderMonkey runtime before this sidecar's Trusted<Document> hosts.
+        drop(self.v8_shadow.get_mut().take());
+
         SCRIPT_THREAD_ROOT.with(|root| {
             root.set(None);
         });

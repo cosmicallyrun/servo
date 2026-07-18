@@ -1,0 +1,18 @@
+[package]
+name = "servo-v8"
+build = "build.rs"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+repository.workspace = true
+description = "Experimental Servo–V8 compile-shadow and binding bridge"
+links = "servo_v8_bridge"
+
+[build-dependencies]
+cc = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

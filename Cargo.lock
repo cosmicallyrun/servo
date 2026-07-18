@@ -9008,6 +9008,7 @@ dependencies = [
  "servo-timers",
  "servo-tracing",
  "servo-url",
+ "servo-v8",
  "servo-webgpu-traits",
  "servo-webxr-api",
  "servo-xpath",
@@ -9189,6 +9190,13 @@ dependencies = [
  "servo_arc",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "servo-v8"
+version = "0.4.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -9388,6 +9396,7 @@ dependencies = [
  "servo",
  "servo-allocator",
  "servo-base",
+ "servo-v8",
  "servo-webdriver-server",
  "signal-hook-registry",
  "surfman",

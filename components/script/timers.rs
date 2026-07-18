@@ -38,7 +38,9 @@ use crate::dom::csp::CspReporting;
 use crate::dom::document::RefreshRedirectDue;
 use crate::dom::eventsource::EventSourceTimeoutCallback;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::globalscope::script_execution::{ErrorReporting, RethrowErrors};
+use crate::dom::globalscope::script_execution::{
+    ClassicScriptEngine, ErrorReporting, RethrowErrors,
+};
 #[cfg(feature = "testbinding")]
 use crate::dom::testbinding::TestBindingCallback;
 use crate::dom::trustedtypes::trustedscript::TrustedScript;
@@ -816,6 +818,7 @@ impl JsTimerTask {
                     Some(IntroductionType::DOM_TIMER),
                     1,
                     false,
+                    ClassicScriptEngine::SpiderMonkey,
                 );
 
                 // Step 9.6.9. Run the classic script script.

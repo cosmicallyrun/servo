@@ -67,7 +67,9 @@ use crate::dom::csp::{GlobalCspReporting, Violation, parse_csp_list_from_metadat
 use crate::dom::debugger::debuggerglobalscope::DebuggerGlobalScope;
 use crate::dom::dedicatedworkerglobalscope::DedicatedWorkerGlobalScope;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::globalscope::script_execution::{ErrorReporting, RethrowErrors};
+use crate::dom::globalscope::script_execution::{
+    ClassicScriptEngine, ErrorReporting, RethrowErrors,
+};
 use crate::dom::htmlscriptelement::{SCRIPT_JS_MIMES, Script};
 use crate::dom::idbfactory::IDBFactory;
 use crate::dom::performance::performance::Performance;
@@ -229,6 +231,7 @@ impl FetchResponseListener for ScriptFetchContext {
             Some(IntroductionType::WORKER),
             1,
             true,
+            ClassicScriptEngine::SpiderMonkey,
         );
 
         // Step 6 Run onComplete given script.
@@ -613,7 +616,9 @@ impl WorkerGlobalScope {
     pub(crate) fn on_complete(&self, cx: &mut JSContext, script: Option<Script>) {
         // Step 1. If script is null or if script's error to rethrow is non-null, then:
         let script = match script {
-            Some(Script::Classic(script)) if script.record.is_ok() => Script::Classic(script),
+            Some(Script::Classic(script)) if script.record.as_ref().is_some_and(Result::is_ok) => {
+                Script::Classic(script)
+            },
             Some(Script::Module(module_tree))
                 if module_tree.get_rethrow_error().borrow().is_none() =>
             {
@@ -811,6 +816,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
                 Some(IntroductionType::WORKER),
                 1,
                 true,
+                ClassicScriptEngine::SpiderMonkey,
             );
 
             // Run the classic script script, with rethrow errors set to true.

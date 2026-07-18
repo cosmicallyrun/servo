@@ -51,7 +51,9 @@ use crate::dom::element::{
 };
 use crate::dom::event::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::globalscope::script_execution::{ClassicScript, ErrorReporting, RethrowErrors};
+use crate::dom::globalscope::script_execution::{
+    ClassicScript, ClassicScriptEngine, ErrorReporting, RethrowErrors,
+};
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{ChildrenMutation, CloneChildrenFlag, Node, NodeTraits, UnbindContext};
@@ -289,6 +291,8 @@ struct ClassicContext {
     fetch_options: ScriptFetchOptions,
     /// Used to set muted errors flag of classic scripts
     response_was_cors_cross_origin: bool,
+    /// Engine selected once during script-element preparation.
+    engine: ClassicScriptEngine,
 }
 
 impl FetchResponseListener for ClassicContext {
@@ -402,6 +406,7 @@ impl FetchResponseListener for ClassicContext {
             Some(IntroductionType::SRC_SCRIPT),
             1,
             true,
+            self.engine,
         );
 
         /*
@@ -506,6 +511,7 @@ fn fetch_a_classic_script(
     cors_setting: Option<CorsSettings>,
     options: ScriptFetchOptions,
     character_encoding: &'static Encoding,
+    engine: ClassicScriptEngine,
 ) {
     // Step 1, 2.
     let doc = script.owner_document();
@@ -532,6 +538,7 @@ fn fetch_a_classic_script(
         status: Ok(()),
         fetch_options: options,
         response_was_cors_cross_origin: false,
+        engine,
     };
     doc.fetch_background(request, context);
 }
@@ -770,6 +777,19 @@ impl HTMLScriptElement {
 
         let kind = self.get_script_kind(script_type);
         let delayed_document = self.get_script_active_document(kind);
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        let classic_script_engine = if script_type == ScriptType::Classic
+            && matches!(kind, ExternalScriptKind::ParsingBlocking)
+            && element
+                .get_attribute_string_value(&LocalName::from("data-servo-v8"))
+                .is_some_and(|value| value == "authoritative")
+        {
+            ClassicScriptEngine::V8Authoritative
+        } else {
+            ClassicScriptEngine::SpiderMonkey
+        };
+        #[cfg(not(feature = "v8-classic-script-authoritative"))]
+        let classic_script_engine = ClassicScriptEngine::SpiderMonkey;
 
         // Step 31. If el has a src content attribute, then:
         // Step 31.2. Let src be the value of el's src attribute.
@@ -819,7 +839,15 @@ impl HTMLScriptElement {
             match script_type {
                 ScriptType::Classic => {
                     // Step 31.11. Fetch a classic script.
-                    fetch_a_classic_script(self, kind, url, cors_setting, options, encoding);
+                    fetch_a_classic_script(
+                        self,
+                        kind,
+                        url,
+                        cors_setting,
+                        options,
+                        encoding,
+                        classic_script_engine,
+                    );
                 },
                 ScriptType::Module => {
                     // If el does not have an integrity attribute, then set options's integrity metadata to
@@ -867,6 +895,7 @@ impl HTMLScriptElement {
                         introduction_type,
                         self.line_number as u32,
                         false,
+                        classic_script_engine,
                     );
                     let result = Ok(Script::Classic(script));
 

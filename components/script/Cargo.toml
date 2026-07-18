@@ -25,6 +25,10 @@ js_jit = ["js/jit"]
 profilemozjs = ['js/profilemozjs']
 testbinding = ["script_bindings/testbinding"]
 tracing = ["dep:tracing", "script_bindings/tracing"]
+v8-shadow = ["dep:servo-v8"]
+v8-classic-script-authoritative = ["v8-shadow"]
+v8-document-hidden-diagnostic = ["v8-shadow"]
+v8-document-hidden-authoritative = ["v8-document-hidden-diagnostic"]
 webgl_backtrace = ["servo-canvas-traits/webgl_backtrace"]
 webgpu = [
     "dep:webgpu_traits",
@@ -143,6 +147,7 @@ servo-geometry = { workspace = true }
 servo-media = { workspace = true }
 servo-tracing = { workspace = true }
 servo-url = { workspace = true }
+servo-v8 = { workspace = true, optional = true }
 servo_arc = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
