@@ -11,8 +11,9 @@ barriers, so incremental or concurrent tracing would be unsound.
 
 The expected checkout layout is `servo/` and `v8/` as sibling directories. Set
 `SERVO_V8_ROOT` to use another V8 checkout and `SERVO_V8_OUT_DIR` to use another
-GN output directory. After syncing the V8 DEPS checkout, configure and build the
-native M-series artifact with:
+GN output directory. The currently validated V8 revision is
+`72b8a475dfd36cb28cc9c536f01f7fbdebe74a36`. After checking out that revision
+and syncing its DEPS, configure and build the native M-series artifact with:
 
 ```sh
 v8_root="${SERVO_V8_ROOT:-../v8}"
@@ -61,17 +62,18 @@ collections with an explicit no-heap-pointers stack state so conservative
 stack scanning cannot hide a broken edge or make the test flaky.
 
 The first production binding slice is generated separately from the enabled
-`Document.hidden` declaration in Servo's real
+`Document.hidden` and `Document.bgColor` declarations in Servo's real
 `components/script_bindings/webidls/Document.webidl`. Each pipeline realm owns
-a stable V8 `document` facade. Its native accessor recovers tagged per-context
-embedder state from the holder's creation context and calls a typed Rust C ABI
-thunk. The Rust host owns a `Trusted<Document>` rather than a raw DOM pointer;
+a stable V8 `document` facade. Its native accessors recover tagged per-context
+embedder state from the holder's creation context and call typed Rust C ABI
+thunks. The Rust host owns a `Trusted<Document>` rather than a raw DOM pointer;
 realm destruction first detaches and resets all V8 handles, then drops that
-host synchronously and exactly once. The callback roots briefly for a pure
-visibility-state `Cell` read. It cannot re-enter V8/cppgc or the Servo sidecar
-`RefCell`, and a C++/Rust reentry barrier turns accidental recursion into a
-deterministic failure. Failed installation leaves ownership with Rust, so
-every host transfer is transactional.
+host synchronously and exactly once. The callbacks root the live Servo document
+for the operation. The `bgColor` setter uses Servo's production CEReactions
+stack and an owned UTF-8 transfer across the C ABI. A C++/Rust reentry barrier
+turns accidental recursive entry into a deterministic failure. Failed
+installation leaves ownership with Rust, so every host transfer is
+transactional.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -105,6 +107,22 @@ hosts, reentrant callbacks, or failed reads abort the experiment rather than
 silently returning Servo's native value. It makes only `document.hidden`
 V8-authoritative; SpiderMonkey still parses and executes page JavaScript and
 owns all other DOM bindings.
+
+An additional non-default experiment makes one tightly scoped classic script
+V8-authoritative:
+
+```sh
+cargo build -p servoshell --features v8-classic-script-authoritative
+```
+
+Only a parser-inserted, parsing-blocking classic script with the exact
+`data-servo-v8="authoritative"` attribute takes this path. Servo still performs
+the normal HTML fetch, CSP, ordering, and settings-stack work, but V8 alone
+compiles and executes that script. Async, defer, dynamic, module, timer, worker,
+and service-worker scripts remain on SpiderMonkey. The current visible host
+surface is deliberately limited to `window`, `document.hidden`, and
+`document.bgColor`. V8 microtask checkpoint integration is not implemented, so
+this mode must not yet be used for promise- or microtask-dependent scripts.
 
 Run with a debug log filter to see each source accepted by V8:
 
