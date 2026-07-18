@@ -34,6 +34,8 @@ use crate::realms::enter_auto_realm;
 use crate::script_module::{
     ModuleScript, ModuleSource, ModuleTree, RethrowError, ScriptFetchOptions,
 };
+#[cfg(feature = "v8-shadow")]
+use crate::script_thread::ScriptThread;
 use crate::unminify::unminify_js;
 
 /// <https://html.spec.whatwg.org/multipage/#classic-script>
@@ -42,7 +44,11 @@ pub(crate) struct ClassicScript {
     /// On script parsing success this will be <https://html.spec.whatwg.org/multipage/#concept-script-record>
     /// On failure <https://html.spec.whatwg.org/multipage/#concept-script-error-to-rethrow>
     #[ignore_malloc_size_of = "mozjs"]
-    pub record: Result<RootedTraceableBox<Heap<*mut JSScript>>, RethrowError>,
+    pub record: Option<Result<RootedTraceableBox<Heap<*mut JSScript>>, RethrowError>>,
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    #[no_trace]
+    #[ignore_malloc_size_of = "V8-owned classic-script handle"]
+    v8_record: Option<V8ClassicScriptRecord>,
     /// <https://html.spec.whatwg.org/multipage/#concept-script-script-fetch-options>
     fetch_options: ScriptFetchOptions,
     /// <https://html.spec.whatwg.org/multipage/#concept-script-base-url>
@@ -50,6 +56,23 @@ pub(crate) struct ClassicScript {
     url: ServoUrl,
     /// <https://html.spec.whatwg.org/multipage/#muted-errors>
     muted_errors: ErrorReporting,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ClassicScriptEngine {
+    SpiderMonkey,
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    V8Authoritative,
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+enum V8ClassicScriptRecord {
+    Compiled {
+        realm_id: servo_v8::RealmId,
+        script_id: servo_v8::ScriptId,
+    },
+    ParseError(servo_v8::ScriptException),
+    InternalFailure(String),
 }
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
@@ -87,8 +110,9 @@ impl GlobalScope {
         introduction_type: Option<&'static CStr>,
         line_number: u32,
         external: bool,
+        engine: ClassicScriptEngine,
     ) -> ClassicScript {
-        let mut source = if self.unminified_js_dir().is_some() {
+        let source = if self.unminified_js_dir().is_some() {
             let mut script_source = ModuleSource {
                 source,
                 unminified_dir: self.unminified_js_dir(),
@@ -96,10 +120,44 @@ impl GlobalScope {
                 url: url.clone(),
             };
             unminify_js(&mut script_source);
-            transform_str_to_source_text(&script_source.source)
+            script_source.source
         } else {
-            transform_str_to_source_text(&source)
+            source
         };
+        #[cfg(feature = "v8-shadow")]
+        if matches!(engine, ClassicScriptEngine::SpiderMonkey) {
+            ScriptThread::shadow_compile_classic_script(
+                self.pipeline_id(),
+                source.as_ref(),
+                &url,
+                line_number,
+            );
+        }
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        let v8_record = if matches!(engine, ClassicScriptEngine::V8Authoritative) {
+            Some(
+                match ScriptThread::compile_authoritative_classic_script(
+                    self.pipeline_id(),
+                    source.as_ref(),
+                    &url,
+                    line_number,
+                ) {
+                    Ok((realm_id, servo_v8::ScriptCompileOutcome::Compiled(script_id))) => {
+                        V8ClassicScriptRecord::Compiled {
+                            realm_id,
+                            script_id,
+                        }
+                    },
+                    Ok((_, servo_v8::ScriptCompileOutcome::ParseError(exception))) => {
+                        V8ClassicScriptRecord::ParseError(exception)
+                    },
+                    Err(error) => V8ClassicScriptRecord::InternalFailure(error),
+                },
+            )
+        } else {
+            None
+        };
+        let mut source = transform_str_to_source_text(&source);
 
         // TODO Step 1. If mutedErrors is true, then set baseURL to about:blank.
 
@@ -109,27 +167,33 @@ impl GlobalScope {
 
         // TODO Step 9. Record classic script creation time given script and sourceURLForWindowScripts.
 
-        let options = fill_compile_options(
-            cx,
-            url.as_str(),
-            introduction_type,
-            muted_errors,
-            true, // noScriptRval
-            line_number,
-        );
+        let record = match engine {
+            ClassicScriptEngine::SpiderMonkey => {
+                let options = fill_compile_options(
+                    cx,
+                    url.as_str(),
+                    introduction_type,
+                    muted_errors,
+                    true, // noScriptRval
+                    line_number,
+                );
 
-        // Step 10. Let result be ParseScript(source, settings's realm, script).
-        rooted!(&in(cx) let compiled_script = unsafe { Compile1(cx, options.ptr, &mut source) });
+                // Step 10. Let result be ParseScript(source, settings's realm, script).
+                rooted!(&in(cx) let compiled_script = unsafe { Compile1(cx, options.ptr, &mut source) });
 
-        // Step 11. If result is a list of errors, then:
-        let record = if compiled_script.get().is_null() {
-            // Step 11.1. Set script's parse error and its error to rethrow to result[0].
-            // Step 11.2. Return script.
-            Err(RethrowError::from_pending_exception(cx))
-        } else {
-            Ok(RootedTraceableBox::from_box(Heap::boxed(
-                compiled_script.get(),
-            )))
+                // Step 11. If result is a list of errors, then:
+                Some(if compiled_script.get().is_null() {
+                    // Step 11.1. Set script's parse error and its error to rethrow to result[0].
+                    // Step 11.2. Return script.
+                    Err(RethrowError::from_pending_exception(cx))
+                } else {
+                    Ok(RootedTraceableBox::from_box(Heap::boxed(
+                        compiled_script.get(),
+                    )))
+                })
+            },
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            ClassicScriptEngine::V8Authoritative => None,
         };
 
         // Step 3. Let script be a new classic script that this algorithm will subsequently initialize.
@@ -140,6 +204,8 @@ impl GlobalScope {
         // Step 13. Return script.
         ClassicScript {
             record,
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            v8_record,
             url,
             fetch_options,
             muted_errors,
@@ -161,6 +227,43 @@ impl GlobalScope {
             return Ok(());
         }
 
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        if let Some(v8_record) = script.v8_record {
+            assert!(
+                matches!(rethrow_errors, RethrowErrors::No),
+                "V8-authoritative classic scripts currently support only HTML's non-rethrow path"
+            );
+            let muted_errors = script.muted_errors;
+            let mut realm = enter_auto_realm(cx, self);
+            let cx = &mut realm.current_realm();
+            return run_a_script::<DomTypeHolder, _, _>(cx, self, |cx| match v8_record {
+                V8ClassicScriptRecord::Compiled {
+                    realm_id,
+                    script_id,
+                } => match ScriptThread::run_authoritative_classic_script(
+                    self.pipeline_id(),
+                    realm_id,
+                    script_id,
+                    cx,
+                ) {
+                    Ok(servo_v8::ScriptRunOutcome::Completed) => Ok(()),
+                    Ok(servo_v8::ScriptRunOutcome::Thrown(exception)) => {
+                        self.report_v8_classic_script_error(cx, exception, muted_errors)
+                    },
+                    Ok(servo_v8::ScriptRunOutcome::Terminated) => Err(Error::JSFailed),
+                    Err(error) => panic!(
+                        "authoritative V8 classic-script execution failed internally: {error}"
+                    ),
+                },
+                V8ClassicScriptRecord::ParseError(exception) => {
+                    self.report_v8_classic_script_error(cx, exception, muted_errors)
+                },
+                V8ClassicScriptRecord::InternalFailure(error) => {
+                    panic!("authoritative V8 classic-script compilation failed internally: {error}")
+                },
+            });
+        }
+
         // TODO Step 3. Record classic script execution start time given script.
 
         let mut realm = enter_auto_realm(cx, self);
@@ -172,7 +275,10 @@ impl GlobalScope {
             // Step 5. Let evaluationStatus be null.
             let mut result = false;
 
-            match script.record {
+            match script
+                .record
+                .expect("SpiderMonkey classic script must have a SpiderMonkey record")
+            {
                 // Step 6. If script's error to rethrow is not null, then set evaluationStatus to ThrowCompletion(script's error to rethrow).
                 Err(error_to_rethrow) => unsafe {
                     JS_SetPendingException(
@@ -255,6 +361,29 @@ impl GlobalScope {
         })
     }
 
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    fn report_v8_classic_script_error(
+        &self,
+        cx: &mut JSContext,
+        exception: servo_v8::ScriptException,
+        muted_errors: ErrorReporting,
+    ) -> ErrorResult {
+        let error_info = match muted_errors {
+            ErrorReporting::Unmuted => ErrorInfo {
+                message: exception.message,
+                filename: exception.resource_name,
+                lineno: exception.line_number,
+                column: exception.column_number,
+            },
+            ErrorReporting::Muted => ErrorInfo {
+                message: String::from("Script error."),
+                ..Default::default()
+            },
+        };
+        self.report_an_error(cx, error_info, HandleValue::null());
+        Err(Error::JSFailed)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#run-a-module-script>
     pub(crate) fn run_a_module_script(
         &self,
@@ -319,8 +448,8 @@ impl GlobalScope {
         // does not have its sandboxed scripts browsing context flag set.
         if let Some(window) = self.downcast::<Window>() {
             let doc = window.Document();
-            doc.is_fully_active() &&
-                !doc.has_active_sandboxing_flag(
+            doc.is_fully_active()
+                && !doc.has_active_sandboxing_flag(
                     SandboxingFlagSet::SANDBOXED_SCRIPTS_BROWSING_CONTEXT_FLAG,
                 )
         } else {

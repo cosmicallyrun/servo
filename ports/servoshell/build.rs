@@ -31,12 +31,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let out = Path::new(&out);
     let krate = out.parent().unwrap();
     let build = krate.parent().unwrap();
-    let profile = build
-        .parent()
-        .unwrap()
-        .file_name()
-        .unwrap()
-        .to_string_lossy();
+    let profile_dir = build.parent().unwrap();
+    let profile = profile_dir.file_name().unwrap().to_string_lossy();
     if profile == "production" || profile.starts_with("production-") {
         println!("cargo:rustc-cfg=servo_production");
     } else {
@@ -47,6 +43,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     // and not the target platform
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap();
+
+    if target_os == "macos" && std::env::var_os("CARGO_FEATURE_V8_SHADOW").is_some() {
+        let dylib = std::env::var("DEP_SERVO_V8_BRIDGE_DYLIB_PATH")?;
+        let dylib = Path::new(&dylib);
+        assert!(
+            dylib.exists(),
+            "missing Servo V8 bridge dylib at {}",
+            dylib.display()
+        );
+        let lib_dir = profile_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir)?;
+        let installed_dylib = lib_dir.join(dylib.file_name().unwrap());
+        std::fs::copy(dylib, &installed_dylib)?;
+        println!("cargo:rerun-if-changed={}", dylib.display());
+    }
 
     if target_os == "windows" {
         #[cfg(windows)]

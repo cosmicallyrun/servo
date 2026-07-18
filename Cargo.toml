@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "components/media/examples",
+    "components/servo_v8",
     "components/xpath",
     "ffi/capi",
     "ports/servoshell",
@@ -325,6 +326,7 @@ script = { package = "servo-script", version = "=0.4.0", path = "components/scri
 script_bindings = { package = "servo-script-bindings", version = "=0.4.0", path = "components/script_bindings" }
 script_webgpu = { package = "servo-script-webgpu", version = "=0.4.0", path = "components/script_webgpu" }
 script_traits = { package = "servo-script-traits", version = "=0.4.0", path = "components/shared/script" }
+servo-v8 = { version = "=0.4.0", path = "components/servo_v8" }
 servo = { version = "=0.4.0", path = "components/servo", default-features = false }
 servo-allocator = { version = "=0.4.0", path = "components/allocator" }
 servo-background-hang-monitor = { version = "=0.4.0", path = "components/background_hang_monitor" }

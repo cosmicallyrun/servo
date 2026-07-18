@@ -60,6 +60,13 @@ tracing = [
     "script/tracing",
     "net/tracing",
 ]
+v8-shadow = ["script/v8-shadow"]
+v8-classic-script-authoritative = ["v8-shadow", "script/v8-classic-script-authoritative"]
+v8-document-hidden-diagnostic = ["v8-shadow", "script/v8-document-hidden-diagnostic"]
+v8-document-hidden-authoritative = [
+    "v8-document-hidden-diagnostic",
+    "script/v8-document-hidden-authoritative",
+]
 vello = ["servo-constellation/vello"]
 webgl_backtrace = [
     "script/webgl_backtrace",
