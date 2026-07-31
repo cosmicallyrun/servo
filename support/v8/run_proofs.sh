@@ -29,6 +29,9 @@ proofs=(
   "authoritative_bgcolor_proof.html:(0, 255, 0):1:1"
   "authoritative_external_proof.html:(0, 255, 0):1:1"
   "authoritative_microtask_proof.html:(0, 255, 0):1:1"
+  "authoritative_defer_proof.html:(0, 255, 0):1:1"
+  "authoritative_async_proof.html:(0, 255, 0):1:1"
+  "authoritative_dynamic_proof.html:(0, 255, 0):1:1"
 )
 
 failures=0

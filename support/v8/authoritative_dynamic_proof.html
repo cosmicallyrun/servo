@@ -1,0 +1,34 @@
+<!doctype html>
+<!--
+Runtime proof that a dynamically inserted authoritative classic script runs on
+V8.
+
+Here SpiderMonkey executes the outer script and creates the element, then V8
+executes the inserted script. That crossing is the point: the two engines hand
+off within one page without either re-entering the other.
+
+Same counting argument as authoritative_bgcolor_proof.html: the body starts red
+and the script toggles document.bgColor once per execution, so lime is only
+reachable when V8 alone executed it exactly once.
+
+Run via support/v8/run_proofs.sh, or directly:
+
+  RUST_LOG=warn,script::script_thread=debug \
+    target/debug/servoshell -z -x --hard-fail -o /tmp/proof.png \
+      support/v8/authoritative_dynamic_proof.html
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative dynamic-insertion proof</title>
+
+  </head>
+  <body bgcolor="red">
+    <script>
+      var script = document.createElement("script");
+      script.setAttribute("data-servo-v8", "authoritative");
+      script.src = "authoritative_external.js";
+      document.body.appendChild(script);
+    </script>
+  </body>
+</html>

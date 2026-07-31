@@ -115,11 +115,22 @@ V8-authoritative:
 cargo build -p servoshell --features v8-classic-script-authoritative
 ```
 
-Only a parser-inserted, parsing-blocking classic script with the exact
-`data-servo-v8="authoritative"` attribute takes this path. Servo still performs
-the normal HTML fetch, CSP, ordering, and settings-stack work, but V8 alone
-compiles and executes that script. Async, defer, dynamic, module, timer, worker,
-and service-worker scripts remain on SpiderMonkey. The current visible host
+Any classic script with the exact `data-servo-v8="authoritative"` attribute
+takes this path, in every execution mode: parser-blocking, deferred, async,
+and dynamically inserted, inline or external. Servo still performs the normal
+HTML fetch, CSP, ordering, and settings-stack work, but V8 alone compiles and
+executes that script. Module, timer, worker, and service-worker scripts remain
+on SpiderMonkey.
+
+Every mode routes through the same create/run pair, so the engine choice does
+not depend on the script kind. Deferred and async scripts do widen the window
+between compiling into the realm and running it: a script is compiled when it
+is created and may not run until much later, by which time the pipeline can
+have exited and taken the realm with it. Both the compile and run sides
+therefore fail the script rather than aborting the process. That is still
+strict — nothing re-runs it on SpiderMonkey.
+
+The current visible host
 surface is deliberately limited to `window`, `document.hidden`, and
 `document.bgColor`.
 
@@ -170,13 +181,17 @@ Three proof pages use that same counting argument:
 | Page | Proves |
 | --- | --- |
 | `authoritative_bgcolor_proof.html` | V8 alone executes an inline parser-blocking script |
-| `authoritative_external_proof.html` | the same route already covers external scripts |
+| `authoritative_external_proof.html` | the same route covers external scripts |
 | `authoritative_microtask_proof.html` | the task-boundary microtask checkpoint runs, with a live host context |
+| `authoritative_defer_proof.html` | a deferred script runs on V8 after the widest compile-to-run window |
+| `authoritative_async_proof.html` | an async script runs on V8 off the parser's critical path |
+| `authoritative_dynamic_proof.html` | SpiderMonkey can insert a script that V8 then executes |
 
-External parser-blocking scripts needed no additional wiring. The gate keys on
-`ExternalScriptKind::ParsingBlocking`, which classifies inline and external
-parser-blocking scripts alike, and the selected engine already travels on the
-fetch context to the external creation site.
+`support/v8/run_proofs.sh` runs all of them and checks both signals each one
+depends on, plus two cases it generates rather than commits: the
+double-execution control, and a 51-script page alternating direct and
+microtask-deferred sets that stresses the reentry guard across many task
+boundaries.
 
 Run with a debug log filter to see each source accepted by V8:
 
