@@ -103,10 +103,29 @@ cargo build -p servoshell --features v8-document-hidden-authoritative
 ```
 
 The authoritative feature is intentionally strict: missing runtimes, realms,
-hosts, reentrant callbacks, or failed reads abort the experiment rather than
-silently returning Servo's native value. It makes only `document.hidden`
-V8-authoritative; SpiderMonkey still parses and executes page JavaScript and
-owns all other DOM bindings.
+hosts, or failed reads abort the experiment rather than silently returning
+Servo's native value. It makes only `document.hidden` V8-authoritative;
+SpiderMonkey still parses and executes page JavaScript and owns all other DOM
+bindings.
+
+Re-entrancy is the one deliberate exception, because it is reachable from
+ordinary page script rather than from a bug. Setting `document.bgColor` runs
+Servo's production CEReactions stack, which can synchronously invoke a custom
+element's `attributeChangedCallback` — SpiderMonkey JS running inside a live V8
+stack frame, with the sidecar already mutably borrowed — and that callback may
+read `document.hidden`. Aborting there would let any page crash the script
+thread. Such a read is instead answered from the host's own native source and
+logged as a short circuit. This is not a SpiderMonkey fallback: the V8
+accessor's host implementation reads `hidden_state_for_v8` and returns it
+unchanged, so only the round trip is skipped, and the value cannot differ.
+`authoritative_cereactions_proof.html` exercises exactly that path; it needs
+both authoritative features and so is not part of `run_proofs.sh`.
+
+The deeper fix is to stop running the CEReactions stack inline inside the V8
+setter and push that boundary out to the V8 script and checkpoint boundary, so
+reactions drain after the V8 frames unwind. That removes the re-entrancy class
+rather than tolerating it, and should land before the host surface grows any
+further mutating members.
 
 An additional non-default experiment makes one tightly scoped classic script
 V8-authoritative:

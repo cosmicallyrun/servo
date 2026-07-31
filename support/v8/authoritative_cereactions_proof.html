@@ -1,0 +1,60 @@
+<!doctype html>
+<!--
+Runtime proof that page script cannot crash the script thread by re-entering
+the V8 bridge through CEReactions.
+
+A customized built-in <body> observes bgcolor. The V8-authoritative script sets
+document.bgColor, which runs Servo's production CEReactions stack, which
+synchronously invokes attributeChangedCallback -- SpiderMonkey JS running
+inside a live V8 stack frame, with the sidecar already mutably borrowed. That
+callback then reads document.hidden, re-entering the bridge.
+
+Under v8-document-hidden-authoritative this used to abort: the re-entrancy
+guard returned an error and every error was fatal. Re-entry here is not a bug,
+it is exactly where HTML says the callback runs, so it now answers from the
+host's own native source and logs a short-circuit warning. That is not a
+SpiderMonkey fallback -- the V8 accessor's host implementation reads the same
+hidden_state_for_v8 and returns it unchanged, so only the round trip is
+skipped.
+
+This proof needs BOTH authoritative features, so it is not part of
+run_proofs.sh, which builds only the classic-script feature:
+
+  cargo build -p servoshell \
+    --features v8-classic-script-authoritative,v8-document-hidden-authoritative
+  RUST_LOG=warn,script::script_thread=debug \
+    target/debug/servoshell -z -x --hard-fail \
+      --enable-experimental-web-platform-features \
+      -o /tmp/cereactions.png support/v8/authoritative_cereactions_proof.html
+
+Expected: no panic, every pixel lime, the title reporting ceFired=2, and one
+"answered from the host's own native source" warning.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative CEReactions re-entrancy proof</title>
+    <script>
+      class V8Body extends HTMLBodyElement {
+        static get observedAttributes() { return ["bgcolor"]; }
+        attributeChangedCallback(name, oldValue, newValue) {
+          window.ceFired = (window.ceFired || 0) + 1;
+          // Re-enters the V8 bridge from inside the V8 bgColor setter.
+          window.ceHidden = document.hidden;
+        }
+      }
+      customElements.define("v8-body", V8Body, { extends: "body" });
+    </script>
+  </head>
+  <body is="v8-body" bgcolor="red">
+    <script data-servo-v8="authoritative">
+      document.bgColor =
+        document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      document.title =
+        "ceFired=" + (window.ceFired || 0) + " ceHidden=" + window.ceHidden;
+      console.log("RESULT " + document.title);
+    </script>
+  </body>
+</html>

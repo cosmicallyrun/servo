@@ -6599,7 +6599,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     /// <https://html.spec.whatwg.org/multipage/#dom-document-hidden>
     fn Hidden(&self) -> bool {
         #[cfg(feature = "v8-document-hidden-authoritative")]
-        let hidden = ScriptThread::v8_document_hidden_strict(self.pipeline_id());
+        let hidden =
+            ScriptThread::v8_document_hidden_strict(self.pipeline_id(), self.hidden_state_for_v8());
 
         #[cfg(all(
             feature = "v8-document-hidden-diagnostic",

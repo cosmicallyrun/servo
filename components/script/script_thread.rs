@@ -279,6 +279,31 @@ impl Drop for V8DocumentHiddenQueryGuard<'_> {
     }
 }
 
+/// Why a V8 `Document.hidden` read did not reach V8.
+///
+/// The two cases need opposite policies, which is the whole reason they are
+/// distinguished: re-entrancy is normal and page-reachable, while a bridge
+/// failure is a bug in the embedding.
+#[cfg(feature = "v8-document-hidden-diagnostic")]
+enum V8DocumentHiddenError {
+    /// The bridge is already on the stack, so the sidecar cannot be borrowed
+    /// again. The V8 accessor's host implementation returns the same native
+    /// state it would have been asked for, so no answer is lost.
+    Reentrant(String),
+    /// The sidecar, the realm, or V8 itself failed.
+    Failed(String),
+}
+
+#[cfg(feature = "v8-document-hidden-diagnostic")]
+impl std::fmt::Display for V8DocumentHiddenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            V8DocumentHiddenError::Reentrant(reason) |
+            V8DocumentHiddenError::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
 #[cfg(feature = "v8-classic-script-authoritative")]
 struct V8AuthoritativeScriptGuard<'a>(&'a Cell<bool>);
 
@@ -1049,13 +1074,16 @@ impl ScriptThread {
     }
 
     #[cfg(feature = "v8-document-hidden-diagnostic")]
-    fn query_v8_document_hidden(&self, pipeline_id: PipelineId) -> Result<bool, String> {
+    fn query_v8_document_hidden(
+        &self,
+        pipeline_id: PipelineId,
+    ) -> Result<bool, V8DocumentHiddenError> {
         #[cfg(feature = "v8-classic-script-authoritative")]
         if self.in_v8_authoritative_script.get() {
-            return Err(format!(
+            return Err(V8DocumentHiddenError::Reentrant(format!(
                 "cannot re-enter V8 Document.hidden during an authoritative script for \
                  {pipeline_id}"
-            ));
+            )));
         }
         if self.in_v8_document_hidden.get() {
             let attempts = self
@@ -1063,26 +1091,28 @@ impl ScriptThread {
                 .get()
                 .wrapping_add(1);
             self.v8_document_hidden_reentrant_attempts.set(attempts);
-            return Err(format!(
+            return Err(V8DocumentHiddenError::Reentrant(format!(
                 "re-entrant V8 Document.hidden query for {pipeline_id} (attempt {attempts})"
-            ));
+            )));
         }
 
         self.in_v8_document_hidden.set(true);
         let _guard = V8DocumentHiddenQueryGuard(&self.in_v8_document_hidden);
         let mut slot = self.v8_shadow.borrow_mut();
-        let shadow = slot
-            .as_mut()
-            .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned())?;
+        let shadow = slot.as_mut().ok_or_else(|| {
+            V8DocumentHiddenError::Failed("V8 shadow runtime is unavailable".to_owned())
+        })?;
         let realm_id = shadow
             .realms
             .get(&pipeline_id)
             .map(|realm| realm.id)
-            .ok_or_else(|| format!("V8 shadow has no realm for {pipeline_id}"))?;
+            .ok_or_else(|| {
+                V8DocumentHiddenError::Failed(format!("V8 shadow has no realm for {pipeline_id}"))
+            })?;
         shadow
             .runtime
             .document_hidden(realm_id)
-            .map_err(|error| error.to_string())
+            .map_err(|error| V8DocumentHiddenError::Failed(error.to_string()))
     }
 
     #[cfg(all(
@@ -1115,14 +1145,46 @@ impl ScriptThread {
         });
     }
 
+    /// Reads `Document.hidden` through V8, or short-circuits when the bridge
+    /// is already on the stack.
+    ///
+    /// `native` is only consulted for the re-entrant case, and that is not a
+    /// SpiderMonkey fallback: the V8 accessor's own host implementation reads
+    /// `hidden_state_for_v8` and returns it unchanged, so the answer is not in
+    /// doubt — only the round trip is skipped, because the sidecar is already
+    /// mutably borrowed further up the stack.
+    ///
+    /// Re-entry is reachable from ordinary page script. A custom element's
+    /// `attributeChangedCallback`, invoked by CEReactions during the V8
+    /// `bgColor` setter, can read `document.hidden`. Aborting there would let
+    /// a page crash the script thread, so only a genuine bridge failure — a
+    /// disposed sidecar, a missing realm, a V8 error — still aborts.
     #[cfg(feature = "v8-document-hidden-authoritative")]
-    pub(crate) fn v8_document_hidden_strict(pipeline_id: PipelineId) -> bool {
+    pub(crate) fn v8_document_hidden_strict(pipeline_id: PipelineId, native: bool) -> bool {
         let result = with_optional_script_thread(|script_thread| {
-            script_thread.map(|script_thread| script_thread.query_v8_document_hidden(pipeline_id))
+            script_thread.map(|script_thread| {
+                (
+                    script_thread.query_v8_document_hidden(pipeline_id),
+                    script_thread.v8_document_hidden_fallbacks.get(),
+                )
+            })
         });
         match result {
-            Some(Ok(hidden)) => hidden,
-            Some(Err(error)) => {
+            Some((Ok(hidden), _)) => hidden,
+            Some((Err(V8DocumentHiddenError::Reentrant(reason)), fallbacks)) => {
+                let fallbacks = fallbacks.wrapping_add(1);
+                with_optional_script_thread(|script_thread| {
+                    if let Some(script_thread) = script_thread {
+                        script_thread.v8_document_hidden_fallbacks.set(fallbacks);
+                    }
+                });
+                warn!(
+                    "V8 Document.hidden answered from the host's own native source for \
+                     {pipeline_id} (short circuit {fallbacks}): {reason}"
+                );
+                native
+            },
+            Some((Err(V8DocumentHiddenError::Failed(error)), _)) => {
                 panic!("authoritative V8 Document.hidden query failed for {pipeline_id}: {error}")
             },
             None => panic!(
