@@ -165,6 +165,19 @@ second identical authoritative script is the control: it reports two getters
 and two setters and renders pure red, which is what a page would show if
 SpiderMonkey had also executed the script.
 
+Three proof pages use that same counting argument:
+
+| Page | Proves |
+| --- | --- |
+| `authoritative_bgcolor_proof.html` | V8 alone executes an inline parser-blocking script |
+| `authoritative_external_proof.html` | the same route already covers external scripts |
+| `authoritative_microtask_proof.html` | the task-boundary microtask checkpoint runs, with a live host context |
+
+External parser-blocking scripts needed no additional wiring. The gate keys on
+`ExternalScriptKind::ParsingBlocking`, which classifies inline and external
+parser-blocking scripts alike, and the selected engine already travels on the
+fetch context to the external creation site.
+
 Run with a debug log filter to see each source accepted by V8:
 
 ```sh
