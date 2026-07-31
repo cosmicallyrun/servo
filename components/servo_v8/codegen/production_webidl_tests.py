@@ -30,17 +30,30 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
 
     def test_selects_real_document_bg_color(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            _, attribute = production_webidl.select_document_host_attributes(
+            attributes = production_webidl.select_document_host_attributes(
                 Path(temporary_directory) / "cache",
                 environment={},
             )
 
+        attribute = attributes[production_webidl.DOCUMENT_BG_COLOR]
         self.assertEqual(attribute.identifier.name, "bgColor")
         self.assertFalse(attribute.readonly)
         self.assertFalse(attribute.type.nullable())
         self.assertTrue(attribute.type.isDOMString())
         self.assertTrue(attribute.getExtendedAttribute("CEReactions"))
         self.assertTrue(attribute.type.getExtendedAttribute("LegacyNullToEmptyString"))
+
+    def test_selects_the_slice_keyed_in_manifest_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_attributes(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            list(attributes),
+            [qualified_name for qualified_name, _ in production_webidl.DOCUMENT_HOST],
+        )
 
 
 class SyntheticSelectionTests(unittest.TestCase):
@@ -144,6 +157,18 @@ class SyntheticSelectionTests(unittest.TestCase):
             "`Document.hidden` must use `boolean`, got `long`",
         )
 
+    def test_rejects_unexpected_extended_attribute(self) -> None:
+        self.assert_rejected(
+            "interface Document { [Throws] readonly attribute boolean hidden; };",
+            "`Document.hidden` carries extended attributes that are not implemented: Throws",
+        )
+
+    def test_reports_every_unexpected_extended_attribute(self) -> None:
+        self.assert_rejected(
+            'interface Document { [Throws, Pref="dom.hidden"] readonly attribute boolean hidden; };',
+            "`Document.hidden` carries extended attributes that are not implemented: Pref, Throws",
+        )
+
     def test_rejects_malformed_qualified_name(self) -> None:
         parser_results = self.parse({"Document.webidl": "interface Document { readonly attribute boolean hidden; };"})
         with self.assertRaisesRegex(
@@ -191,6 +216,12 @@ class SyntheticSelectionTests(unittest.TestCase):
         self.assert_bg_color_rejected(
             "[CEReactions] attribute DOMString bgColor;",
             "`Document.bgColor` must carry `[LegacyNullToEmptyString]` on its type",
+        )
+
+    def test_rejects_bg_color_with_extended_attribute_beyond_ce_reactions(self) -> None:
+        self.assert_bg_color_rejected(
+            "[CEReactions, Throws] attribute [LegacyNullToEmptyString] DOMString bgColor;",
+            "`Document.bgColor` carries extended attributes that are not implemented: Throws",
         )
 
 

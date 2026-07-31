@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 
+import generate  # noqa: E402
 import generate_document_host  # noqa: E402
 import production_webidl  # noqa: E402
 
@@ -76,6 +77,22 @@ class DocumentHostGenerationTests(unittest.TestCase):
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, output)
+
+    def test_rejects_a_selection_that_does_not_match_the_manifest(self) -> None:
+        incomplete = {
+            production_webidl.DOCUMENT_HIDDEN: self.attributes[production_webidl.DOCUMENT_HIDDEN],
+        }
+
+        with self.assertRaises(production_webidl.WebIDLSelectionError):
+            generate_document_host.generate_outputs(incomplete)
+
+    def test_emits_one_slot_per_manifest_member(self) -> None:
+        header = self.outputs[generate_document_host.HEADER_NAME]
+
+        for qualified_name, _ in production_webidl.DOCUMENT_HOST:
+            member_name = qualified_name.split(".")[1]
+            with self.subTest(member=qualified_name):
+                self.assertIn(f"(*get_{generate.snake_case(member_name)})", header)
 
     def test_cli_writes_exactly_the_three_document_host_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
