@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 7u
+#define SERVO_V8_ABI_VERSION 8u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -123,6 +123,24 @@ int32_t servo_v8_realm_script_discard(ServoV8Runtime* runtime,
                                       ServoV8RealmId realm_id,
                                       ServoV8ScriptId script_id,
                                       ServoV8ErrorBuffer* error);
+
+/* Drains the isolate's explicit microtask queue.
+ *
+ * The queue is isolate-wide because V8 requires contexts that can access each
+ * other synchronously to share one queue, and same-origin Servo pipelines on
+ * one script thread do exactly that. A job may therefore belong to any realm,
+ * so the ephemeral host context is installed on every live realm for the
+ * duration of the drain and cleared from all of them on every return path.
+ *
+ * Only termination is reported through the outcome. V8 delivers an uncaught
+ * job exception to the isolate's message handler and an unhandled rejection to
+ * the promise-rejection callback, neither of which is wired up yet, so a
+ * throwing job currently reports SERVO_V8_SCRIPT_RUN_COMPLETED. */
+int32_t servo_v8_runtime_perform_microtask_checkpoint(
+    ServoV8Runtime* runtime,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error);
 
 /* Consumes native only on success; failure leaves ownership with the caller. */
 int32_t servo_v8_realm_install_document_host(

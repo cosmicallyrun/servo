@@ -121,11 +121,17 @@ the normal HTML fetch, CSP, ordering, and settings-stack work, but V8 alone
 compiles and executes that script. Async, defer, dynamic, module, timer, worker,
 and service-worker scripts remain on SpiderMonkey. The current visible host
 surface is deliberately limited to `window`, `document.hidden`, and
-`document.bgColor`. V8 microtask checkpoint integration is not implemented, so
-this mode must not yet be used for promise- or microtask-dependent scripts.
-`microtask-checkpoint-design.md` records the intended integration, including
-why the drain must stay on the isolate's single explicit queue rather than
-moving to per-realm queues.
+`document.bgColor`.
+
+Servo performs a V8 microtask checkpoint at HTML's "clean up after running
+script" boundary, in `ScriptThread::perform_a_microtask_checkpoint`, before its
+own SpiderMonkey checkpoint. `microtask-checkpoint-design.md` records why the
+drain stays on the isolate's single explicit queue rather than moving to
+per-realm queues, and why V8 drains first. One caveat carries real weight: a V8
+job that throws is currently silent, because V8 routes an uncaught job
+exception to the isolate message handler rather than to a boundary `TryCatch`,
+and neither that handler nor a promise-rejection callback is installed yet.
+Promise-dependent scripts run, but their failures do not surface.
 
 Entering that route is guarded by an explicit test-then-set on the script
 thread. `V8AuthoritativeScriptGuard::enter` fails on a flag that is already
@@ -175,13 +181,14 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 7 and remains experimental. The original
+The current exported C ABI is version 8 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume
 it during one later execution. That execution deliberately does not perform an
-implicit V8 microtask checkpoint; task-boundary integration remains Servo's
-responsibility.
+implicit V8 microtask checkpoint. Draining is a separate runtime-level call,
+because the queue is isolate-wide rather than realm-scoped, and Servo makes it
+at the task boundary.
 
 ## Verify TurboLev
 

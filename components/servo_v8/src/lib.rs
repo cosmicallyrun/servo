@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 7;
+const ABI_VERSION: u32 = 8;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -188,6 +188,12 @@ unsafe extern "C" {
         runtime: *mut RawRuntime,
         realm_id: RealmId,
         script_id: ScriptId,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_runtime_perform_microtask_checkpoint(
+        runtime: *mut RawRuntime,
+        host_context: *mut c_void,
+        outcome: *mut RawScriptRunOutcome,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_realm_install_document_host(
@@ -553,6 +559,80 @@ impl Runtime {
                 "V8 returned unknown classic-script run status {status}"
             ))),
         }
+    }
+
+    /// Drains the isolate's explicit microtask queue with one ephemeral host
+    /// context installed on every live realm.
+    ///
+    /// The queue is isolate-wide because V8 requires contexts that can access
+    /// each other synchronously to share one queue, and same-origin Servo
+    /// pipelines on one script thread do exactly that.
+    ///
+    /// Only termination is reported. V8 delivers an uncaught job exception to
+    /// the isolate message handler and an unhandled rejection to the
+    /// promise-rejection callback; neither is installed yet, so a throwing job
+    /// currently reports [`ScriptRunOutcome::Completed`].
+    ///
+    /// # Safety
+    ///
+    /// `host_context` must remain valid for every synchronous native callback
+    /// made during the drain. The bridge clears it from every realm before
+    /// returning and no generated binding may retain it.
+    pub unsafe fn perform_microtask_checkpoint_with_host_context(
+        &mut self,
+        host_context: *mut c_void,
+    ) -> Result<ScriptRunOutcome, Error> {
+        let mut error_storage = [0; ERROR_CAPACITY];
+        let mut message_storage = [0; ERROR_CAPACITY];
+        let mut resource_storage = [0; ERROR_CAPACITY];
+        let mut stack_storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut error_storage);
+        let mut outcome = RawScriptRunOutcome {
+            status: SCRIPT_RUN_COMPLETED,
+            exception: RawScriptException {
+                message: error_buffer(&mut message_storage),
+                resource_name: error_buffer(&mut resource_storage),
+                stack: error_buffer(&mut stack_storage),
+                line_number: 0,
+                column_number: 0,
+            },
+        };
+        // SAFETY: The runtime is live and the error buffer remains valid for
+        // the duration of the call. Every outcome buffer has independent live
+        // backing storage.
+        let succeeded = unsafe {
+            servo_v8_runtime_perform_microtask_checkpoint(
+                self.raw.as_ptr(),
+                host_context,
+                &mut outcome,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            return Err(error_from(&error_storage, &error));
+        }
+        match outcome.status {
+            SCRIPT_RUN_COMPLETED => Ok(ScriptRunOutcome::Completed),
+            SCRIPT_RUN_THROWN => Ok(ScriptRunOutcome::Thrown(ScriptException {
+                message: text_from(&message_storage, &outcome.exception.message),
+                resource_name: text_from(&resource_storage, &outcome.exception.resource_name),
+                stack: text_from(&stack_storage, &outcome.exception.stack),
+                line_number: outcome.exception.line_number,
+                column_number: outcome.exception.column_number,
+            })),
+            SCRIPT_RUN_TERMINATED => Ok(ScriptRunOutcome::Terminated),
+            status => Err(Error(format!(
+                "V8 returned unknown microtask checkpoint status {status}"
+            ))),
+        }
+    }
+
+    /// Drains the isolate's explicit microtask queue with no host context, so
+    /// jobs that call an embedding host fail deterministically.
+    pub fn perform_microtask_checkpoint(&mut self) -> Result<ScriptRunOutcome, Error> {
+        // SAFETY: A null context disables host callbacks that require an
+        // embedding-engine context.
+        unsafe { self.perform_microtask_checkpoint_with_host_context(std::ptr::null_mut()) }
     }
 
     /// Discards a retained classic script without executing it.
@@ -1135,6 +1215,85 @@ mod tests {
         assert!(
             runtime
                 .eval_bool_in_realm(first, "retainedMicrotaskRan")
+                .unwrap()
+        );
+
+        // The explicit checkpoint is what Servo calls at the HTML task
+        // boundary, so it must drain a retained script's jobs without any
+        // diagnostic eval running first.
+        let explicit = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.explicitMicrotaskRan = false; \
+                 Promise.resolve().then(() => explicitMicrotaskRan = true);",
+            "explicit-microtask.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, explicit).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "explicitMicrotaskRan")
+                .unwrap()
+        );
+        // Draining an empty queue is not an error, so Servo may checkpoint at
+        // every task boundary without tracking whether jobs exist.
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+
+        // One checkpoint drains to exhaustion, including jobs enqueued by
+        // jobs. HTML's checkpoint runs until the queue is empty, so a promise
+        // chain must complete within a single task boundary.
+        let nested = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.nestedMicrotaskDepth = 0; \
+                 Promise.resolve() \
+                   .then(() => nestedMicrotaskDepth++) \
+                   .then(() => nestedMicrotaskDepth++) \
+                   .then(() => nestedMicrotaskDepth++);",
+            "nested-microtask.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, nested).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "nestedMicrotaskDepth === 3")
+                .unwrap()
+        );
+
+        // The queue is isolate-wide, so one checkpoint drains every realm.
+        let across_realms = compiled(runtime.compile_script_in_realm(
+            second,
+            "globalThis.secondRealmMicrotaskRan = false; \
+                 Promise.resolve().then(() => secondRealmMicrotaskRan = true);",
+            "second-realm-microtask.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(second, across_realms).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(second, "secondRealmMicrotaskRan")
                 .unwrap()
         );
 

@@ -458,6 +458,14 @@ pub struct ScriptThread {
     #[cfg(feature = "v8-classic-script-authoritative")]
     in_v8_authoritative_script: Cell<bool>,
 
+    /// Set when an authoritative script has run and may have enqueued V8
+    /// microtasks. The public `MicrotaskQueue` API has no emptiness query, and
+    /// draining an empty queue is a no-op rather than an error, so this is
+    /// purely a gate that keeps sidecar cost off every SpiderMonkey script on
+    /// the thread. No authoritative script having run means no V8 job exists.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    v8_may_have_pending_jobs: Cell<bool>,
+
     /// Guards the synchronous V8 -> Rust `Document.hidden` callback against
     /// accidentally borrowing the V8 sidecar recursively.
     #[cfg(feature = "v8-document-hidden-diagnostic")]
@@ -833,6 +841,10 @@ impl ScriptThread {
                      current realm is {actual_realm_id:?}"
                 ));
             }
+            // The script is about to run and may enqueue V8 jobs. Marking
+            // before execution keeps the mark correct for a script that throws
+            // after enqueuing one.
+            script_thread.v8_may_have_pending_jobs.set(true);
             // SAFETY: cx is synchronously borrowed for this call, the bridge
             // clears it on every return path, and generated hosts cannot retain it.
             unsafe {
@@ -844,6 +856,64 @@ impl ScriptThread {
             }
             .map_err(|error| error.to_string())
         })
+    }
+
+    /// Drains V8's microtask queue at HTML's "clean up after running script"
+    /// boundary, immediately before Servo's own checkpoint.
+    ///
+    /// V8 runs first so a job that enqueues a SpiderMonkey microtask — today
+    /// only reachable through a DOM host, for example CEReactions running a
+    /// custom element callback — is still serviced by the SpiderMonkey
+    /// checkpoint that follows, within the same boundary. Draining V8 second
+    /// would strand such a job until the next task, which is observable.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    fn perform_a_v8_microtask_checkpoint(&self, cx: &mut js::context::JSContext) {
+        if !self.v8_may_have_pending_jobs.get() {
+            return;
+        }
+
+        // Never checkpoint inside an authoritative script. The settings-stack
+        // boundary cannot reach here that way, but the parser and event loop
+        // also call this. Leave the mark set so the next boundary drains.
+        let Ok(_guard) = V8AuthoritativeScriptGuard::enter(&self.in_v8_authoritative_script) else {
+            debug!("skipping V8 microtask checkpoint inside an authoritative script");
+            return;
+        };
+
+        let mut slot = self.v8_shadow.borrow_mut();
+        let Some(shadow) = slot.as_mut() else {
+            // The sidecar is gone, so its jobs are too. Nothing to fall back
+            // to and nothing to report.
+            self.v8_may_have_pending_jobs.set(false);
+            return;
+        };
+        self.v8_may_have_pending_jobs.set(false);
+
+        // SAFETY: cx is synchronously borrowed for this call, the bridge
+        // clears it from every realm on every return path, and generated
+        // hosts cannot retain it.
+        let outcome = unsafe {
+            shadow
+                .runtime
+                .perform_microtask_checkpoint_with_host_context((cx as *mut JSContext).cast())
+        };
+        match outcome {
+            Ok(servo_v8::ScriptRunOutcome::Completed) => {},
+            Ok(servo_v8::ScriptRunOutcome::Terminated) => {
+                warn!("V8 execution was terminated during a microtask checkpoint")
+            },
+            Ok(servo_v8::ScriptRunOutcome::Thrown(exception)) => warn!(
+                "V8 microtask threw at {}:{}:{}: {}",
+                exception.resource_name,
+                exception.line_number,
+                exception.column_number,
+                exception.message
+            ),
+            // Authoritative mode fails strictly. There is no SpiderMonkey
+            // fallback for a V8 job, so a bridge failure is a bug, not a
+            // condition to recover from.
+            Err(error) => panic!("authoritative V8 microtask checkpoint failed internally: {error}"),
+        }
     }
 
     #[cfg(feature = "v8-shadow")]
@@ -1563,6 +1633,8 @@ impl ScriptThread {
                     v8_shadow: RefCell::new(v8_shadow),
                     #[cfg(feature = "v8-classic-script-authoritative")]
                     in_v8_authoritative_script: Cell::new(false),
+                    #[cfg(feature = "v8-classic-script-authoritative")]
+                    v8_may_have_pending_jobs: Cell::new(false),
                     #[cfg(feature = "v8-document-hidden-diagnostic")]
                     in_v8_document_hidden: Cell::new(false),
                     #[cfg(feature = "v8-document-hidden-diagnostic")]
@@ -4888,6 +4960,9 @@ impl ScriptThread {
     pub(crate) fn perform_a_microtask_checkpoint(&self, cx: &mut js::context::JSContext) {
         // Only perform the checkpoint if we're not shutting down.
         if self.can_continue_running_inner() {
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            self.perform_a_v8_microtask_checkpoint(cx);
+
             let globals = self
                 .documents
                 .borrow()

@@ -283,6 +283,35 @@ class ActiveHostContextScope {
   ServoV8DocumentHostState* state_;
 };
 
+// Installs one ephemeral host context on every live realm.
+//
+// A microtask checkpoint drains the isolate's single queue, so a job may
+// belong to any realm and call that realm's Document host. The host context is
+// in fact a per-script-thread value — one embedding JSContext for the thread —
+// rather than a per-realm one, so every realm gets it for the drain.
+//
+// Realms are created and destroyed only by Servo, never by running JavaScript,
+// and CheckRuntime rejects bridge re-entry from a Rust host callback, so the
+// realm map cannot change between construction and destruction.
+class AllRealmsHostContextScope {
+ public:
+  AllRealmsHostContextScope(ServoV8Runtime* runtime, void* host_context)
+      : runtime_(runtime) {
+    for (auto& entry : runtime_->realms) {
+      entry.second->document_host.active_host_context = host_context;
+    }
+  }
+
+  ~AllRealmsHostContextScope() {
+    for (auto& entry : runtime_->realms) {
+      entry.second->document_host.active_host_context = nullptr;
+    }
+  }
+
+ private:
+  ServoV8Runtime* runtime_;
+};
+
 bool CheckRuntime(ServoV8Runtime* runtime, ServoV8ErrorBuffer* error) {
   if (!runtime || !runtime->isolate) {
     WriteError(error, "invalid Servo V8 runtime");
@@ -887,6 +916,48 @@ extern "C" int32_t servo_v8_realm_script_discard(
     return 0;
   }
   realm->scripts.erase(entry);
+  return 1;
+}
+
+extern "C" int32_t servo_v8_runtime_perform_microtask_checkpoint(
+    ServoV8Runtime* runtime,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!outcome) {
+    WriteError(error, "microtask checkpoint outcome pointer is null");
+    return 0;
+  }
+  ClearScriptRunOutcome(outcome);
+  if (!CheckRuntime(runtime, error)) return 0;
+
+  // The script-run path's barrier, generalised isolate-wide: any realm holding
+  // an active host context means a script or an earlier checkpoint is already
+  // inside the bridge, and a checkpoint must not nest inside either.
+  for (const auto& entry : runtime->realms) {
+    if (entry.second->document_host.active_host_context) {
+      WriteError(error, "Document host context is already active");
+      return 0;
+    }
+  }
+
+  v8::Isolate* isolate = runtime->isolate;
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  AllRealmsHostContextScope host_context_scope(runtime, host_context);
+  v8::TryCatch try_catch(isolate);
+  // Jobs carry their own context, so no realm context is entered here.
+  isolate->PerformMicrotaskCheckpoint();
+  if (try_catch.HasTerminated()) {
+    outcome->status = SERVO_V8_SCRIPT_RUN_TERMINATED;
+    return 1;
+  }
+  // A job that throws does not surface through this TryCatch. V8 routes an
+  // uncaught job exception to the isolate message handler and an unhandled
+  // rejection to the promise-rejection callback. Neither is installed yet, so
+  // such a job is currently silent. Reporting them is the next step and needs
+  // Servo's "notify about rejected promises" path on the V8 side.
   return 1;
 }
 

@@ -1,8 +1,13 @@
 # V8 microtask checkpoint integration
 
-Status: design only. Nothing here is implemented yet. The retained-script run
-path still performs no checkpoint, so `v8-classic-script-authoritative` must
-not be used for promise- or microtask-dependent scripts.
+Status: implemented, at exported C ABI version 8. `authoritative_microtask_proof.html`
+is the runtime proof. Two deviations from the design as first written are noted
+inline below, both marked **As built**.
+
+The retained-script run path still performs no checkpoint of its own; the drain
+happens at the task boundary, which is the point of the design.
+
+Still missing: a job that throws is silent. See "Reporting a job that throws".
 
 ## The boundary
 
@@ -86,25 +91,35 @@ says a script or an earlier checkpoint is already inside the bridge.
 Requires bumping the exported ABI version from 7 to 8.
 
 ```c
-/* Drains the isolate's explicit microtask queue with one ephemeral host
- * context installed on every live realm. */
 int32_t servo_v8_runtime_perform_microtask_checkpoint(
     ServoV8Runtime* runtime,
     void* host_context,
-    ServoV8MicrotaskCheckpointOutcome* outcome,
+    ServoV8ScriptRunOutcome* outcome,
     ServoV8ErrorBuffer* error);
 ```
 
 with `_servo_v8_runtime_perform_microtask_checkpoint` added to
-`servo_v8.exports`. The outcome reuses `ServoV8ScriptException` so a job that
-throws is transported with resource, stack, line, and column exactly as a
-throwing script is today.
+`servo_v8.exports`.
 
-Open implementation question, to settle against V8 rather than by assumption:
-an uncaught exception in a microtask is delivered to the isolate's message
-listener rather than to a `TryCatch` at the checkpoint boundary. The bridge
-will most likely need a message listener scoped to the drain, not a bare
-`TryCatch`.
+**As built:** the outcome reuses `ServoV8ScriptRunOutcome` rather than a new
+`ServoV8MicrotaskCheckpointOutcome` type. Its completed/thrown/terminated
+statuses and its `ServoV8ScriptException` already carry exactly what a
+checkpoint needs, so a second identical struct would only widen the ABI.
+
+## Reporting a job that throws
+
+The open question in the original design — whether a boundary `TryCatch` sees
+an uncaught job exception — resolves to **no**. V8 runs microtasks internally
+and routes an uncaught job exception to the isolate's message handler, and an
+unhandled rejection to the promise-rejection callback. A `TryCatch` around
+`PerformMicrotaskCheckpoint` reliably observes only termination.
+
+**As built:** the bridge reports `SERVO_V8_SCRIPT_RUN_TERMINATED` on
+termination and `SERVO_V8_SCRIPT_RUN_COMPLETED` otherwise, so **a throwing job
+is currently silent**. Fixing it needs `SetPromiseRejectCallback` plus a
+message listener on the V8 side, feeding Servo's "notify about rejected
+promises" path — that is the natural next piece of work here, and it belongs
+with the DOMException transport rather than with this change.
 
 ## Knowing whether to drain at all
 
@@ -114,9 +129,14 @@ Calling into the bridge on every checkpoint would put sidecar cost on every
 SpiderMonkey script on the thread.
 
 So the embedder tracks it: `ScriptThread` sets a `v8_may_have_pending_jobs`
-flag when `run_authoritative_classic_script` returns, and clears it after the
-drain. No authoritative script has run means no V8 job can exist, and the
-checkpoint skips the bridge entirely.
+flag when an authoritative script is about to run — before, not after, so the
+mark stays correct for a script that throws after enqueuing a job — and clears
+it after the drain. No authoritative script has run means no V8 job can exist,
+and the checkpoint skips the bridge entirely.
+
+This is purely a performance gate, not a correctness requirement: draining an
+empty queue is a no-op rather than an error, which
+`isolates_realms_and_rejects_destroyed_ids` asserts directly.
 
 ## Execution sequence
 
