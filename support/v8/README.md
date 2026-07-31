@@ -149,6 +149,22 @@ have exited and taken the realm with it. Both the compile and run sides
 therefore fail the script rather than aborting the process. That is still
 strict — nothing re-runs it on SpiderMonkey.
 
+Two things protect that window, and it is worth knowing which does the work.
+The realm-identity check comparing the compile-time realm against the current
+one is *not* the load-bearing one: a pipeline keeps one realm for its whole
+life, so the ids match even when the global has been replaced underneath. The
+protection that actually fires is HTML's own "can we run script" step, which
+refuses a document that is no longer fully active, plus pipeline-exit ordering
+that destroys the realm before the document is torn down.
+
+That leaves a known gap: `document.open()` replaces the global on the
+SpiderMonkey side without recreating the V8 realm, so the realm keeps the old
+global and the identity check cannot detect it. This predates the widening but
+defer and async make the window much larger. Recreating the realm there would
+invalidate any retained handle compiled against the old global, which now fails
+the script safely rather than aborting — so the fix is tractable, and it should
+land before this route is used for anything beyond experiments.
+
 The current visible host
 surface is deliberately limited to `window`, `document.hidden`, and
 `document.bgColor`.
