@@ -92,6 +92,50 @@ else
   failures=$((failures + 1))
 fi
 
+# Many authoritative scripts on one page, alternating a direct set with a set
+# deferred into a microtask. This exercises repeated realm entry, the
+# check-then-set reentry guard, and a checkpoint at every task boundary. An odd
+# count ends lime. Generated rather than committed so the count is easy to
+# raise.
+stress="$out/stress.html"
+python3 - "$stress" <<'PY'
+import sys
+
+SCRIPTS = 51
+assert SCRIPTS % 2 == 1, "an odd count must end lime"
+toggle = 'document.bgColor = document.bgColor === "lime" ? "red" : "lime";'
+parts = ['<!doctype html><html><body bgcolor="red">']
+for index in range(SCRIPTS):
+    body = toggle if index % 2 == 0 else f"Promise.resolve().then(() => {{ {toggle} }});"
+    parts.append(f'<script data-servo-v8="authoritative">{body}</script>')
+parts.append("</body></html>")
+open(sys.argv[1], "w").write("\n".join(parts))
+PY
+RUST_LOG=warn,script::script_thread=debug \
+  "$servoshell" -z -x --hard-fail -o "$out/stress.png" "$stress" >"$out/stress.log" 2>&1
+stress_counts="$(sed -n 's/.*after \([0-9]*\) Document.hidden, \([0-9]*\) Document.bgColor getter, and \([0-9]*\) Document.bgColor setter.*/\2 \3/p' "$out/stress.log" | tail -1)"
+stress_rgb="$(python3 - "$out/stress.png" <<'PY'
+import sys
+from collections import Counter
+try:
+    from PIL import Image
+except ImportError:
+    print("no-pillow"); sys.exit(0)
+image = Image.open(sys.argv[1]).convert("RGB")
+data = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
+colours = Counter(data)
+print(colours.most_common(1)[0][0] if len(colours) == 1 else "mixed")
+PY
+)"
+if [ "$stress_counts" = "51 51" ] && [ "$stress_rgb" = "(0, 255, 0)" ] &&
+   ! grep -q "re-entrant\|skipping V8\|panicked at" "$out/stress.log"; then
+  echo "ok    stress: 51 scripts report 51 getters and 51 setters, no guard rejections"
+else
+  echo "FAIL  stress: expected '51 51' and lime, got '${stress_counts:-none}' and $stress_rgb"
+  grep -o "re-entrant.*\|skipping V8.*\|panicked at.*" "$out/stress.log" | head -3
+  failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
   echo "$failures proof(s) failed" >&2
   exit 1
