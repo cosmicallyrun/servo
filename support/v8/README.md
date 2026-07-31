@@ -123,6 +123,41 @@ and service-worker scripts remain on SpiderMonkey. The current visible host
 surface is deliberately limited to `window`, `document.hidden`, and
 `document.bgColor`. V8 microtask checkpoint integration is not implemented, so
 this mode must not yet be used for promise- or microtask-dependent scripts.
+`microtask-checkpoint-design.md` records the intended integration, including
+why the drain must stay on the isolate's single explicit queue rather than
+moving to per-realm queues.
+
+Entering that route is guarded by an explicit test-then-set on the script
+thread. `V8AuthoritativeScriptGuard::enter` fails on a flag that is already
+set, and setting the flag is inseparable from arming its reset, so a rejected
+recursive entry can never leave the guard state modified. HTML also allows a
+created script never to run, so the compiled handle is owned by a
+`V8RetainedScript` whose drop discards it. Execution consumes the handle first,
+and discarding is deliberately best effort and infallible: it runs from a drop
+path, and every way it can fail — a disposed sidecar, a realm already
+destroyed, a sidecar borrowed further up the stack — means the handle is
+already gone or is released by realm destruction. Realm and script IDs are
+never reused, so a stale discard cannot free an unrelated handle.
+
+### Prove that V8 alone executed the script
+
+`authoritative_bgcolor_proof.html` starts with a red body and toggles
+`document.bgColor` exactly once per execution, so the final colour counts
+executions rather than merely observing that some engine ran:
+
+```sh
+cargo build -p servoshell --features v8-classic-script-authoritative
+RUST_LOG=warn,script::script_thread=debug \
+  target/debug/servoshell -z -x --hard-fail \
+    -o /tmp/authoritative_bgcolor_proof.png \
+    support/v8/authoritative_bgcolor_proof.html
+```
+
+Every pixel of the screenshot must be `(0, 255, 0)`, and realm teardown must
+report exactly one `Document.bgColor` getter and one setter host call. Adding a
+second identical authoritative script is the control: it reports two getters
+and two setters and renders pure red, which is what a page would show if
+SpiderMonkey had also executed the script.
 
 Run with a debug log filter to see each source accepted by V8:
 

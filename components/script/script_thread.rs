@@ -283,8 +283,27 @@ impl Drop for V8DocumentHiddenQueryGuard<'_> {
 struct V8AuthoritativeScriptGuard<'a>(&'a Cell<bool>);
 
 #[cfg(feature = "v8-classic-script-authoritative")]
+impl<'a> V8AuthoritativeScriptGuard<'a> {
+    /// Marks the script thread as running an authoritative V8 classic script,
+    /// or fails if one is already running. The flag is tested before it is
+    /// set, and setting it is inseparable from arming the reset, so a
+    /// rejected recursive entry can never observe or leave a modified flag.
+    fn enter(flag: &'a Cell<bool>) -> Result<Self, String> {
+        if flag.get() {
+            return Err("re-entrant authoritative V8 classic-script run".to_owned());
+        }
+        flag.set(true);
+        Ok(Self(flag))
+    }
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
 impl Drop for V8AuthoritativeScriptGuard<'_> {
     fn drop(&mut self) {
+        debug_assert!(
+            self.0.get(),
+            "authoritative V8 classic-script guard was cleared before it was dropped"
+        );
         self.0.set(false);
     }
 }
@@ -751,6 +770,42 @@ impl ScriptThread {
         })
     }
 
+    /// Releases a retained V8 classic script that will never be executed.
+    ///
+    /// This is deliberately best effort and infallible. It runs from a drop
+    /// path, so it must not panic, and every way it can fail — a disposed
+    /// sidecar, an already destroyed realm, a sidecar borrowed further up the
+    /// stack — means the handle is either already gone or will be released
+    /// when its realm is destroyed. Realm and script IDs are never reused, so
+    /// a stale discard can never free an unrelated handle.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn discard_authoritative_classic_script(
+        realm_id: servo_v8::RealmId,
+        script_id: servo_v8::ScriptId,
+    ) {
+        with_optional_script_thread(|script_thread| {
+            let Some(script_thread) = script_thread else {
+                return;
+            };
+            let Ok(mut slot) = script_thread.v8_shadow.try_borrow_mut() else {
+                debug!(
+                    "V8 sidecar is already borrowed; leaving {script_id:?} in {realm_id:?} to \
+                     realm destruction"
+                );
+                return;
+            };
+            let Some(shadow) = slot.as_mut() else {
+                return;
+            };
+            match shadow.runtime.discard_script_in_realm(realm_id, script_id) {
+                Ok(()) => debug!("discarded unexecuted V8 {script_id:?} in {realm_id:?}"),
+                Err(error) => debug!(
+                    "discarding unexecuted V8 {script_id:?} in {realm_id:?} failed: {error}"
+                ),
+            }
+        });
+    }
+
     #[cfg(feature = "v8-classic-script-authoritative")]
     pub(crate) fn run_authoritative_classic_script(
         pipeline_id: PipelineId,
@@ -761,10 +816,8 @@ impl ScriptThread {
         with_optional_script_thread(|script_thread| {
             let script_thread = script_thread
                 .ok_or_else(|| "no current ScriptThread for authoritative V8 run".to_owned())?;
-            if script_thread.in_v8_authoritative_script.replace(true) {
-                return Err("re-entrant authoritative V8 classic-script run".to_owned());
-            }
-            let _guard = V8AuthoritativeScriptGuard(&script_thread.in_v8_authoritative_script);
+            let _guard =
+                V8AuthoritativeScriptGuard::enter(&script_thread.in_v8_authoritative_script)?;
             let mut slot = script_thread.v8_shadow.borrow_mut();
             let shadow = slot
                 .as_mut()
