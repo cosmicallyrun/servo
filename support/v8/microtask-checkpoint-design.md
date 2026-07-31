@@ -1,13 +1,14 @@
 # V8 microtask checkpoint integration
 
-Status: implemented, at exported C ABI version 8. `authoritative_microtask_proof.html`
-is the runtime proof. Two deviations from the design as first written are noted
-inline below, both marked **As built**.
+Status: implemented, at exported C ABI version 9. `authoritative_microtask_proof.html`
+is the runtime proof. Deviations from the design as first written are noted
+inline below, marked **As built**.
 
 The retained-script run path still performs no checkpoint of its own; the drain
 happens at the task boundary, which is the point of the design.
 
-Still missing: a job that throws is silent. See "Reporting a job that throws".
+Job failures are reported as of ABI 9. What remains is routing them to the
+owning global's events rather than the log — see "Reporting a job that throws".
 
 ## The boundary
 
@@ -114,12 +115,36 @@ and routes an uncaught job exception to the isolate's message handler, and an
 unhandled rejection to the promise-rejection callback. A `TryCatch` around
 `PerformMicrotaskCheckpoint` reliably observes only termination.
 
-**As built:** the bridge reports `SERVO_V8_SCRIPT_RUN_TERMINATED` on
-termination and `SERVO_V8_SCRIPT_RUN_COMPLETED` otherwise, so **a throwing job
-is currently silent**. Fixing it needs `SetPromiseRejectCallback` plus a
-message listener on the V8 side, feeding Servo's "notify about rejected
-promises" path — that is the natural next piece of work here, and it belongs
-with the DOMException transport rather than with this change.
+There is a second distinction that matters more in practice. A *reaction* that
+throws does not produce an uncaught exception at all: the throw rejects the
+derived promise, so it takes the rejection channel. That makes the rejection
+callback — not the message listener — the path an ordinary `Promise.then`
+failure follows, and a design that installed only the message listener would
+still miss almost everything page script does.
+
+**As built (ABI 9):** the bridge installs both, with
+`SetCaptureStackTraceForUncaughtExceptions` enabled because
+`Message::GetStackTrace` is otherwise empty. Neither callback may call into
+Rust: both run with the drain on the stack and the host context installed on
+every realm, and `CheckRuntime` would *permit* that re-entry because
+`rust_callback_depth` is still zero. They buffer into C++-owned state instead,
+which Servo pulls once the drain returns. The pull is a loop, not a single
+outcome slot, because one drain can produce many failures.
+
+Rejections are recorded with their promise identity rather than reported on
+sight, so `kPromiseHandlerAddedAfterReject` revokes the entry and a rejection
+handled later in the same drain reports nothing — which is what HTML wants.
+
+Registering the listener requires an entered isolate. Doing it immediately
+after `Isolate::New`, before the isolate scope, segfaults: registering
+allocates on the V8 heap.
+
+**Still missing:** the failures are logged, not delivered to the owning
+global's `error` and `unhandledrejection` events. Servo's half of that already
+exists — `notify_about_rejected_promises` runs at the end of the SpiderMonkey
+checkpoint, and the V8-drains-first ordering already puts V8 rejections in the
+right place to be picked up. What blocks it is attribution: the realm does not
+travel with the error across the C ABI, so there is no global to fire on.
 
 ## Knowing whether to drain at all
 
