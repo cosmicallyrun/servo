@@ -276,6 +276,7 @@ trace_dir="$(mktemp -d /tmp/v8-turbolev-trace.XXXXXX)"
   --turbolev --turbofan --maglev --allow-natives-syntax \
   --no-concurrent-recompilation --trace-turbo --trace-turbo-filter=tlv_probe \
   --trace-turbo-path="$trace_dir" \
+  --trace-turbo-cfg-file="$trace_dir/turbo.cfg" \
   support/v8/turbolev_probe.js
 rg -n '"name":"V8\.TFTurboshaftTurbolevGraphBuilding"' \
   "$trace_dir"/*.json
