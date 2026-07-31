@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 8;
+const ABI_VERSION: u32 = 9;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -194,6 +194,12 @@ unsafe extern "C" {
         runtime: *mut RawRuntime,
         host_context: *mut c_void,
         outcome: *mut RawScriptRunOutcome,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_runtime_take_pending_job_error(
+        runtime: *mut RawRuntime,
+        exception: *mut RawScriptException,
+        has_error: *mut u8,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_realm_install_document_host(
@@ -568,10 +574,10 @@ impl Runtime {
     /// each other synchronously to share one queue, and same-origin Servo
     /// pipelines on one script thread do exactly that.
     ///
-    /// Only termination is reported. V8 delivers an uncaught job exception to
-    /// the isolate message handler and an unhandled rejection to the
-    /// promise-rejection callback; neither is installed yet, so a throwing job
-    /// currently reports [`ScriptRunOutcome::Completed`].
+    /// Only termination is reported through the return value. A job that
+    /// throws is buffered, because one drain can produce many errors; collect
+    /// them with [`Runtime::take_pending_job_errors`]. An unhandled promise
+    /// rejection is still silent and needs the promise-rejection callback.
     ///
     /// # Safety
     ///
@@ -633,6 +639,53 @@ impl Runtime {
         // SAFETY: A null context disables host callbacks that require an
         // embedding-engine context.
         unsafe { self.perform_microtask_checkpoint_with_host_context(std::ptr::null_mut()) }
+    }
+
+    /// Collects every uncaught error thrown by a microtask job, oldest first.
+    ///
+    /// V8 catches a throwing job inside its own microtask builtin, reports the
+    /// message, and lets execution continue, so these never reach a `TryCatch`
+    /// at the checkpoint boundary and must be pulled instead.
+    pub fn take_pending_job_errors(&mut self) -> Result<Vec<ScriptException>, Error> {
+        let mut errors = Vec::new();
+        loop {
+            let mut error_storage = [0; ERROR_CAPACITY];
+            let mut message_storage = [0; ERROR_CAPACITY];
+            let mut resource_storage = [0; ERROR_CAPACITY];
+            let mut stack_storage = [0; ERROR_CAPACITY];
+            let mut error = error_buffer(&mut error_storage);
+            let mut exception = RawScriptException {
+                message: error_buffer(&mut message_storage),
+                resource_name: error_buffer(&mut resource_storage),
+                stack: error_buffer(&mut stack_storage),
+                line_number: 0,
+                column_number: 0,
+            };
+            let mut has_error = 0u8;
+            // SAFETY: The runtime is live and every output buffer has
+            // independent live backing storage for the duration of the call.
+            let succeeded = unsafe {
+                servo_v8_runtime_take_pending_job_error(
+                    self.raw.as_ptr(),
+                    &mut exception,
+                    &mut has_error,
+                    &mut error,
+                )
+            };
+            if succeeded == 0 {
+                return Err(error_from(&error_storage, &error));
+            }
+            if has_error == 0 {
+                return Ok(errors);
+            }
+            errors.push(ScriptException {
+                message: text_from(&message_storage, &exception.message),
+                resource_name: text_from(&resource_storage, &exception.resource_name),
+                stack: text_from(&stack_storage, &exception.stack),
+                line_number: exception.line_number,
+                column_number: exception.column_number,
+            });
+        }
     }
 
     /// Discards a retained classic script without executing it.
@@ -1274,6 +1327,61 @@ mod tests {
                 .eval_bool_in_realm(first, "nestedMicrotaskDepth === 3")
                 .unwrap()
         );
+
+        // A reaction that throws rejects its derived promise rather than
+        // reaching a TryCatch at the checkpoint boundary, so this is the
+        // channel an ordinary `Promise.then` failure takes. It must be
+        // observable, and one failure must not cancel the rest of the drain.
+        let throwing_job = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.jobAfterThrowRan = false; \
+                 Promise.resolve().then(() => { throw new Error('job boom'); }); \
+                 Promise.resolve().then(() => { jobAfterThrowRan = true; });",
+            "throwing-job.js",
+            4,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, throwing_job).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        let job_errors = runtime.take_pending_job_errors().unwrap();
+        assert_eq!(job_errors.len(), 1);
+        assert!(job_errors[0].message.contains("job boom"));
+        assert_eq!(job_errors[0].resource_name, "throwing-job.js");
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "jobAfterThrowRan")
+                .unwrap()
+        );
+        // Pulling is destructive, so a second pull reports nothing.
+        assert!(runtime.take_pending_job_errors().unwrap().is_empty());
+
+        // A rejection that gains a handler later must be revoked rather than
+        // reported, which is why the promise identity is tracked.
+        let handled_late = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.lateHandlerRan = false; \
+                 const rejected = Promise.reject(new Error('handled later')); \
+                 Promise.resolve().then(() => { \
+                   rejected.catch(() => { lateHandlerRan = true; }); \
+                 });",
+            "handled-late.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, handled_late).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(runtime.eval_bool_in_realm(first, "lateHandlerRan").unwrap());
+        assert!(runtime.take_pending_job_errors().unwrap().is_empty());
 
         // The queue is isolate-wide, so one checkpoint drains every realm.
         let across_realms = compiled(runtime.compile_script_in_realm(

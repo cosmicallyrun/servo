@@ -157,11 +157,20 @@ Servo performs a V8 microtask checkpoint at HTML's "clean up after running
 script" boundary, in `ScriptThread::perform_a_microtask_checkpoint`, before its
 own SpiderMonkey checkpoint. `microtask-checkpoint-design.md` records why the
 drain stays on the isolate's single explicit queue rather than moving to
-per-realm queues, and why V8 drains first. One caveat carries real weight: a V8
-job that throws is currently silent, because V8 routes an uncaught job
-exception to the isolate message handler rather than to a boundary `TryCatch`,
-and neither that handler nor a promise-rejection callback is installed yet.
-Promise-dependent scripts run, but their failures do not surface.
+per-realm queues, and why V8 drains first.
+
+A job that fails never reaches a `TryCatch` at that boundary. V8 catches an
+uncaught job exception inside its own microtask builtin and reports it to the
+isolate message handler, and a reaction that throws rejects its derived promise
+instead — which is the channel an ordinary `Promise.then` failure takes. The
+bridge installs both an `AddMessageListener` and a `SetPromiseRejectCallback`,
+buffers what they deliver, and Servo pulls it after the drain, so a handler
+attached during the same drain revokes its entry rather than reporting a
+spurious failure. Failures are logged with resource, line, column, and stack.
+
+They are not yet routed to the owning global's `error` and `unhandledrejection`
+events, because the realm does not travel with the error across the C ABI. That
+is the next piece of this work.
 
 Entering that route is guarded by an explicit test-then-set on the script
 thread. `V8AuthoritativeScriptGuard::enter` fails on a flag that is already
@@ -228,7 +237,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 8 and remains experimental. The original
+The current exported C ABI is version 9 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

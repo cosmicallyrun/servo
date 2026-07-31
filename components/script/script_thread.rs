@@ -939,6 +939,30 @@ impl ScriptThread {
             // condition to recover from.
             Err(error) => panic!("authoritative V8 microtask checkpoint failed internally: {error}"),
         }
+
+        // A job that throws never reaches the outcome above: V8 catches it
+        // inside its own microtask builtin, and a reaction that throws rejects
+        // its derived promise instead. Both are pulled here, after the drain,
+        // so a handler attached during the drain has already revoked its entry.
+        match shadow.runtime.take_pending_job_errors() {
+            Ok(job_errors) => {
+                for exception in job_errors {
+                    // TODO: route these to the owning global's `error` and
+                    // `unhandledrejection` events instead of the log. That
+                    // needs the realm to travel with the error across the C
+                    // ABI, which it does not yet.
+                    warn!(
+                        "uncaught error in a V8 microtask at {}:{}:{}: {}{}",
+                        exception.resource_name,
+                        exception.line_number,
+                        exception.column_number,
+                        exception.message,
+                        exception.stack
+                    );
+                }
+            },
+            Err(error) => panic!("collecting V8 microtask job errors failed: {error}"),
+        }
     }
 
     #[cfg(feature = "v8-shadow")]

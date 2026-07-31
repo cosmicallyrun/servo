@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 8u
+#define SERVO_V8_ABI_VERSION 9u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -132,14 +132,24 @@ int32_t servo_v8_realm_script_discard(ServoV8Runtime* runtime,
  * so the ephemeral host context is installed on every live realm for the
  * duration of the drain and cleared from all of them on every return path.
  *
- * Only termination is reported through the outcome. V8 delivers an uncaught
- * job exception to the isolate's message handler and an unhandled rejection to
- * the promise-rejection callback, neither of which is wired up yet, so a
- * throwing job currently reports SERVO_V8_SCRIPT_RUN_COMPLETED. */
+ * Only termination is reported through the outcome. A job that throws is
+ * buffered instead, because one drain can produce many errors; pull them with
+ * servo_v8_runtime_take_pending_job_error. An unhandled promise rejection is
+ * still silent: that needs the promise-rejection callback. */
 int32_t servo_v8_runtime_perform_microtask_checkpoint(
     ServoV8Runtime* runtime,
     void* host_context,
     ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error);
+
+/* Pops the oldest buffered microtask job error, if any.
+ *
+ * Sets *has_error to 0 and leaves the exception cleared once drained, so the
+ * caller loops until it reports none. */
+int32_t servo_v8_runtime_take_pending_job_error(
+    ServoV8Runtime* runtime,
+    ServoV8ScriptException* exception,
+    uint8_t* has_error,
     ServoV8ErrorBuffer* error);
 
 /* Consumes native only on success; failure leaves ownership with the caller. */

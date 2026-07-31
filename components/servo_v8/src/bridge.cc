@@ -11,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "include/cppgc/allocation.h"
 #include "include/cppgc/heap.h"
@@ -237,9 +238,35 @@ struct ServoV8RealmState {
   bool tearing_down = false;
 };
 
+// One uncaught error from a microtask job, buffered until Rust asks for it.
+//
+// V8 reports these to the isolate message handler rather than to a TryCatch at
+// the checkpoint boundary, so they arrive by callback while the drain is still
+// running. The strings are owned here because the caller's outcome buffers
+// belong to a single call, and one drain can produce many errors.
+struct ServoV8PendingJobError {
+  std::string message;
+  std::string resource_name;
+  std::string stack;
+  uint32_t line_number = 0;
+  uint32_t column_number = 0;
+};
+
+// A rejection with no handler, held with its promise so that a handler added
+// later can revoke it before anything is reported.
+struct ServoV8PendingRejection {
+  v8::Global<v8::Promise> promise;
+  ServoV8PendingJobError error;
+};
+
 struct ServoV8Runtime {
   std::unique_ptr<v8::ArrayBuffer::Allocator> allocator;
   v8::Isolate* isolate = nullptr;
+  std::vector<ServoV8PendingJobError> pending_job_errors;
+  std::vector<ServoV8PendingRejection> pending_rejections;
+  // Only buffer while a checkpoint is on the stack. Everywhere else the
+  // embedder already observes failures through a TryCatch it owns.
+  bool draining_microtasks = false;
   v8::Global<v8::Context> context;
   std::unordered_map<ServoV8RealmId, std::unique_ptr<ServoV8RealmState>> realms;
   ServoV8RealmId next_realm_id = 1;
@@ -307,6 +334,143 @@ class AllRealmsHostContextScope {
       entry.second->document_host.active_host_context = nullptr;
     }
   }
+
+ private:
+  ServoV8Runtime* runtime_;
+};
+
+constexpr uint32_t kServoRuntimeIsolateSlot = 0;
+
+// Formats a captured stack trace the way `TryCatch::StackTrace` would, so a
+// job error and a script error read the same on the Rust side.
+std::string FormatStackTrace(v8::Isolate* isolate,
+                             v8::Local<v8::StackTrace> trace) {
+  if (trace.IsEmpty()) return std::string();
+  std::string formatted;
+  for (int index = 0; index < trace->GetFrameCount(); ++index) {
+    v8::Local<v8::StackFrame> frame = trace->GetFrame(isolate, index);
+    v8::String::Utf8Value function(isolate, frame->GetFunctionName());
+    v8::String::Utf8Value script(isolate, frame->GetScriptName());
+    formatted += "\n    at ";
+    formatted += (*function && function.length()) ? *function : "<anonymous>";
+    formatted += " (";
+    formatted += (*script && script.length()) ? *script : "<unknown>";
+    formatted += ":" + std::to_string(frame->GetLineNumber());
+    formatted += ":" + std::to_string(frame->GetColumn()) + ")";
+  }
+  return formatted;
+}
+
+// Receives uncaught errors that V8 reports rather than propagating.
+//
+// A microtask that throws is caught inside V8's own microtask builtin, which
+// reports the message and lets execution continue, so no TryCatch the embedder
+// installs at the checkpoint boundary can observe it. This is the only channel
+// that can. It must not call into Rust: it runs with the drain still on the
+// stack and the host context installed on every realm.
+void FillFromMessage(v8::Isolate* isolate,
+                     v8::Local<v8::Message> message,
+                     ServoV8PendingJobError* pending) {
+  if (message.IsEmpty()) return;
+  if (pending->message.empty()) {
+    v8::String::Utf8Value text(isolate, message->Get());
+    if (*text) pending->message.assign(*text, text.length());
+  }
+  v8::String::Utf8Value resource(isolate, message->GetScriptResourceName());
+  if (*resource) pending->resource_name.assign(*resource, resource.length());
+  pending->stack = FormatStackTrace(isolate, message->GetStackTrace());
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  if (context.IsEmpty()) return;
+  const int line = message->GetLineNumber(context).FromMaybe(0);
+  const int column = message->GetStartColumn(context).FromMaybe(-1);
+  if (line > 0) pending->line_number = static_cast<uint32_t>(line);
+  if (column >= 0) pending->column_number = static_cast<uint32_t>(column + 1);
+}
+
+void OnUncaughtMessage(v8::Local<v8::Message> message,
+                       v8::Local<v8::Value> data) {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  if (!isolate) return;
+  auto* runtime =
+      static_cast<ServoV8Runtime*>(isolate->GetData(kServoRuntimeIsolateSlot));
+  if (!runtime || !runtime->draining_microtasks) return;
+
+  v8::HandleScope handle_scope(isolate);
+  ServoV8PendingJobError pending;
+  // Registered with the default data, so V8 passes the thrown value itself.
+  if (!data.IsEmpty()) {
+    v8::String::Utf8Value text(isolate, data);
+    if (*text) pending.message.assign(*text, text.length());
+  }
+  FillFromMessage(isolate, message, &pending);
+  runtime->pending_job_errors.push_back(std::move(pending));
+}
+
+// Tracks rejections that currently have no handler.
+//
+// A promise reaction that throws does not reach the message listener: the
+// throw rejects the derived promise instead, which is this channel. That makes
+// this the path an ordinary `Promise.then(...)` failure takes, so it is the
+// one that matters most for page script.
+//
+// Recording rather than reporting immediately is what HTML wants: a handler
+// attached later in the same drain revokes the entry, so only rejections still
+// unhandled when the caller pulls are surfaced.
+void OnPromiseReject(v8::PromiseRejectMessage message) {
+  v8::Isolate* isolate = v8::Isolate::GetCurrent();
+  if (!isolate) return;
+  auto* runtime =
+      static_cast<ServoV8Runtime*>(isolate->GetData(kServoRuntimeIsolateSlot));
+  if (!runtime) return;
+
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Promise> promise = message.GetPromise();
+  if (promise.IsEmpty()) return;
+
+  auto matches = [&](const ServoV8PendingRejection& entry) {
+    return entry.promise.Get(isolate) == promise;
+  };
+
+  switch (message.GetEvent()) {
+    case v8::kPromiseRejectWithNoHandler: {
+      ServoV8PendingJobError pending;
+      v8::Local<v8::Value> value = message.GetValue();
+      if (!value.IsEmpty()) {
+        v8::String::Utf8Value text(isolate, value);
+        if (*text) pending.message.assign(*text, text.length());
+        FillFromMessage(isolate, v8::Exception::CreateMessage(isolate, value),
+                        &pending);
+      }
+      ServoV8PendingRejection entry;
+      entry.promise.Reset(isolate, promise);
+      entry.error = std::move(pending);
+      runtime->pending_rejections.push_back(std::move(entry));
+      break;
+    }
+    case v8::kPromiseHandlerAddedAfterReject: {
+      auto& rejections = runtime->pending_rejections;
+      for (auto entry = rejections.begin(); entry != rejections.end();
+           ++entry) {
+        if (matches(*entry)) {
+          rejections.erase(entry);
+          break;
+        }
+      }
+      break;
+    }
+    default:
+      // The remaining events are deprecated and no longer emitted.
+      break;
+  }
+}
+
+class MicrotaskDrainScope {
+ public:
+  explicit MicrotaskDrainScope(ServoV8Runtime* runtime) : runtime_(runtime) {
+    runtime_->draining_microtasks = true;
+  }
+
+  ~MicrotaskDrainScope() { runtime_->draining_microtasks = false; }
 
  private:
   ServoV8Runtime* runtime_;
@@ -570,10 +734,17 @@ extern "C" ServoV8Runtime* servo_v8_runtime_new(
   runtime->owner_thread = std::this_thread::get_id();
   runtime->expose_gc = actual_options.expose_gc != 0;
   runtime->isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+  runtime->isolate->SetData(kServoRuntimeIsolateSlot, runtime.get());
 
   {
     v8::Isolate::Scope isolate_scope(runtime->isolate);
     v8::HandleScope handle_scope(runtime->isolate);
+    // Must be inside the isolate scope: registering a listener allocates on
+    // the V8 heap. The default data makes V8 pass the thrown value to the
+    // listener, and the stack stays empty unless capture is enabled.
+    runtime->isolate->AddMessageListener(&OnUncaughtMessage);
+    runtime->isolate->SetCaptureStackTraceForUncaughtExceptions(true, 16);
+    runtime->isolate->SetPromiseRejectCallback(&OnPromiseReject);
     v8::Local<v8::Context> context = v8::Context::New(runtime->isolate);
     if (context.IsEmpty()) {
       WriteError(error, "V8 failed to allocate a context");
@@ -946,6 +1117,7 @@ extern "C" int32_t servo_v8_runtime_perform_microtask_checkpoint(
   v8::Isolate::Scope isolate_scope(isolate);
   v8::HandleScope handle_scope(isolate);
   AllRealmsHostContextScope host_context_scope(runtime, host_context);
+  MicrotaskDrainScope drain_scope(runtime);
   v8::TryCatch try_catch(isolate);
   // Jobs carry their own context, so no realm context is entered here.
   isolate->PerformMicrotaskCheckpoint();
@@ -953,11 +1125,45 @@ extern "C" int32_t servo_v8_runtime_perform_microtask_checkpoint(
     outcome->status = SERVO_V8_SCRIPT_RUN_TERMINATED;
     return 1;
   }
-  // A job that throws does not surface through this TryCatch. V8 routes an
-  // uncaught job exception to the isolate message handler and an unhandled
-  // rejection to the promise-rejection callback. Neither is installed yet, so
-  // such a job is currently silent. Reporting them is the next step and needs
-  // Servo's "notify about rejected promises" path on the V8 side.
+  // A job that throws never reaches this TryCatch; it arrives through
+  // OnUncaughtMessage while the drain is running. The caller pulls those with
+  // servo_v8_runtime_take_pending_job_error, because one drain can produce
+  // more errors than a single outcome can carry.
+  return 1;
+}
+
+extern "C" int32_t servo_v8_runtime_take_pending_job_error(
+    ServoV8Runtime* runtime,
+    ServoV8ScriptException* exception,
+    uint8_t* has_error,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!exception || !has_error) {
+    WriteError(error, "microtask job error output pointer is null");
+    return 0;
+  }
+  *has_error = 0;
+  ClearScriptException(exception);
+  if (!CheckRuntime(runtime, error)) return 0;
+
+  // Oldest first, so Rust observes failures in the order they happened.
+  // Uncaught job exceptions drain before rejections that are still unhandled.
+  ServoV8PendingJobError pending;
+  if (!runtime->pending_job_errors.empty()) {
+    pending = std::move(runtime->pending_job_errors.front());
+    runtime->pending_job_errors.erase(runtime->pending_job_errors.begin());
+  } else if (!runtime->pending_rejections.empty()) {
+    pending = std::move(runtime->pending_rejections.front().error);
+    runtime->pending_rejections.erase(runtime->pending_rejections.begin());
+  } else {
+    return 1;
+  }
+  WriteError(&exception->message, pending.message);
+  WriteError(&exception->resource_name, pending.resource_name);
+  WriteError(&exception->stack, pending.stack);
+  exception->line_number = pending.line_number;
+  exception->column_number = pending.column_number;
+  *has_error = 1;
   return 1;
 }
 
