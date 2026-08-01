@@ -572,6 +572,29 @@ bool CallDocumentHostGetUrl(ServoV8DocumentHostState* state,
   return state->vtable.get_url(state->native, value) != 0;
 }
 
+bool CallDocumentHostGetVisibilityState(ServoV8DocumentHostState* state,
+                                       ServoV8OwnedUtf8* value) {
+  if (!state || !value || !state->runtime ||
+      state->runtime->rust_callback_depth != 0 || !state->native ||
+      !state->vtable.get_visibility_state) {
+    return false;
+  }
+  RustCallbackScope callback_scope(state->runtime);
+  return state->vtable.get_visibility_state(state->native, value) != 0;
+}
+
+bool CallDocumentHostGetNodeType(ServoV8DocumentHostState* state,
+                                 uint16_t* node_type) {
+  if (!state || !node_type || !state->runtime ||
+      state->runtime->rust_callback_depth != 0 || !state->native ||
+      !state->vtable.get_node_type) {
+    return false;
+  }
+  RustCallbackScope callback_scope(state->runtime);
+  *node_type = state->vtable.get_node_type(state->native);
+  return true;
+}
+
 bool CallDocumentHostSetBgColor(ServoV8DocumentHostState* state,
                                 const uint8_t* value,
                                 size_t value_length) {
@@ -827,6 +850,8 @@ extern "C" int32_t servo_v8_realm_create(
   v8::Local<v8::Function> bg_color_getter;
   v8::Local<v8::Function> bg_color_setter;
   v8::Local<v8::Function> url_getter;
+  v8::Local<v8::Function> visibility_state_getter;
+  v8::Local<v8::Function> node_type_getter;
   const v8::PropertyAttribute immutable = static_cast<v8::PropertyAttribute>(
       v8::ReadOnly | v8::DontDelete);
   if (!v8::Function::New(context, DocumentHostGetHidden,
@@ -854,7 +879,17 @@ extern "C" int32_t servo_v8_realm_create(
                          v8::Local<v8::Data>(), 0,
                          v8::ConstructorBehavior::kThrow,
                          v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&url_getter)) {
+           .ToLocal(&url_getter) ||
+      !v8::Function::New(context, DocumentHostGetVisibilityState,
+                         v8::Local<v8::Data>(), 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&visibility_state_getter) ||
+      !v8::Function::New(context, DocumentHostGetNodeType,
+                         v8::Local<v8::Data>(), 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&node_type_getter)) {
     context->SetAlignedPointerInEmbedderData(
         kServoRealmStateEmbedderSlot, nullptr,
         kServoRealmStateEmbedderTag);
@@ -865,6 +900,8 @@ extern "C" int32_t servo_v8_realm_create(
   bg_color_getter->SetName(V8String(isolate, "get bgColor"));
   bg_color_setter->SetName(V8String(isolate, "set bgColor"));
   url_getter->SetName(V8String(isolate, "get URL"));
+  visibility_state_getter->SetName(V8String(isolate, "get visibilityState"));
+  node_type_getter->SetName(V8String(isolate, "get nodeType"));
   v8::PropertyDescriptor hidden_descriptor(hidden_getter,
                                             v8::Undefined(isolate));
   hidden_descriptor.set_enumerable(true);
@@ -876,6 +913,15 @@ extern "C" int32_t servo_v8_realm_create(
   v8::PropertyDescriptor url_descriptor(url_getter, v8::Undefined(isolate));
   url_descriptor.set_enumerable(true);
   url_descriptor.set_configurable(true);
+  v8::PropertyDescriptor visibility_state_descriptor(visibility_state_getter,
+                                                     v8::Undefined(isolate));
+  visibility_state_descriptor.set_enumerable(true);
+  visibility_state_descriptor.set_configurable(true);
+  // Document inherits from Node, so nodeType belongs on this same facade.
+  v8::PropertyDescriptor node_type_descriptor(node_type_getter,
+                                               v8::Undefined(isolate));
+  node_type_descriptor.set_enumerable(true);
+  node_type_descriptor.set_configurable(true);
   if (!document_prototype
            ->DefineProperty(context, V8String(isolate, "hidden"),
                             hidden_descriptor)
@@ -886,6 +932,14 @@ extern "C" int32_t servo_v8_realm_create(
            .FromMaybe(false) ||
       !document_prototype
            ->DefineProperty(context, V8String(isolate, "URL"), url_descriptor)
+           .FromMaybe(false) ||
+      !document_prototype
+           ->DefineProperty(context, V8String(isolate, "visibilityState"),
+                            visibility_state_descriptor)
+           .FromMaybe(false) ||
+      !document_prototype
+           ->DefineProperty(context, V8String(isolate, "nodeType"),
+                            node_type_descriptor)
            .FromMaybe(false) ||
       !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
       !global

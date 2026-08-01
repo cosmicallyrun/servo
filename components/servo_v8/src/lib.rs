@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 10;
+const ABI_VERSION: u32 = 11;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -977,6 +977,16 @@ mod tests {
             "https://example.com/probe?q=\u{2713}".to_owned()
         }
 
+        fn visibility_state(&self) -> String {
+            // Mirrors Servo's enum-to-string, which is what crosses the ABI.
+            if self.hidden.get() { "hidden" } else { "visible" }.to_owned()
+        }
+
+        fn node_type(&self) -> u16 {
+            // Node.DOCUMENT_NODE.
+            9
+        }
+
         unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
             assert!(!host_context.is_null());
             self.bg_color_setter_calls
@@ -1567,6 +1577,26 @@ mod tests {
                 .eval_bool_in_realm(
                     first,
                     "document.URL === 'https://example.com/probe?q=\u{2713}'"
+                )
+                .unwrap()
+        );
+        // The enum crosses the ABI as a string, so the host must only ever
+        // produce a value the selector pinned.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "['visible', 'hidden'].includes(document.visibilityState)"
+                )
+                .unwrap()
+        );
+        // Document inherits Node, so nodeType is served by the same facade and
+        // must arrive as a number rather than a string.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.nodeType === 9 && typeof document.nodeType === 'number'"
                 )
                 .unwrap()
         );

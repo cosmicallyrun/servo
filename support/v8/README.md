@@ -62,7 +62,8 @@ collections with an explicit no-heap-pointers stack state so conservative
 stack scanning cannot hide a broken edge or make the test flaky.
 
 The production binding slice is generated from the enabled `Document.hidden`,
-`Document.bgColor`, and `Document.URL` declarations in Servo's real
+`Document.bgColor`, `Document.URL`, `Document.visibilityState`, and
+`Node.nodeType` declarations in Servo's real
 `components/script_bindings/webidls/Document.webidl`. Which members are exposed
 is a data manifest of `(qualified name, shape)` pairs, with one selector and
 one emitter registered per shape, so widening the slice with a member of a
@@ -70,7 +71,26 @@ known shape is an edit to that manifest. Each shape also declares an
 extended-attribute allowlist and fails on anything outside it, because an
 unlisted extended attribute usually changes conversion or reaction semantics
 that the generated glue implements literally -- it would be silently wrong
-rather than merely unsupported. Each pipeline realm owns
+rather than merely unsupported.
+
+`Node.nodeType` lands on the existing `document` facade rather than needing a
+second host: `Document` inherits from `Node`, so no second native pointer and
+no second vtable are involved. An enum crosses the ABI as its string value, so
+its selector pins the exact value set the glue was generated against; a new
+state appearing upstream becomes a build failure rather than an unvalidated
+string.
+
+`Document.documentElement` and `Element.tagName` are deliberately **not** here.
+Neither is a codegen slice. `documentElement` returns a nullable interface, and
+nothing in either generator can marshal an interface outward, there is no
+per-realm native-to-wrapper cache to give such an object a stable identity, and
+a V8-held `Element` would need a strong Servo root inside a cppgc cell — a
+cross-heap cycle neither collector can break. `tagName` has no receiver at all,
+since `Element` is not an ancestor of `Document` and the realm owns exactly one
+host object. Both need the reflector subsystem, which should be scoped and
+reviewed on its own rather than smuggled in behind a binding.
+
+Each pipeline realm owns
 a stable V8 `document` facade. Its native accessors recover tagged per-context
 embedder state from the holder's creation context and call typed Rust C ABI
 thunks. The Rust host owns a `Trusted<Document>` rather than a raw DOM pointer;
@@ -174,7 +194,8 @@ land before this route is used for anything beyond experiments.
 
 The current visible host
 surface is deliberately limited to `window`, `document.hidden`,
-`document.bgColor`, and `document.URL`.
+`document.bgColor`, `document.URL`, `document.visibilityState`, and
+`document.nodeType`.
 
 Servo performs a V8 microtask checkpoint at HTML's "clean up after running
 script" boundary, in `ScriptThread::perform_a_microtask_checkpoint`, before its
@@ -238,6 +259,7 @@ Three proof pages use that same counting argument:
 | `authoritative_async_proof.html` | an async script runs on V8 off the parser's critical path |
 | `authoritative_dynamic_proof.html` | SpiderMonkey can insert a script that V8 then executes |
 | `authoritative_url_proof.html` | `Document.URL` is served by the V8 host, getter-only |
+| `authoritative_visibility_nodetype_proof.html` | the enum and numeric shapes, the latter inherited from `Node` |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -261,7 +283,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 10 and remains experimental. The original
+The current exported C ABI is version 11 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

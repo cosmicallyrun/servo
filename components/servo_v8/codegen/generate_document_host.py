@@ -626,6 +626,81 @@ def _readonly_usvstring_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_getter_name(member.attribute)}"]
 
 
+# An enum crosses the ABI as its string value, so it reuses the owned-UTF-8
+# getter wholesale; the selector pins the value set, which is what keeps the
+# untyped string honest.
+_readonly_enum_header_slots = _readonly_usvstring_header_slots
+_readonly_enum_rust_trait_members = _readonly_usvstring_rust_trait_members
+_readonly_enum_rust_vtable_fields = _readonly_usvstring_rust_vtable_fields
+_readonly_enum_rust_thunks = _readonly_usvstring_rust_thunks
+_readonly_enum_rust_vtable_init = _readonly_usvstring_rust_vtable_init
+_readonly_enum_cpp_bodies = _readonly_usvstring_cpp_bodies
+_readonly_enum_cpp_vtable_terms = _readonly_usvstring_cpp_vtable_terms
+
+
+# `unsigned short` is the boolean shape widened: an infallible POD return with
+# no out-parameter and so no error channel, where the returned value *is* the
+# result rather than a status.
+def _readonly_unsigned_short_header_slots(member: Member) -> Block:
+    return [f"  uint16_t (*{_getter_name(member.attribute)})(void* native);"]
+
+
+def _readonly_unsigned_short_rust_trait_members(member: Member) -> Block:
+    return [f"    fn {_rust_member_name(member.attribute)}(&self) -> u16;"]
+
+
+def _readonly_unsigned_short_rust_vtable_fields(member: Member) -> Block:
+    return [f'    pub {_getter_name(member.attribute)}: Option<unsafe extern "C" fn(*mut c_void) -> u16>,']
+
+
+def _readonly_unsigned_short_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    getter = _getter_name(member.attribute)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{getter}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            ") -> u16 {",
+            "    // SAFETY: The vtable contract requires a live Box<T> native pointer.",
+            f"    unsafe {{ &*native.cast::<T>() }}.{name}()",
+            "}",
+        ],
+    )
+
+
+def _readonly_unsigned_short_rust_vtable_init(member: Member) -> Block:
+    getter = _getter_name(member.attribute)
+    return [f"            {getter}: Some(document_host_{getter}::<T>),"]
+
+
+def _readonly_unsigned_short_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    getter = _getter_name(member.attribute)
+    accessor = _cpp_member_name(member.attribute)
+    return (
+        [
+            f"void DocumentHostGet{accessor}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{getter}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  uint16_t value = 0;",
+            f"  if (!CallDocumentHostGet{accessor}(state, &value)) {{",
+            '    ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, value));",
+            "}",
+        ],
+    )
+
+
+def _readonly_unsigned_short_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_getter_name(member.attribute)}"]
+
+
 # The owned UTF-8 transfer is shared by every DOMString member: one C type, one
 # Rust type, one Rust owner drop, and one C++ scope guard, emitted once.
 _OWNED_UTF8_C_TYPE: Block = [
@@ -710,6 +785,32 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
         cpp_bodies=_readonly_usvstring_cpp_bodies,
         cpp_vtable_terms=_readonly_usvstring_cpp_vtable_terms,
+    ),
+    production_webidl.READONLY_ENUM: ShapeEmitter(
+        header_type_blocks=(_OWNED_UTF8_C_TYPE,),
+        header_slots=_readonly_enum_header_slots,
+        rust_type_blocks=(_OWNED_UTF8_RUST_TYPE,),
+        rust_trait_members=_readonly_enum_rust_trait_members,
+        rust_vtable_fields=_readonly_enum_rust_vtable_fields,
+        rust_thunk_blocks=(_OWNED_UTF8_RUST_DROP,),
+        rust_thunks=_readonly_enum_rust_thunks,
+        rust_vtable_init=_readonly_enum_rust_vtable_init,
+        cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
+        cpp_bodies=_readonly_enum_cpp_bodies,
+        cpp_vtable_terms=_readonly_enum_cpp_vtable_terms,
+    ),
+    production_webidl.READONLY_UNSIGNED_SHORT: ShapeEmitter(
+        header_type_blocks=(),
+        header_slots=_readonly_unsigned_short_header_slots,
+        rust_type_blocks=(),
+        rust_trait_members=_readonly_unsigned_short_rust_trait_members,
+        rust_vtable_fields=_readonly_unsigned_short_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_readonly_unsigned_short_rust_thunks,
+        rust_vtable_init=_readonly_unsigned_short_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_readonly_unsigned_short_cpp_bodies,
+        cpp_vtable_terms=_readonly_unsigned_short_cpp_vtable_terms,
     ),
 }
 

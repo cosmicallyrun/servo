@@ -125,6 +125,8 @@ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::conversions::{
     ConversionResult, FromJSValConvertible, StringificationBehavior,
@@ -254,6 +256,17 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         // Servo's production getter returns a USVString, which is already
         // well-formed UTF-8, so the C ABI transfer needs no further conversion.
         self.document.root().URL().0
+    }
+
+    fn visibility_state(&self) -> String {
+        // The generator pinned this enum's value set, so `as_str` can only
+        // produce a value the V8 side was generated against.
+        self.document.root().VisibilityState().as_str().to_owned()
+    }
+
+    fn node_type(&self) -> u16 {
+        // Document inherits from Node, so this is served by the same facade.
+        self.document.root().upcast::<Node>().NodeType()
     }
 
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {

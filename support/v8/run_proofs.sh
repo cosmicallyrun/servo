@@ -33,6 +33,7 @@ proofs=(
   "authoritative_async_proof.html:(0, 255, 0):1:1"
   "authoritative_dynamic_proof.html:(0, 255, 0):1:1"
   "authoritative_url_proof.html:(0, 255, 0):1:1"
+  "authoritative_visibility_nodetype_proof.html:(0, 255, 0):1:1"
 )
 
 failures=0

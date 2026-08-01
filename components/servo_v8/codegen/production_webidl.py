@@ -29,6 +29,8 @@ SKIP_UNLESS_PATTERN = re.compile(r"// skip-unless ([A-Z_]+)\n")
 DOCUMENT_HIDDEN = "Document.hidden"
 DOCUMENT_BG_COLOR = "Document.bgColor"
 DOCUMENT_URL = "Document.URL"
+DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
+NODE_NODE_TYPE = "Node.nodeType"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -36,6 +38,8 @@ DOCUMENT_URL = "Document.URL"
 READONLY_BOOLEAN = "readonly boolean"
 WRITABLE_LEGACY_DOMSTRING = "CEReactions writable LegacyNullToEmptyString DOMString"
 READONLY_USVSTRING = "readonly USVString"
+READONLY_ENUM = "readonly enum"
+READONLY_UNSIGNED_SHORT = "readonly unsigned short"
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
@@ -48,6 +52,13 @@ WRITABLE_LEGACY_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"CEReactions"})
 # honouring it costs nothing. It is allowed rather than required so that dropping
 # it upstream does not break the build.
 READONLY_USVSTRING_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
+READONLY_ENUM_EXTENDED_ATTRIBUTES = frozenset()
+READONLY_UNSIGNED_SHORT_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
+
+# An enum crosses the ABI as its string value, so the generated glue is only
+# correct for the exact value set it was written against. Pinning the set makes
+# a new state upstream a build failure rather than an unvalidated string.
+DOCUMENT_VISIBILITY_STATE_VALUES = ("visible", "hidden")
 
 # The supported Document slice is data, in declaration order: selection and
 # generation both walk it, so widening the slice is an edit to this tuple alone.
@@ -55,6 +66,10 @@ DOCUMENT_HOST: tuple[tuple[str, str], ...] = (
     (DOCUMENT_HIDDEN, READONLY_BOOLEAN),
     (DOCUMENT_BG_COLOR, WRITABLE_LEGACY_DOMSTRING),
     (DOCUMENT_URL, READONLY_USVSTRING),
+    (DOCUMENT_VISIBILITY_STATE, READONLY_ENUM),
+    # Document inherits from Node, so this lands on the existing document
+    # facade: no second host, no second native pointer, no second vtable.
+    (NODE_NODE_TYPE, READONLY_UNSIGNED_SHORT),
 )
 
 
@@ -186,6 +201,51 @@ def select_readonly_usvstring_attribute(
     return member
 
 
+def select_readonly_enum_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_values: Sequence[str],
+) -> WebIDL.IDLAttribute:
+    """Select one readonly, non-nullable enum attribute with a pinned value set."""
+
+    member = _select_instance_attribute(parser_results, qualified_name, READONLY_ENUM_EXTENDED_ATTRIBUTES)
+    if not member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be readonly")
+    if member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be non-nullable")
+    if not member.type.isEnum():
+        raise WebIDLSelectionError(f"`{qualified_name}` must use an enum, got `{member.type.prettyName()}`")
+
+    values = tuple(member.type.inner.values())
+    if values != tuple(expected_values):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have the values {list(expected_values)}, got {list(values)}"
+        )
+
+    return member
+
+
+def select_readonly_unsigned_short_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLAttribute:
+    """Select one readonly, non-nullable `unsigned short` attribute."""
+
+    member = _select_instance_attribute(
+        parser_results, qualified_name, READONLY_UNSIGNED_SHORT_EXTENDED_ATTRIBUTES
+    )
+    if not member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be readonly")
+    if member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be non-nullable")
+    if member.type.tag() != WebIDL.IDLType.Tags.uint16:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must use `unsigned short`, got `{member.type.prettyName()}`"
+        )
+
+    return member
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -201,6 +261,10 @@ _SHAPE_SELECTORS = {
     READONLY_BOOLEAN: select_readonly_boolean_attribute,
     WRITABLE_LEGACY_DOMSTRING: select_writable_legacy_domstring_attribute,
     READONLY_USVSTRING: select_readonly_usvstring_attribute,
+    READONLY_ENUM: lambda results, name: select_readonly_enum_attribute(
+        results, name, DOCUMENT_VISIBILITY_STATE_VALUES
+    ),
+    READONLY_UNSIGNED_SHORT: select_readonly_unsigned_short_attribute,
 }
 
 
