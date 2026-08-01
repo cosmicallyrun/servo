@@ -4,6 +4,7 @@
 
 #include "servo_v8.h"
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -856,8 +857,45 @@ void ResetDocumentHost(ServoV8DocumentHostState* state) {
   }
 }
 
+// Drops buffered job state owned by one realm before that realm's context and
+// embedder state are detached. Pending rejections contain strong V8 handles;
+// leaving one behind would keep the destroyed context alive and would make the
+// handle outlive the realm state used for attribution.
+void ClearPendingJobStateForRealm(ServoV8Runtime* runtime,
+                                  ServoV8RealmId realm_id) {
+  auto& errors = runtime->pending_job_errors;
+  errors.erase(
+      std::remove_if(errors.begin(), errors.end(),
+                     [realm_id](const ServoV8PendingJobError& error) {
+                       return error.realm_id == realm_id;
+                     }),
+      errors.end());
+
+  auto& rejections = runtime->pending_rejections;
+  for (auto entry = rejections.begin(); entry != rejections.end();) {
+    if (entry->error.realm_id != realm_id) {
+      ++entry;
+      continue;
+    }
+    entry->promise.Reset();
+    entry = rejections.erase(entry);
+  }
+}
+
+// Every v8::Global must be reset before Isolate::Dispose. This also covers
+// failures whose realm could not be determined and therefore could not be
+// removed by ClearPendingJobStateForRealm.
+void ClearPendingJobState(ServoV8Runtime* runtime) {
+  runtime->pending_job_errors.clear();
+  for (auto& rejection : runtime->pending_rejections) {
+    rejection.promise.Reset();
+  }
+  runtime->pending_rejections.clear();
+}
+
 void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->tearing_down = true;
+  ClearPendingJobStateForRealm(runtime, realm->id);
   if (!realm->context.IsEmpty()) {
     v8::Local<v8::Context> context = realm->context.Get(runtime->isolate);
     context->SetAlignedPointerInEmbedderData(
@@ -1069,6 +1107,7 @@ extern "C" void servo_v8_runtime_delete(ServoV8Runtime* runtime) {
         DetachRealm(runtime, realm.second.get());
       }
       runtime->realms.clear();
+      ClearPendingJobState(runtime);
       runtime->context.Reset();
     }
     runtime->isolate->Dispose();

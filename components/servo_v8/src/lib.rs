@@ -1130,7 +1130,12 @@ mod tests {
 
         fn visibility_state(&self) -> String {
             // Mirrors Servo's enum-to-string, which is what crosses the ABI.
-            if self.hidden.get() { "hidden" } else { "visible" }.to_owned()
+            if self.hidden.get() {
+                "hidden"
+            } else {
+                "visible"
+            }
+            .to_owned()
         }
 
         fn node_type(&self) -> u16 {
@@ -1589,7 +1594,25 @@ mod tests {
                 .unwrap()
         );
 
+        // A rejection is retained through a v8::Global<Promise> until it is
+        // handled or reported. Destroying its realm before the next checkpoint
+        // must release that handle and discard the now-unreportable error,
+        // rather than pinning the dead context until runtime teardown.
+        let abandoned_rejection = compiled(runtime.compile_script_in_realm(
+            first,
+            "Promise.reject(new Error('realm is going away'));",
+            "abandoned-rejection.js",
+            1,
+        ));
+        assert_eq!(
+            runtime
+                .run_script_in_realm(first, abandoned_rejection)
+                .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+
         runtime.destroy_realm(first).unwrap();
+        assert!(runtime.take_pending_job_errors().unwrap().is_empty());
         let compile_error = runtime
             .compile_in_realm(first, "1;", "destroyed-realm.js", 1)
             .unwrap_err()
@@ -1665,7 +1688,10 @@ mod tests {
         // be the same JavaScript object, not merely an equal one.
         assert!(
             runtime
-                .eval_bool_in_realm(realm, "document.documentElement === document.documentElement")
+                .eval_bool_in_realm(
+                    realm,
+                    "document.documentElement === document.documentElement",
+                )
                 .unwrap()
         );
         assert!(

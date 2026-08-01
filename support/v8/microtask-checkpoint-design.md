@@ -137,6 +137,13 @@ Rejections are recorded with their promise identity rather than reported on
 sight, so `kPromiseHandlerAddedAfterReject` revokes the entry and a rejection
 handled later in the same drain reports nothing — which is what HTML wants.
 
+That identity is a strong `v8::Global<Promise>`, so it has explicit teardown
+rules. Destroying a realm removes its buffered errors and resets every pending
+promise owned by that realm before detaching the context; there is no global
+left on which such a failure could be reported. Runtime teardown then resets
+any unattributed promise handles before `Isolate::Dispose`, so a persistent
+handle can neither pin a dead realm nor outlive its isolate.
+
 Registering the listener requires an entered isolate. Doing it immediately
 after `Isolate::New`, before the isolate scope, segfaults: registering
 allocates on the V8 heap.
