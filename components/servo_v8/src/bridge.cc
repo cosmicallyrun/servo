@@ -896,6 +896,18 @@ extern "C" int32_t servo_v8_realm_create(
     WriteError(error, TryCatchMessage(isolate, try_catch));
     return 0;
   }
+  // V8 installs its own `console` on every context. With no inspector attached
+  // its methods silently discard everything, so an authoritative script would
+  // log nothing while the identical script on SpiderMonkey logs normally --
+  // a silent divergence rather than a visible gap. Removing it makes
+  // `console.log` a ReferenceError until a real host binding exists.
+  if (!global->Delete(context, V8String(isolate, "console")).FromMaybe(false)) {
+    context->SetAlignedPointerInEmbedderData(
+        kServoRealmStateEmbedderSlot, nullptr,
+        kServoRealmStateEmbedderTag);
+    WriteError(error, "V8 realm could not remove the built-in console");
+    return 0;
+  }
   hidden_getter->SetName(V8String(isolate, "get hidden"));
   bg_color_getter->SetName(V8String(isolate, "get bgColor"));
   bg_color_setter->SetName(V8String(isolate, "set bgColor"));

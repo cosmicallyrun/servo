@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+Runtime proof that the V8 realm exposes no API it cannot actually implement.
+
+V8 installs its own `console` on every context. With no inspector attached its
+methods silently discard everything, so before this was removed an
+authoritative script logged nothing while the identical script on SpiderMonkey
+logged normally -- a silent divergence rather than a visible gap, which is the
+one failure mode this experiment is meant not to have. `console.log` is now a
+ReferenceError until a real host binding exists.
+
+The script throws unless the surface is exactly what is claimed, so red means a
+wrong surface rather than merely that nothing ran.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative realm surface proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      if (typeof console !== "undefined") {
+        throw new Error("V8's silent built-in console is still exposed");
+      }
+      let threw = false;
+      try {
+        console.log("unreachable");
+      } catch (error) {
+        threw = error instanceof ReferenceError;
+      }
+      if (!threw) {
+        throw new Error("console.log must be a ReferenceError, not a no-op");
+      }
+      // The surface that IS claimed must still be intact.
+      if (globalThis !== window || window.window !== window ||
+          window.document !== document) {
+        throw new Error("bad identity");
+      }
+      document.bgColor =
+        document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

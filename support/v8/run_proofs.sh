@@ -35,6 +35,8 @@ proofs=(
   "authoritative_url_proof.html:(0, 255, 0):1:1"
   "authoritative_visibility_nodetype_proof.html:(0, 255, 0):1:1"
   "authoritative_timer_proof.html:(0, 255, 0):1:1"
+  "authoritative_realm_surface_proof.html:(0, 255, 0):1:1"
+  "authoritative_document_open_proof.html:(0, 255, 0):1:1"
 )
 
 failures=0
