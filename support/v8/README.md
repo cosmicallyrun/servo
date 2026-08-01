@@ -165,8 +165,27 @@ Any classic script with the exact `data-servo-v8="authoritative"` attribute
 takes this path, in every execution mode: parser-blocking, deferred, async,
 and dynamically inserted, inline or external. Servo still performs the normal
 HTML fetch, CSP, ordering, and settings-stack work, but V8 alone compiles and
-executes that script. Module, timer, worker, and service-worker scripts remain
-on SpiderMonkey.
+executes that script.
+
+String timer handlers opt in too, but through a prologue directive rather than
+an attribute, because a timer handler is a bare source string with no element
+to carry one:
+
+```js
+setTimeout('"use servo-v8"; /* body */', 0);
+```
+
+Like `"use strict"`, that evaluates to a harmless expression statement in an
+engine that does not recognise it, and only a genuine prologue directive counts
+— `"use servo-v8-nope"` does not opt in. The choice is deliberately not
+inherited from the scheduling script: the V8 host exposes no `setTimeout`, so
+an authoritative script cannot schedule a timer and inheritance could only ever
+select SpiderMonkey.
+
+That completes classic-script coverage on the window script thread. Module
+scripts remain on SpiderMonkey because they are a different creation path, not
+a kind of classic script, and worker and service-worker scripts remain
+SpiderMonkey-owned by design.
 
 Every mode routes through the same create/run pair, so the engine choice does
 not depend on the script kind. Deferred and async scripts do widen the window
@@ -260,6 +279,7 @@ Three proof pages use that same counting argument:
 | `authoritative_dynamic_proof.html` | SpiderMonkey can insert a script that V8 then executes |
 | `authoritative_url_proof.html` | `Document.URL` is served by the V8 host, getter-only |
 | `authoritative_visibility_nodetype_proof.html` | the enum and numeric shapes, the latter inherited from `Node` |
+| `authoritative_timer_proof.html` | a string timer handler runs on V8, handed off across a task boundary |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the

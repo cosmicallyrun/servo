@@ -34,6 +34,7 @@ proofs=(
   "authoritative_dynamic_proof.html:(0, 255, 0):1:1"
   "authoritative_url_proof.html:(0, 255, 0):1:1"
   "authoritative_visibility_nodetype_proof.html:(0, 255, 0):1:1"
+  "authoritative_timer_proof.html:(0, 255, 0):1:1"
 )
 
 failures=0

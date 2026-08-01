@@ -149,6 +149,50 @@ pub(crate) enum OneshotTimerCallback {
     },
 }
 
+/// The prologue directive that opts a string timer handler into V8.
+///
+/// A timer handler is a bare source string with no element to carry the
+/// `data-servo-v8` attribute the other authoritative routes use, so the marker
+/// has to travel inside the source. A prologue directive is the one construct
+/// that already does that in JavaScript, and like `"use strict"` it evaluates
+/// to a harmless expression statement in engines that do not recognise it.
+#[cfg(feature = "v8-classic-script-authoritative")]
+const V8_TIMER_DIRECTIVE: &str = "use servo-v8";
+
+/// Chooses the engine for a string timer handler.
+///
+/// This is deliberately not inherited from the scheduling script: the V8 host
+/// exposes no `setTimeout`, so an authoritative script cannot schedule a timer
+/// and inheritance could only ever select SpiderMonkey.
+#[cfg(feature = "v8-classic-script-authoritative")]
+fn classic_timer_engine(handler: &str) -> ClassicScriptEngine {
+    let prologue = handler.trim_start();
+    let opts_in = [
+        format!("\"{V8_TIMER_DIRECTIVE}\""),
+        format!("'{V8_TIMER_DIRECTIVE}'"),
+    ]
+    .iter()
+    .any(|directive| {
+        // Only a genuine prologue directive counts, so a longer string merely
+        // starting with these characters cannot opt in by accident.
+        prologue.strip_prefix(directive.as_str()).is_some_and(|rest| {
+            rest.trim_start()
+                .starts_with([';', '\n', '\r'].as_slice()) ||
+                rest.trim().is_empty()
+        })
+    });
+    if opts_in {
+        ClassicScriptEngine::V8Authoritative
+    } else {
+        ClassicScriptEngine::SpiderMonkey
+    }
+}
+
+#[cfg(not(feature = "v8-classic-script-authoritative"))]
+fn classic_timer_engine(_handler: &str) -> ClassicScriptEngine {
+    ClassicScriptEngine::SpiderMonkey
+}
+
 impl OneshotTimerCallback {
     fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers, cx: &mut JSContext) {
         match self {
@@ -818,7 +862,7 @@ impl JsTimerTask {
                     Some(IntroductionType::DOM_TIMER),
                     1,
                     false,
-                    ClassicScriptEngine::SpiderMonkey,
+                    classic_timer_engine(&code_str.str()),
                 );
 
                 // Step 9.6.9. Run the classic script script.
