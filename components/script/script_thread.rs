@@ -130,6 +130,8 @@ use crate::dom::bindings::error::ErrorInfo;
 #[cfg(feature = "v8-classic-script-authoritative")]
 use js::gc::HandleValue;
 #[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
+#[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::conversions::{
@@ -223,6 +225,28 @@ struct V8DocumentHiddenStats {
     url_getter_calls: Cell<u64>,
 }
 
+/// A host for one Servo `Element` that V8 has been handed.
+///
+/// The `Trusted<Element>` is the single cross-heap edge: it keeps the element
+/// alive while script can still reach the wrapper, and it is released when the
+/// wrapper's cppgc cell is collected. Nothing in the SpiderMonkey heap points
+/// back at V8, so this edge cannot close a cycle.
+#[cfg(feature = "v8-shadow")]
+struct V8ElementHost {
+    element: Trusted<Element>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: This host stays on its element's originating script thread, roots
+// the element only for the duration of a synchronous read, and its Drop only
+// releases a Trusted handle -- it never re-enters V8 or pumps an event loop.
+unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
+    fn tag_name(&self) -> String {
+        self.element.root().TagName().into()
+    }
+}
+
 #[cfg(feature = "v8-shadow")]
 struct V8DocumentHost {
     document: Trusted<Document>,
@@ -271,6 +295,20 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
     fn node_type(&self) -> u16 {
         // Document inherits from Node, so this is served by the same facade.
         self.document.root().upcast::<Node>().NodeType()
+    }
+
+    fn document_element(&self) -> Option<servo_v8::InterfaceHandle> {
+        let element = self.document.root().GetDocumentElement()?;
+        // SAFETY: The key is the address of the element the host below roots,
+        // and that root outlives every cache entry keyed on it.
+        Some(unsafe {
+            servo_v8::InterfaceHandle::new(
+                (&*element as *const Element).cast::<c_void>(),
+                V8ElementHost {
+                    element: Trusted::new(&*element),
+                },
+            )
+        })
     }
 
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
@@ -1738,8 +1776,13 @@ impl ScriptThread {
 
         #[cfg(feature = "v8-shadow")]
         let v8_shadow = match servo_v8::Runtime::new(servo_v8::Options::default()) {
-            Ok(runtime) => {
+            Ok(mut runtime) => {
                 *v8_interrupt.lock().unwrap() = Some(runtime.interrupt_handle());
+                // Type-level and installed once per runtime, before any realm
+                // can hand an Element to script.
+                if let Err(error) = runtime.install_element_host::<V8ElementHost>() {
+                    panic!("V8 Element host installation failed: {error}");
+                }
                 Some(V8ShadowState {
                     runtime,
                     realms: FxHashMap::default(),

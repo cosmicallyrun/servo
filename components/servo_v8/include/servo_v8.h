@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 12u
+#define SERVO_V8_ABI_VERSION 13u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -66,9 +66,31 @@ typedef void (*ServoV8TraceCallback)(void* native,
                                      ServoV8TraceVisitor* visitor);
 typedef void (*ServoV8DropCallback)(void* native);
 
+/* A DOM object being handed to script.
+ *
+ * `key` is the DOM object's address, used only as a cache identity. It is safe
+ * as one because the wrapper cell holds a strong Servo root, so the object
+ * cannot be freed -- and its address cannot be reused -- while a cache entry
+ * for it can still be hit.
+ *
+ * `native` is a freshly boxed host. The bridge consumes it only when it
+ * creates a new wrapper, and drops it through the vtable's drop callback when
+ * an existing wrapper is found, so the transfer stays transactional. */
+typedef struct ServoV8InterfaceValue {
+  uint8_t is_null;
+  const void* key;
+  void* native;
+} ServoV8InterfaceValue;
+
 /* Generated typed WebIDL vtables contain only POD values and native pointers. */
 #include "servo_v8_generated.h"
 #include "servo_v8_document_host_generated.h"
+
+/* Declared after the generated header, which defines ServoV8OwnedUtf8. */
+typedef struct ServoV8ElementHostVTable {
+  uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
+  ServoV8DropCallback drop;
+} ServoV8ElementHostVTable;
 
 uint32_t servo_v8_abi_version(void);
 
@@ -169,6 +191,12 @@ int32_t servo_v8_realm_document_hidden(ServoV8Runtime* runtime,
                                        ServoV8RealmId realm_id,
                                        uint8_t* result,
                                        ServoV8ErrorBuffer* error);
+
+/* Registers the type-level Element host vtable for this runtime. */
+int32_t servo_v8_install_element_host(
+    ServoV8Runtime* runtime,
+    const ServoV8ElementHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
 
 int32_t servo_v8_install_engine_binding_smoke(
     ServoV8Runtime* runtime,

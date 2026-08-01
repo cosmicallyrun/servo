@@ -31,6 +31,7 @@ DOCUMENT_BG_COLOR = "Document.bgColor"
 DOCUMENT_URL = "Document.URL"
 DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
 NODE_NODE_TYPE = "Node.nodeType"
+DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -40,6 +41,7 @@ WRITABLE_LEGACY_DOMSTRING = "CEReactions writable LegacyNullToEmptyString DOMStr
 READONLY_USVSTRING = "readonly USVString"
 READONLY_ENUM = "readonly enum"
 READONLY_UNSIGNED_SHORT = "readonly unsigned short"
+READONLY_NULLABLE_INTERFACE = "readonly nullable interface"
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
@@ -54,6 +56,9 @@ WRITABLE_LEGACY_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"CEReactions"})
 READONLY_USVSTRING_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
 READONLY_ENUM_EXTENDED_ATTRIBUTES = frozenset()
 READONLY_UNSIGNED_SHORT_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
+# `[Pure]` is a SpiderMonkey alias-set hint, like `[Constant]` but weaker, and
+# says nothing the V8 accessor needs to honour.
+READONLY_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 
 # An enum crosses the ABI as its string value, so the generated glue is only
 # correct for the exact value set it was written against. Pinning the set makes
@@ -70,6 +75,9 @@ DOCUMENT_HOST: tuple[tuple[str, str], ...] = (
     # Document inherits from Node, so this lands on the existing document
     # facade: no second host, no second native pointer, no second vtable.
     (NODE_NODE_TYPE, READONLY_UNSIGNED_SHORT),
+    # The first member whose value is another DOM object, and so the first that
+    # needs the per-realm wrapper cache to preserve identity.
+    (DOCUMENT_DOCUMENT_ELEMENT, READONLY_NULLABLE_INTERFACE),
 )
 
 
@@ -246,6 +254,36 @@ def select_readonly_unsigned_short_attribute(
     return member
 
 
+def select_readonly_nullable_interface_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_interface: str,
+) -> WebIDL.IDLAttribute:
+    """Select one readonly, nullable attribute returning a named interface."""
+
+    member = _select_instance_attribute(
+        parser_results, qualified_name, READONLY_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES
+    )
+    if not member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be readonly")
+    # Nullable is required rather than merely tolerated: the generated glue
+    # returns JS null for an absent object and has no other way to say "none".
+    if not member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be nullable")
+    if not member.type.inner.isInterface():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return an interface, got `{member.type.prettyName()}`"
+        )
+
+    actual_interface = member.type.inner.name
+    if actual_interface != expected_interface:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return `{expected_interface}`, got `{actual_interface}`"
+        )
+
+    return member
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -265,6 +303,9 @@ _SHAPE_SELECTORS = {
         results, name, DOCUMENT_VISIBILITY_STATE_VALUES
     ),
     READONLY_UNSIGNED_SHORT: select_readonly_unsigned_short_attribute,
+    READONLY_NULLABLE_INTERFACE: lambda results, name: select_readonly_nullable_interface_attribute(
+        results, name, "Element"
+    ),
 }
 
 

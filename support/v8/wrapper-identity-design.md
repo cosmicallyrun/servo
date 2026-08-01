@@ -1,0 +1,219 @@
+# Per-realm wrapper identity for DOM objects
+
+Status: implemented, at exported C ABI version 13. `Document.documentElement`
+and `Element.tagName` are the first members built on it.
+
+This is the subsystem every interface-typed binding waits on.
+`Document.documentElement`, `Element.tagName`, and eventually anything that
+hands a DOM node to script all need the same thing: asking for the same DOM
+object twice must produce the *same* JavaScript object.
+
+## What already exists, and why it does not generalise
+
+The synthetic `EngineBindingSmoke` slice creates wrappers the easy way round.
+JavaScript calls a constructor, V8 allocates the object first, and only then
+does Rust allocate the native behind it:
+
+```
+new EngineBindingSmoke(7)
+  -> V8 creates info.This()
+  -> Rust allocates the native
+  -> cppgc::MakeGarbageCollected<ServoV8DomCell>(native, ...)
+  -> v8::Object::Wrap<kServoDomTag>(isolate, info.This(), cell)
+```
+
+Identity is free there, because the JS object exists before the native does and
+there is exactly one of each.
+
+Returning `document.documentElement` is the reverse. Servo already owns the
+`Element`; it may already have been handed to script; and a second read must
+not mint a second wrapper. So the missing piece is a lookup from an existing
+Servo DOM object to a wrapper that may or may not exist yet.
+
+## The cross-heap edge is one-way
+
+Three heaps are involved: SpiderMonkey owns the DOM objects, V8 owns the JS
+objects, and cppgc (unified with V8) owns the embedder cells.
+
+A wrapper cell must hold the DOM object alive while script can still reach it,
+so the cell holds a strong Servo root — `Trusted<Element>`, exactly as the
+existing `Document` host holds `Trusted<Document>`. That is an edge from cppgc
+into SpiderMonkey.
+
+There is no edge back. No Servo DOM object holds a V8 handle, a cppgc pointer,
+or a cell; the V8 side is reached only through the sidecar, never from the DOM.
+Because every cross-heap edge points the same way, **a cross-heap cycle cannot
+form**, and the usual reason embedders need an ephemeron/wrapper-tracing
+protocol between the two collectors does not arise here.
+
+That matters because an earlier audit recorded the opposite — that a V8-held
+`Element` would create a cycle neither collector could break — and treated it
+as a blocker. The direction of the edges is what settles it.
+
+Collection then works out on its own terms:
+
+- Script drops its last reference to the wrapper. V8 collects the wrapper,
+  cppgc collects the cell, the cell's destructor drops the `Trusted<Element>`,
+  and SpiderMonkey is free to collect the element.
+- Servo detaches the element from the tree, but script still holds the wrapper.
+  The element stays alive, which is correct: script can still reach it.
+
+## Identity, and why the DOM object's address is a safe key
+
+The cache lives on the V8 side, per realm, because Servo's DOM objects have one
+reflector slot and it belongs to SpiderMonkey. A realm therefore holds a map
+from the DOM object to a weak handle on its wrapper.
+
+Keying that map on the DOM object's raw address looks unsafe, and the first
+instinct is to invent an id instead: an address is only unique while the object
+is alive, so a freed element could be replaced by a new allocation at the same
+address and collide with a stale entry. That reasoning is correct in general
+and does not apply here, because of what the cell holds:
+
+> A cache entry can only be hit while its cell is alive. The cell holds
+> `Trusted<Element>`. So while an entry is reachable, its element is alive, and
+> its address cannot have been reused.
+
+The hazard needs a live entry pointing at a dead object, and the strong root
+makes that state unreachable. An id would add a second source of truth to keep
+in sync for a collision the design already prevents.
+
+Entries are `cppgc::WeakPersistent`, so an entry clears itself when its cell
+dies rather than pinning wrappers for the life of the realm.
+
+One ordering subtlety is worth stating because it looks like a bug. cppgc
+clears weak references during marking, while destructors run later during
+sweeping, so there is a window where the entry reads as empty but the cell and
+its element are still alive. A lookup in that window misses and mints a second
+wrapper for a still-live element — identity apparently broken.
+
+It is not observable. Weak clearing only happens once the cell is unreachable
+from V8, which means no JavaScript reference to the old wrapper survives; there
+is nothing left for script to compare the new wrapper against. Identity is only
+required to hold for wrappers script can still reach, and for those the entry
+is still strong.
+
+## Ownership across the ABI
+
+An interface-typed getter hands back the DOM object's address as a cache key
+together with a freshly boxed host, allocated before anyone knows whether it
+will be needed.
+
+- Cache hit: the bridge returns the existing wrapper and drops the surplus host
+  through its drop callback, so ownership never straddles the two outcomes and
+  nothing leaks on the path that allocated speculatively.
+- Cache miss: the bridge allocates a cell, wraps a new object from the realm's
+  `Element` template, and records the entry.
+
+Allocating a host that may immediately be dropped is the price of resolving the
+cache on the side that owns it; the alternative is a second round trip to ask
+whether a wrapper exists before building one.
+
+A nullable return needs no extra machinery: the null flag becomes JavaScript
+`null`, which is what `documentElement` yields before the tree has a root
+element.
+
+## Why not simply hold every wrapper strongly
+
+A per-realm map of `v8::Global<v8::Object>` would give correct identity in a
+dozen lines, and it is what a first attempt reaches for. It is rejected because
+the lifetime it implies is wrong in a way that only shows up under load: every
+element ever handed to script would be pinned until its pipeline is destroyed,
+so a long-lived page that walks the DOM would accumulate wrappers and the Servo
+elements behind them without bound. Weak entries are the difference between a
+demo and something that can survive a real page.
+
+It would also reintroduce the address-reuse hazard from the other direction, by
+keeping entries alive past the point where anything guarantees their key still
+identifies the object it was created for.
+
+## Where the generator fits
+
+The manifest carries `Document.documentElement` like any other member, and the
+generator emits its ABI slot, its Rust trait method, thunk and vtable wiring
+from a `readonly nullable interface` shape — so the selector still rejects a
+member whose WebIDL drifts.
+
+What the generator does *not* emit for this shape is the C++ accessor body. The
+wrapper cache, the cell, and the per-realm `Element` template are
+infrastructure, and live in `bridge.cc` beside the hand-written `document`
+facade, because the generator has always written accessor bodies onto a facade
+someone else builds. Teaching it to emit interface-return bodies is worth doing
+once a second such member exists to generalise from.
+
+## What this does not do
+
+Nothing here gives V8 the ability to *mutate* the DOM, and nothing here accepts
+a JavaScript function as a callback. Those are separate problems: the first
+needs the CEReactions boundary moved out of the accessor, and the second needs a
+story for a V8 function held by a Servo event target, which reverses the edge
+direction this design depends on and so has to be reasoned about again from
+scratch.
+
+## The constraint this design depends on
+
+No object in the SpiderMonkey heap may ever hold a V8 handle, a cppgc pointer,
+or anything that keeps a wrapper cell alive. That, and not the strong root the
+cells hold, is what would create a cycle neither collector can see through.
+
+The tempting design that breaks it is the conventional one: a wrapper slot on
+the DOM object itself, which is how a single-engine embedder normally gets
+identity. Here that would close the loop — `Element` → wrapper → cell →
+`Trusted<Element>` — so identity has to live in a side table instead, which is
+what the per-realm cache is.
+
+## Teardown must not wait for a collection
+
+Realm destruction releases every host synchronously rather than letting the
+cells' destructors do it whenever the next collection happens. Each host roots
+its element and, through it, the tree; leaving that to a GC would pin a
+destroyed pipeline's DOM for as long as the isolate stayed idle, which for a
+background tab may be indefinitely. Servo already depends on the document
+host's release being synchronous for the same reason, and the wrapper cells now
+match it.
+
+The cells themselves stay cppgc-owned and die on their own schedule. Only the
+Servo roots are released early, which is the part with an observable cost.
+
+## Releasing a host from a collection
+
+A cell's destructor runs during sweeping and drops a host holding non-atomic
+Rust state. Two properties make that sound, and both are worth naming because
+they are configuration rather than luck:
+
+- cppgc marking and sweeping are atomic, so destructors run in the pause on the
+  owner thread. A concurrent sweeper would be dropping an `Rc` off-thread.
+- Dropping a `Trusted<T>` performs no SpiderMonkey call and no allocation. It
+  decrements a refcount and makes the object *eligible* for collection at the
+  next SpiderMonkey GC; nothing is freed inside the V8 pause.
+
+The drop is wrapped in the same re-entrancy scope every other Rust callback
+uses. Without it the runtime check would *accept* a bridge call made from a
+host's `Drop`, which during sweeping means re-entering V8 mid-collection.
+
+## Known limitation: dead entries are pruned lazily
+
+A cleared entry is removed only when the same key is looked up again, or when
+the realm dies. An element exposed once, collected, and never queried again
+leaves a dead slot behind. That costs map memory, and more importantly a node
+in cppgc's weak persistent region, which is walked in full at every collection
+— so GC pause time grows with historical DOM churn rather than with live DOM
+size.
+
+Servo solves the identical problem for `Trusted<T>` by pruning nulls on table
+growth and at every GC trace, and this cache should do the same. It is not
+urgent while the host surface exposes one element per document, and it becomes
+urgent the moment anything walks the tree.
+
+## Proofs
+
+`authoritative_wrapper_identity_proof.html` covers the runtime behaviour
+against real Servo DOM, and `interface_returns_preserve_wrapper_identity`
+covers the bridge:
+
+- the same DOM object read twice through V8 is the same JS object, checked by
+  an expando surviving a re-read rather than by equality alone
+- the wrapper is not the document facade, and `tagName` is brand-checked
+- a cache hit drops the host the reading path speculatively allocated
+- realm destruction releases the one live host synchronously
+- `documentElement` is `null` when there is no root element

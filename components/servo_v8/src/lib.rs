@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 12;
+const ABI_VERSION: u32 = 13;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -137,6 +137,89 @@ impl Default for Options {
 pub type TraceCallback = unsafe extern "C" fn(*mut c_void, *mut TraceVisitor);
 pub type DropCallback = unsafe extern "C" fn(*mut c_void);
 
+#[repr(C)]
+pub struct RawInterfaceValue {
+    pub is_null: u8,
+    pub key: *const c_void,
+    pub native: *mut c_void,
+}
+
+/// One Servo DOM object being handed to script.
+///
+/// `key` identifies the object for the realm's wrapper cache, so that reading
+/// the same object twice yields the same JavaScript object. A raw address is
+/// safe here only because the wrapper cell keeps that object alive for exactly
+/// as long as a cache entry for it can be hit.
+///
+/// `native` is a freshly boxed host. The bridge takes it only when it creates
+/// a new wrapper, and drops it through the vtable when an existing wrapper is
+/// found, so ownership never straddles the two outcomes.
+pub struct InterfaceHandle {
+    pub key: *const c_void,
+    pub native: *mut c_void,
+}
+
+impl InterfaceHandle {
+    /// Boxes `host` and derives the cache key from `dom_object`.
+    ///
+    /// # Safety
+    ///
+    /// `dom_object` must be the address of the DOM object `host` roots, and
+    /// that root must keep it alive for as long as the host lives. Passing an
+    /// address the host does not root would let the cache outlive its object.
+    pub unsafe fn new<T: ElementHostBinding>(dom_object: *const c_void, host: T) -> Self {
+        Self {
+            key: dom_object,
+            native: Box::into_raw(Box::new(host)).cast::<c_void>(),
+        }
+    }
+}
+
+/// A host for one Servo `Element` reachable from V8.
+///
+/// # Safety
+///
+/// Implementations must stay on the owning script thread, must not unwind,
+/// and must root the DOM object they read for the duration of the call. The
+/// implementation is dropped from a cppgc destructor during a V8 collection,
+/// so its `Drop` must not re-enter V8 or pump an event loop.
+pub unsafe trait ElementHostBinding: Sized + 'static {
+    fn tag_name(&self) -> String;
+}
+
+#[repr(C)]
+pub struct ElementHostVTable {
+    pub get_tag_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub drop: Option<DropCallback>,
+}
+
+unsafe extern "C" fn element_host_get_tag_name<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut OwnedUtf8,
+) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract requires a live Box<T> native pointer.
+    let native = unsafe { &*native.cast::<T>() };
+    let owner = Box::new(native.tag_name().into_bytes());
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe {
+        *output = OwnedUtf8 {
+            data: owner.as_ptr(),
+            length: owner.len(),
+            owner: Box::into_raw(owner).cast::<c_void>(),
+            drop_owner: Some(document_host_owned_utf8_drop),
+        };
+    }
+    1
+}
+
+unsafe extern "C" fn element_host_drop<T: ElementHostBinding>(native: *mut c_void) {
+    // SAFETY: The bridge hands back exactly the Box<T> it was given, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
 include!(concat!(env!("OUT_DIR"), "/servo_v8_generated.rs"));
 include!(concat!(
     env!("OUT_DIR"),
@@ -224,6 +307,11 @@ unsafe extern "C" {
         runtime: *mut RawRuntime,
         realm_id: RealmId,
         result: *mut u8,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_install_element_host(
+        runtime: *mut RawRuntime,
+        vtable: *const ElementHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_install_engine_binding_smoke(
@@ -704,6 +792,27 @@ impl Runtime {
         }
     }
 
+    /// Registers how the bridge talks to an `Element` host, once per runtime.
+    ///
+    /// The vtable is type-level; the hosts it describes are per DOM object and
+    /// are handed over one at a time by an interface-typed getter.
+    pub fn install_element_host<T: ElementHostBinding>(&mut self) -> Result<(), Error> {
+        let vtable = ElementHostVTable {
+            get_tag_name: Some(element_host_get_tag_name::<T>),
+            drop: Some(element_host_drop::<T>),
+        };
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The runtime is live and both the vtable and error buffer
+        // remain valid for the duration of the call.
+        let succeeded =
+            unsafe { servo_v8_install_element_host(self.raw.as_ptr(), &vtable, &mut error) };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
     /// Discards a retained classic script without executing it.
     pub fn discard_script_in_realm(
         &mut self,
@@ -941,6 +1050,26 @@ mod tests {
         child: Cell<Option<EngineBindingSmokeHandle>>,
     }
 
+    /// A stand-in for one Servo Element.
+    struct ElementHostProbe {
+        tag_name: String,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for ElementHostProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    // SAFETY: The probe stays on its Runtime's thread, cannot unwind, and its
+    // Drop only touches an Rc counter.
+    unsafe impl ElementHostBinding for ElementHostProbe {
+        fn tag_name(&self) -> String {
+            self.tag_name.clone()
+        }
+    }
+
     struct DocumentHostProbe {
         hidden: Rc<Cell<bool>>,
         bg_color: Rc<RefCell<String>>,
@@ -948,6 +1077,10 @@ mod tests {
         bg_color_getter_calls: Rc<Cell<usize>>,
         bg_color_setter_calls: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
+        /// Stands in for the address of a Servo Element the host would root.
+        /// Stable for this probe's lifetime, which is what identity needs.
+        element_identity: Box<u8>,
+        element_drops: Rc<Cell<usize>>,
     }
 
     impl DocumentHostProbe {
@@ -963,6 +1096,8 @@ mod tests {
                 bg_color_getter_calls: Rc::new(Cell::new(0)),
                 bg_color_setter_calls: Rc::new(Cell::new(0)),
                 drops,
+                element_identity: Box::new(0),
+                element_drops: Rc::new(Cell::new(0)),
             }
         }
     }
@@ -1001,6 +1136,20 @@ mod tests {
         fn node_type(&self) -> u16 {
             // Node.DOCUMENT_NODE.
             9
+        }
+
+        fn document_element(&self) -> Option<InterfaceHandle> {
+            // SAFETY: `element_identity` lives as long as this host, which is
+            // what the probe stands in for -- a real host roots its element.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    (&*self.element_identity as *const u8).cast::<c_void>(),
+                    ElementHostProbe {
+                        tag_name: "HTML".to_owned(),
+                        drops: Rc::clone(&self.element_drops),
+                    },
+                )
+            })
         }
 
         unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
@@ -1487,6 +1636,99 @@ mod tests {
         assert_eq!(outcome, ScriptRunOutcome::Terminated);
         drop(runtime);
         assert!(!interrupt.terminate_execution());
+    }
+
+    #[test]
+    fn interface_returns_preserve_wrapper_identity() {
+        let options = Options {
+            expose_gc: 1,
+            ..Options::default()
+        };
+        let mut runtime = Runtime::new(options).unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+        // Type-level, so a second install is a misuse rather than a no-op.
+        assert!(runtime.install_element_host::<ElementHostProbe>().is_err());
+
+        let realm = runtime.create_realm().unwrap();
+        let element_drops = Rc::new(Cell::new(0));
+        let mut host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        host.element_drops = Rc::clone(&element_drops);
+        runtime.install_document_host(realm, host).unwrap();
+
+        // The point of the wrapper cache: the same DOM object read twice must
+        // be the same JavaScript object, not merely an equal one.
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "document.documentElement === document.documentElement")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "document.documentElement.tagName === 'HTML'")
+                .unwrap()
+        );
+        // A property set on the wrapper survives a re-read, which an
+        // equal-but-distinct object would not manage.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.documentElement.marker = 17; \
+                     document.documentElement.marker === 17"
+                )
+                .unwrap()
+        );
+        // The wrapper is an object of its own, not the document facade.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.documentElement !== document && \
+                     typeof document.documentElement === 'object'"
+                )
+                .unwrap()
+        );
+        // Reading tagName off a foreign receiver must not reach a host.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { \
+                       const descriptor = Object.getOwnPropertyDescriptor( \
+                         document.documentElement, 'tagName'); \
+                       try { descriptor.get.call({}); } \
+                       catch (error) { return error instanceof TypeError; } \
+                       return false; \
+                     })()"
+                )
+                .unwrap()
+        );
+
+        // Realm destruction must release every element host synchronously,
+        // not whenever the next collection happens. Each host roots its
+        // element, and through it the tree, so waiting for a GC would pin a
+        // destroyed pipeline's DOM for as long as the isolate stays idle.
+        // Every read past the first hits the cache, and each hit drops the
+        // host that read speculatively allocated -- so those drops have
+        // already happened, and exactly one live host remains.
+        let dropped_on_cache_hits = element_drops.get();
+        assert!(
+            dropped_on_cache_hits > 0,
+            "cache hits must drop the surplus host they allocated"
+        );
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(
+            element_drops.get(),
+            dropped_on_cache_hits + 1,
+            "realm destruction must release the one cached host, synchronously"
+        );
+        drop(runtime);
     }
 
     #[test]

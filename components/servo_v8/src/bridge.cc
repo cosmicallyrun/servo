@@ -222,6 +222,70 @@ struct ServoV8DomCell final : public v8::Object::Wrappable {
   v8::TracedReference<v8::Object> wrapper_;
 };
 
+// A wrapper for a Servo DOM object that already exists.
+//
+// ServoV8DomCell above is created the other way round -- JavaScript calls a
+// constructor, so the JS object exists before the native does and identity is
+// free. Handing back an object Servo already owns needs the reverse lookup, so
+// these cells are registered in their realm's wrapper cache.
+//
+// The cell holds the only cross-heap edge: strong into SpiderMonkey, via a
+// Trusted<T> inside the native host. Nothing in the SpiderMonkey heap points
+// back, so no cross-heap cycle can form.
+struct ServoV8HostCell final : public v8::Object::Wrappable {
+ public:
+  ServoV8HostCell(ServoV8Runtime* runtime,
+                  void* native,
+                  ServoV8DropCallback drop,
+                  const void* key)
+      : runtime_(runtime), native_(native), drop_(drop), key_(key) {}
+
+  ~ServoV8HostCell() override {
+    wrapper_.Reset();
+    ReleaseHost();
+  }
+
+  // Releases the host now rather than whenever the next collection happens.
+  //
+  // Realm teardown must not leave hosts alive: each holds a Trusted<T> that
+  // roots its DOM object, and through it the tree, so waiting for a GC would
+  // pin a destroyed pipeline's DOM for as long as the isolate stays idle.
+  // Servo relies on this release being synchronous.
+  void ReleaseHost();
+
+  void SetWrapper(v8::Isolate* isolate, v8::Local<v8::Object> wrapper) {
+    wrapper_.Reset(isolate, wrapper);
+  }
+
+  v8::Local<v8::Object> wrapper(v8::Isolate* isolate) const {
+    return wrapper_.Get(isolate);
+  }
+
+  void Trace(cppgc::Visitor* visitor) const override {
+    v8::Object::Wrappable::Trace(visitor);
+    visitor->Trace(wrapper_);
+  }
+
+  const v8::Object::WrapperTypeInfo* GetWrapperTypeInfo() const override {
+    return &kTypeInfo;
+  }
+
+  const char* GetHumanReadableName() const override { return "ServoV8HostCell"; }
+
+  void* native() const { return native_; }
+  const void* key() const { return key_; }
+
+ private:
+  static constexpr v8::Object::WrapperTypeInfo kTypeInfo{2};
+  ServoV8Runtime* runtime_;
+  void* native_;
+  ServoV8DropCallback drop_;
+  // The DOM object's address. Safe as an identity only because this cell keeps
+  // that object alive for exactly as long as the cache entry can be hit.
+  const void* key_;
+  v8::TracedReference<v8::Object> wrapper_;
+};
+
 struct ServoV8DocumentHostState {
   ServoV8Runtime* runtime = nullptr;
   void* native = nullptr;
@@ -237,6 +301,11 @@ struct ServoV8RealmState {
   v8::Global<v8::Context> context;
   v8::Global<v8::Object> document;
   std::unordered_map<ServoV8ScriptId, v8::Global<v8::Script>> scripts;
+  // Weak, so a wrapper script can no longer reach is collected rather than
+  // pinned for the life of the realm along with the element behind it.
+  std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
+      wrappers;
+  v8::Global<v8::ObjectTemplate> element_template;
   ServoV8DocumentHostState document_host;
   bool tearing_down = false;
 };
@@ -279,6 +348,8 @@ struct ServoV8Runtime {
   uint32_t rust_callback_depth = 0;
   ServoV8EngineBindingSmokeVTable engine_binding_smoke_vtable{};
   bool engine_binding_smoke_installed = false;
+  ServoV8ElementHostVTable element_host_vtable{};
+  bool element_host_installed = false;
   bool expose_gc = false;
 };
 
@@ -286,6 +357,11 @@ namespace {
 
 constexpr v8::CppHeapPointerTag kServoDomTag =
     v8::CppHeapPointerTag::kFirstObjectWrappableTag;
+// A separate tag, so unwrapping one cell type can never mis-cast the other.
+constexpr v8::CppHeapPointerTag kServoHostTag =
+    static_cast<v8::CppHeapPointerTag>(
+        static_cast<uint16_t>(v8::CppHeapPointerTag::kFirstObjectWrappableTag) +
+        1);
 constexpr int kServoRealmStateEmbedderSlot = 1;
 constexpr v8::EmbedderDataTypeTag kServoRealmStateEmbedderTag = 1;
 
@@ -635,6 +711,141 @@ bool CallDocumentHostSetBgColor(ServoV8DocumentHostState* state,
 #include "servo_v8_generated.inc"
 #include "servo_v8_document_host_generated.inc"
 
+// Finds or creates the wrapper for one DOM object, preserving identity.
+//
+// A hit drops the surplus host the caller speculatively allocated, so
+// ownership never straddles the two outcomes.
+v8::Local<v8::Object> WrapperForInterfaceValue(
+    ServoV8RealmState* realm,
+    v8::Isolate* isolate,
+    v8::Local<v8::Context> context,
+    const ServoV8InterfaceValue& value) {
+  ServoV8Runtime* runtime = realm->runtime;
+  const ServoV8DropCallback drop = runtime->element_host_vtable.drop;
+
+  const auto entry = realm->wrappers.find(value.key);
+  if (entry != realm->wrappers.end()) {
+    if (ServoV8HostCell* cell = entry->second.Get()) {
+      if (value.native && drop) drop(value.native);
+      return cell->wrapper(isolate);
+    }
+    // cppgc clears the weak entry once the cell dies. The stale slot is only
+    // removed here, which is also what makes a later address reuse safe.
+    realm->wrappers.erase(entry);
+  }
+
+  v8::Local<v8::Object> wrapper;
+  if (!realm->element_template.Get(isolate)
+           ->NewInstance(context)
+           .ToLocal(&wrapper)) {
+    if (value.native && drop) drop(value.native);
+    return v8::Local<v8::Object>();
+  }
+
+  v8::CppHeap* cpp_heap = isolate->GetCppHeap();
+  auto* cell = cppgc::MakeGarbageCollected<ServoV8HostCell>(
+      cpp_heap->GetAllocationHandle(), runtime, value.native, drop, value.key);
+  // Keep the cell reachable across the Wrap call, which can allocate.
+  cppgc::Persistent<ServoV8HostCell> pending(cell);
+  v8::Object::Wrap<kServoHostTag>(isolate, wrapper, cell);
+  cell->SetWrapper(isolate, wrapper);
+  realm->wrappers[value.key] = cell;
+  pending.Clear();
+  return wrapper;
+}
+
+void* UnwrapElementHostNative(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Local<v8::Value> receiver = info.This();
+  if (!receiver->IsObject()) return nullptr;
+  auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(
+      info.GetIsolate(), receiver.As<v8::Object>());
+  return cell ? cell->native() : nullptr;
+}
+
+void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  auto* realm = static_cast<ServoV8RealmState*>(
+      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  void* native = UnwrapElementHostNative(info);
+  if (!realm || realm->tearing_down || !realm->runtime || !native ||
+      !realm->runtime->element_host_vtable.get_tag_name) {
+    ThrowTypeError(isolate, "invalid Element host state");
+    return;
+  }
+  if (realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "re-entrant Element host callback");
+    return;
+  }
+
+  ServoV8OwnedUtf8 value{};
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_tag_name(native, &value)) {
+      ThrowTypeError(isolate, "Element.tagName host callback failed");
+      return;
+    }
+  }
+  DocumentHostOwnedUtf8Scope value_scope(&value);
+  if ((!value.data && value.length != 0) ||
+      value.length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(isolate, "invalid Element.tagName UTF-8 result");
+    return;
+  }
+  v8::Local<v8::String> result;
+  if (!v8::String::NewFromUtf8(isolate,
+                               reinterpret_cast<const char*>(value.data),
+                               v8::NewStringType::kNormal,
+                               static_cast<int>(value.length))
+           .ToLocal(&result)) {
+    return;
+  }
+  info.GetReturnValue().Set(result);
+}
+
+void DocumentHostGetDocumentElement(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  auto* state = UnwrapDocumentHostState(info);
+  if (!state || !state->native || !state->vtable.get_document_element) {
+    ThrowTypeError(isolate, "invalid Document host state");
+    return;
+  }
+  auto* realm = static_cast<ServoV8RealmState*>(
+      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  if (!realm || realm->element_template.IsEmpty()) {
+    ThrowTypeError(isolate, "Element host is not installed in this realm");
+    return;
+  }
+
+  ServoV8InterfaceValue value{};
+  {
+    if (state->runtime->rust_callback_depth != 0) {
+      ThrowTypeError(isolate, "re-entrant Document host callback");
+      return;
+    }
+    RustCallbackScope callback_scope(state->runtime);
+    if (!state->vtable.get_document_element(state->native, &value)) {
+      ThrowTypeError(isolate, "Document.documentElement host callback failed");
+      return;
+    }
+  }
+  if (value.is_null) {
+    info.GetReturnValue().SetNull();
+    return;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Object> wrapper =
+      WrapperForInterfaceValue(realm, isolate, context, value);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(isolate, "Element wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(wrapper);
+}
+
+
 void ResetDocumentHost(ServoV8DocumentHostState* state) {
   void* native = std::exchange(state->native, nullptr);
   const ServoV8DropCallback drop = state->vtable.drop;
@@ -653,6 +864,15 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
         kServoRealmStateEmbedderSlot, nullptr, kServoRealmStateEmbedderTag);
   }
   realm->scripts.clear();
+  // Release every host now. The cells stay cppgc-owned and die whenever the
+  // next collection runs, but their Servo roots must not outlive the realm --
+  // otherwise a torn-down pipeline's DOM stays pinned until the isolate
+  // happens to collect, which for an idle tab may be never.
+  for (auto& entry : realm->wrappers) {
+    if (ServoV8HostCell* cell = entry.second.Get()) cell->ReleaseHost();
+  }
+  realm->wrappers.clear();
+  realm->element_template.Reset();
   realm->document.Reset();
   realm->context.Reset();
   ResetDocumentHost(&realm->document_host);
@@ -760,6 +980,18 @@ bool CompileScript(ServoV8Runtime* runtime,
 
 }  // namespace
 
+void ServoV8HostCell::ReleaseHost() {
+  if (!native_) return;
+  void* native = native_;
+  native_ = nullptr;
+  if (!drop_) return;
+  // Guarded like every other Rust callback: without this, CheckRuntime would
+  // accept a re-entrant bridge call made from a host's Drop, which during
+  // sweeping would re-enter V8 mid-collection.
+  RustCallbackScope callback_scope(runtime_);
+  drop_(native);
+}
+
 extern "C" uint32_t servo_v8_abi_version(void) {
   return SERVO_V8_ABI_VERSION;
 }
@@ -775,6 +1007,13 @@ extern "C" ServoV8Runtime* servo_v8_runtime_new(
   runtime->allocator.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
 
   v8::CppHeapCreateParams cpp_heap_params({});
+  // Atomic is load-bearing in two ways beyond the missing mutation barriers.
+  // Destructors run in the GC pause on the owner thread, which is what makes
+  // it sound for a cell to drop a host holding non-atomic Rust state (an Rc,
+  // a Trusted). And weak references are cleared during marking while
+  // destructors run during sweeping, so a wrapper-cache entry can read as
+  // empty while its host is still alive -- atomic sweeping closes that window
+  // before control returns to the embedder.
   cpp_heap_params.marking_support = cppgc::Heap::MarkingType::kAtomic;
   cpp_heap_params.sweeping_support = cppgc::Heap::SweepingType::kAtomic;
   std::unique_ptr<v8::CppHeap> cpp_heap =
@@ -875,6 +1114,7 @@ extern "C" int32_t servo_v8_realm_create(
   v8::Local<v8::Function> url_getter;
   v8::Local<v8::Function> visibility_state_getter;
   v8::Local<v8::Function> node_type_getter;
+  v8::Local<v8::Function> document_element_getter;
   const v8::PropertyAttribute immutable = static_cast<v8::PropertyAttribute>(
       v8::ReadOnly | v8::DontDelete);
   if (!v8::Function::New(context, DocumentHostGetHidden,
@@ -912,7 +1152,12 @@ extern "C" int32_t servo_v8_realm_create(
                          v8::Local<v8::Data>(), 0,
                          v8::ConstructorBehavior::kThrow,
                          v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&node_type_getter)) {
+           .ToLocal(&node_type_getter) ||
+      !v8::Function::New(context, DocumentHostGetDocumentElement,
+                         v8::Local<v8::Data>(), 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&document_element_getter)) {
     context->SetAlignedPointerInEmbedderData(
         kServoRealmStateEmbedderSlot, nullptr,
         kServoRealmStateEmbedderTag);
@@ -937,6 +1182,22 @@ extern "C" int32_t servo_v8_realm_create(
   url_getter->SetName(V8String(isolate, "get URL"));
   visibility_state_getter->SetName(V8String(isolate, "get visibilityState"));
   node_type_getter->SetName(V8String(isolate, "get nodeType"));
+  document_element_getter->SetName(V8String(isolate, "get documentElement"));
+
+  // Element instances are built from a FunctionTemplate instance template,
+  // which is what makes them wrappable by v8::Object::Wrap.
+  v8::Local<v8::FunctionTemplate> element_constructor =
+      v8::FunctionTemplate::New(isolate);
+  element_constructor->SetClassName(V8String(isolate, "Element"));
+  v8::Local<v8::ObjectTemplate> element_instance =
+      element_constructor->InstanceTemplate();
+  element_instance->SetAccessorProperty(
+      V8String(isolate, "tagName"),
+      v8::FunctionTemplate::New(isolate, ElementHostGetTagName,
+                                v8::Local<v8::Value>(),
+                                v8::Local<v8::Signature>(), 0,
+                                v8::ConstructorBehavior::kThrow,
+                                v8::SideEffectType::kHasNoSideEffect));
   v8::PropertyDescriptor hidden_descriptor(hidden_getter,
                                             v8::Undefined(isolate));
   hidden_descriptor.set_enumerable(true);
@@ -957,6 +1218,10 @@ extern "C" int32_t servo_v8_realm_create(
                                                v8::Undefined(isolate));
   node_type_descriptor.set_enumerable(true);
   node_type_descriptor.set_configurable(true);
+  v8::PropertyDescriptor document_element_descriptor(document_element_getter,
+                                                      v8::Undefined(isolate));
+  document_element_descriptor.set_enumerable(true);
+  document_element_descriptor.set_configurable(true);
   if (!document_prototype
            ->DefineProperty(context, V8String(isolate, "hidden"),
                             hidden_descriptor)
@@ -976,6 +1241,10 @@ extern "C" int32_t servo_v8_realm_create(
            ->DefineProperty(context, V8String(isolate, "nodeType"),
                             node_type_descriptor)
            .FromMaybe(false) ||
+      !document_prototype
+           ->DefineProperty(context, V8String(isolate, "documentElement"),
+                            document_element_descriptor)
+           .FromMaybe(false) ||
       !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
       !global
            ->DefineOwnProperty(context, V8String(isolate, "window"), global,
@@ -994,6 +1263,7 @@ extern "C" int32_t servo_v8_realm_create(
 
   const ServoV8RealmId id = runtime->next_realm_id++;
   realm->id = id;
+  realm->element_template.Reset(isolate, element_instance);
   realm->context.Reset(isolate, context);
   realm->document.Reset(isolate, document);
   auto [entry, inserted] = runtime->realms.try_emplace(id, std::move(realm));
@@ -1284,6 +1554,7 @@ extern "C" int32_t servo_v8_runtime_take_pending_job_error(
   return 1;
 }
 
+
 extern "C" int32_t servo_v8_realm_install_document_host(
     ServoV8Runtime* runtime,
     ServoV8RealmId realm_id,
@@ -1345,6 +1616,27 @@ extern "C" int32_t servo_v8_realm_document_hidden(
     return 0;
   }
   *result = value.As<v8::Boolean>()->Value() ? 1 : 0;
+  return 1;
+}
+
+extern "C" int32_t servo_v8_install_element_host(
+    ServoV8Runtime* runtime,
+    const ServoV8ElementHostVTable* vtable,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!vtable || !vtable->get_tag_name || !vtable->drop) {
+    WriteError(error, "Element host vtable is incomplete");
+    return 0;
+  }
+  if (runtime->element_host_installed) {
+    WriteError(error, "Element host is already installed");
+    return 0;
+  }
+  // Type-level rather than per-realm: the vtable describes how to talk to any
+  // Element host, while the hosts themselves are per object.
+  runtime->element_host_vtable = *vtable;
+  runtime->element_host_installed = true;
   return 1;
 }
 

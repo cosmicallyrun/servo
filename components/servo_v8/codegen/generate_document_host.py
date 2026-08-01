@@ -701,6 +701,79 @@ def _readonly_unsigned_short_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_getter_name(member.attribute)}"]
 
 
+# An interface-typed member hands script another DOM object, so unlike every
+# shape above it needs the per-realm wrapper cache to preserve identity. That
+# cache, the wrapper cell, and the Element prototype are infrastructure and
+# live in bridge.cc beside the hand-written document facade, so this shape
+# emits no C++ body -- only the ABI slot and the Rust side that feeds it.
+def _readonly_nullable_interface_header_slots(member: Member) -> Block:
+    return [
+        f"  uint8_t (*{_getter_name(member.attribute)})(void* native, ServoV8InterfaceValue* output);",
+    ]
+
+
+def _readonly_nullable_interface_rust_trait_members(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"    /// `None` is JavaScript `null`; `Some` transfers one boxed host.",
+        f"    fn {name}(&self) -> Option<InterfaceHandle>;",
+    ]
+
+
+def _readonly_nullable_interface_rust_vtable_fields(member: Member) -> Block:
+    return [
+        f'    pub {_getter_name(member.attribute)}: Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,',
+    ]
+
+
+def _readonly_nullable_interface_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    getter = _getter_name(member.attribute)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{getter}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    output: *mut RawInterfaceValue,",
+            ") -> u8 {",
+            "    if output.is_null() {",
+            "        return 0;",
+            "    }",
+            "    // SAFETY: The vtable contract requires a live Box<T> native pointer.",
+            f"    let handle = unsafe {{ &*native.cast::<T>() }}.{name}();",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe {",
+            "        *output = match handle {",
+            "            Some(handle) => RawInterfaceValue {",
+            "                is_null: 0,",
+            "                key: handle.key,",
+            "                native: handle.native,",
+            "            },",
+            "            None => RawInterfaceValue {",
+            "                is_null: 1,",
+            "                key: std::ptr::null(),",
+            "                native: std::ptr::null_mut(),",
+            "            },",
+            "        };",
+            "    }",
+            "    1",
+            "}",
+        ],
+    )
+
+
+def _readonly_nullable_interface_rust_vtable_init(member: Member) -> Block:
+    getter = _getter_name(member.attribute)
+    return [f"            {getter}: Some(document_host_{getter}::<T>),"]
+
+
+def _readonly_nullable_interface_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    return ()
+
+
+def _readonly_nullable_interface_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_getter_name(member.attribute)}"]
+
+
 # The owned UTF-8 transfer is shared by every DOMString member: one C type, one
 # Rust type, one Rust owner drop, and one C++ scope guard, emitted once.
 _OWNED_UTF8_C_TYPE: Block = [
@@ -811,6 +884,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(),
         cpp_bodies=_readonly_unsigned_short_cpp_bodies,
         cpp_vtable_terms=_readonly_unsigned_short_cpp_vtable_terms,
+    ),
+    production_webidl.READONLY_NULLABLE_INTERFACE: ShapeEmitter(
+        header_type_blocks=(),
+        header_slots=_readonly_nullable_interface_header_slots,
+        rust_type_blocks=(),
+        rust_trait_members=_readonly_nullable_interface_rust_trait_members,
+        rust_vtable_fields=_readonly_nullable_interface_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_readonly_nullable_interface_rust_thunks,
+        rust_vtable_init=_readonly_nullable_interface_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_readonly_nullable_interface_cpp_bodies,
+        cpp_vtable_terms=_readonly_nullable_interface_cpp_vtable_terms,
     ),
 }
 
