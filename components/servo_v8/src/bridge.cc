@@ -712,6 +712,19 @@ bool CallDocumentHostSetBgColor(ServoV8DocumentHostState* state,
 #include "servo_v8_generated.inc"
 #include "servo_v8_document_host_generated.inc"
 
+// Drops a host that was never installed into a cell, using the same re-entry
+// barrier as an installed host's ReleaseHost path. Cache hits create one
+// speculative Rust host that must be discarded, and wrapper allocation can
+// fail after that host has crossed the ABI; neither path may let Drop enter V8
+// beneath the live accessor callback.
+void DropUnownedElementHost(ServoV8Runtime* runtime,
+                            void* native,
+                            ServoV8DropCallback drop) {
+  if (!native || !drop) return;
+  RustCallbackScope callback_scope(runtime);
+  drop(native);
+}
+
 // Finds or creates the wrapper for one DOM object, preserving identity.
 //
 // A hit drops the surplus host the caller speculatively allocated, so
@@ -727,7 +740,7 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
   const auto entry = realm->wrappers.find(value.key);
   if (entry != realm->wrappers.end()) {
     if (ServoV8HostCell* cell = entry->second.Get()) {
-      if (value.native && drop) drop(value.native);
+      DropUnownedElementHost(runtime, value.native, drop);
       return cell->wrapper(isolate);
     }
     // cppgc clears the weak entry once the cell dies. The stale slot is only
@@ -739,7 +752,7 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
   if (!realm->element_template.Get(isolate)
            ->NewInstance(context)
            .ToLocal(&wrapper)) {
-    if (value.native && drop) drop(value.native);
+    DropUnownedElementHost(runtime, value.native, drop);
     return v8::Local<v8::Object>();
   }
 

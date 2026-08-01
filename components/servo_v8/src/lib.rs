@@ -1054,16 +1054,48 @@ mod tests {
     struct ElementHostProbe {
         tag_name: String,
         drops: Rc<Cell<usize>>,
+        drop_reentry: Option<ElementDropReentryProbe>,
+    }
+
+    #[derive(Clone)]
+    struct ElementDropReentryProbe {
+        runtime: *mut RawRuntime,
+        realm: RealmId,
+        attempts: Rc<RefCell<Vec<(i32, String)>>>,
     }
 
     impl Drop for ElementHostProbe {
         fn drop(&mut self) {
+            if let Some(probe) = &self.drop_reentry {
+                let source = b"true";
+                let mut storage = [0; ERROR_CAPACITY];
+                let mut error = error_buffer(&mut storage);
+                let mut result = 0;
+                // SAFETY: This deliberately hostile test-only Drop attempts
+                // to enter its still-live runtime. The C++ callback-depth
+                // guard must reject it before touching the isolate.
+                let succeeded = unsafe {
+                    servo_v8_realm_eval_bool(
+                        probe.runtime,
+                        probe.realm,
+                        source.as_ptr(),
+                        source.len(),
+                        &mut result,
+                        &mut error,
+                    )
+                };
+                probe
+                    .attempts
+                    .borrow_mut()
+                    .push((succeeded, text_from(&storage, &error)));
+            }
             self.drops.set(self.drops.get() + 1);
         }
     }
 
-    // SAFETY: The probe stays on its Runtime's thread, cannot unwind, and its
-    // Drop only touches an Rc counter.
+    // SAFETY: The probe stays on its Runtime's thread and cannot unwind. Its
+    // optional test-only Drop probe is rejected by the bridge before it can
+    // actually re-enter V8.
     unsafe impl ElementHostBinding for ElementHostProbe {
         fn tag_name(&self) -> String {
             self.tag_name.clone()
@@ -1081,6 +1113,7 @@ mod tests {
         /// Stable for this probe's lifetime, which is what identity needs.
         element_identity: Box<u8>,
         element_drops: Rc<Cell<usize>>,
+        element_drop_reentry: Option<ElementDropReentryProbe>,
     }
 
     impl DocumentHostProbe {
@@ -1098,6 +1131,7 @@ mod tests {
                 drops,
                 element_identity: Box::new(0),
                 element_drops: Rc::new(Cell::new(0)),
+                element_drop_reentry: None,
             }
         }
     }
@@ -1152,6 +1186,7 @@ mod tests {
                     ElementHostProbe {
                         tag_name: "HTML".to_owned(),
                         drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
                     },
                 )
             })
@@ -1682,6 +1717,12 @@ mod tests {
             Rc::new(Cell::new(0)),
         );
         host.element_drops = Rc::clone(&element_drops);
+        let drop_reentry_attempts = Rc::new(RefCell::new(Vec::new()));
+        host.element_drop_reentry = Some(ElementDropReentryProbe {
+            runtime: runtime.raw.as_ptr(),
+            realm,
+            attempts: Rc::clone(&drop_reentry_attempts),
+        });
         runtime.install_document_host(realm, host).unwrap();
 
         // The point of the wrapper cache: the same DOM object read twice must
@@ -1748,11 +1789,29 @@ mod tests {
             dropped_on_cache_hits > 0,
             "cache hits must drop the surplus host they allocated"
         );
+        assert_eq!(drop_reentry_attempts.borrow().len(), dropped_on_cache_hits);
+        assert!(
+            drop_reentry_attempts
+                .borrow()
+                .iter()
+                .all(|(status, error)| {
+                    *status == 0 && error.contains("re-entered from a Rust host callback")
+                })
+        );
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(
             element_drops.get(),
             dropped_on_cache_hits + 1,
             "realm destruction must release the one cached host, synchronously"
+        );
+        assert_eq!(drop_reentry_attempts.borrow().len(), element_drops.get());
+        assert!(
+            drop_reentry_attempts
+                .borrow()
+                .iter()
+                .all(|(status, error)| {
+                    *status == 0 && error.contains("re-entered from a Rust host callback")
+                })
         );
         drop(runtime);
     }

@@ -101,7 +101,10 @@ will be needed.
 
 - Cache hit: the bridge returns the existing wrapper and drops the surplus host
   through its drop callback, so ownership never straddles the two outcomes and
-  nothing leaks on the path that allocated speculatively.
+  nothing leaks on the path that allocated speculatively. That callback runs
+  beneath the same C++ re-entry scope as an installed host's destructor; a
+  hostile `Drop` therefore cannot enter V8 beneath the live accessor. Wrapper
+  allocation failure uses the same guarded release path.
 - Cache miss: the bridge allocates a cell, wraps a new object from the realm's
   `Element` template, and records the entry.
 
@@ -187,9 +190,12 @@ they are configuration rather than luck:
   decrements a refcount and makes the object *eligible* for collection at the
   next SpiderMonkey GC; nothing is freed inside the V8 pause.
 
-The drop is wrapped in the same re-entrancy scope every other Rust callback
-uses. Without it the runtime check would *accept* a bridge call made from a
-host's `Drop`, which during sweeping means re-entering V8 mid-collection.
+Every element-host drop performed by the bridge is wrapped in the same
+re-entrancy scope every other Rust callback uses, including speculative hosts
+discarded on wrapper-cache hits or allocation failure. Without it the runtime
+check would *accept* a bridge call made from a host's `Drop`, which during
+sweeping means re-entering V8 mid-collection and during a cache hit means
+re-entering beneath an accessor.
 
 ## Known limitation: dead entries are pruned lazily
 
@@ -215,5 +221,6 @@ covers the bridge:
   an expando surviving a re-read rather than by equality alone
 - the wrapper is not the document facade, and `tagName` is brand-checked
 - a cache hit drops the host the reading path speculatively allocated
+- a hostile surplus-host `Drop` is rejected before it can re-enter V8
 - realm destruction releases the one live host synchronously
 - `documentElement` is `null` when there is no root element
