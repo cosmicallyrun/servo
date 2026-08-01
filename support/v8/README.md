@@ -80,15 +80,13 @@ its selector pins the exact value set the glue was generated against; a new
 state appearing upstream becomes a build failure rather than an unvalidated
 string.
 
-`Document.documentElement` and `Element.tagName` are deliberately **not** here.
-Neither is a codegen slice. `documentElement` returns a nullable interface, and
-nothing in either generator can marshal an interface outward, there is no
-per-realm native-to-wrapper cache to give such an object a stable identity, and
-a V8-held `Element` would need a strong Servo root inside a cppgc cell — a
-cross-heap cycle neither collector can break. `tagName` has no receiver at all,
-since `Element` is not an ancestor of `Document` and the realm owns exactly one
-host object. Both need the reflector subsystem, which should be scoped and
-reviewed on its own rather than smuggled in behind a binding.
+`Document.documentElement` and `Element.tagName` are the first members whose
+value is another DOM object, and they rest on the per-realm wrapper cache
+described in `wrapper-identity-design.md`. That cache was recorded here as
+blocked by a cross-heap cycle; it is not, because every edge between the heaps
+points from cppgc into SpiderMonkey and none point back. The design doc records
+the constraint that keeps that true, along with why the DOM object's address is
+a safe cache key and why realm teardown must release hosts synchronously.
 
 Each pipeline realm owns
 a stable V8 `document` facade. Its native accessors recover tagged per-context
@@ -214,8 +212,9 @@ than cached.
 
 The current visible host
 surface is deliberately limited to `window`, `document.hidden`,
-`document.bgColor`, `document.URL`, `document.visibilityState`, and
-`document.nodeType`.
+`document.bgColor`, `document.URL`, `document.visibilityState`,
+`document.nodeType`, `document.documentElement`, and `Element.tagName` on the
+element that returns.
 
 V8 installs its own `console` on every context, and with no inspector attached
 its methods silently discard everything. An authoritative script therefore
@@ -297,6 +296,7 @@ Three proof pages use that same counting argument:
 | `authoritative_realm_surface_proof.html` | the realm exposes no API it cannot implement |
 | `authoritative_document_open_proof.html` | the realm survives `document.open()` |
 | `authoritative_job_error_proof.html` | a page sees its own failing V8 promise via `onerror` |
+| `authoritative_wrapper_identity_proof.html` | a DOM object handed to V8 keeps one stable wrapper |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -320,7 +320,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 12 and remains experimental. The original
+The current exported C ABI is version 13 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume
