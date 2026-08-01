@@ -203,18 +203,28 @@ protection that actually fires is HTML's own "can we run script" step, which
 refuses a document that is no longer fully active, plus pipeline-exit ordering
 that destroys the realm before the document is torn down.
 
-That leaves a known gap: `document.open()` replaces the global on the
-SpiderMonkey side without recreating the V8 realm, so the realm keeps the old
-global and the identity check cannot detect it. This predates the widening but
-defer and async make the window much larger. Recreating the realm there would
-invalidate any retained handle compiled against the old global, which now fails
-the script safely rather than aborting — so the fix is tractable, and it should
-land before this route is used for anything beyond experiments.
+`document.open()` was recorded here as a gap, on the assumption that it
+installs a fresh global the realm would not follow. That was wrong, and
+`authoritative_document_open_proof.html` now pins the correct behaviour: HTML
+reuses the same `Document` and `Window`, and so does Servo. `open()` clears the
+children, removes listeners, resets the URL, and builds a new parser, but the
+global — and therefore the realm — is the same object throughout, and the host
+reads through a live `Trusted<Document>` so the new URL is picked up rather
+than cached.
 
 The current visible host
 surface is deliberately limited to `window`, `document.hidden`,
 `document.bgColor`, `document.URL`, `document.visibilityState`, and
 `document.nodeType`.
+
+V8 installs its own `console` on every context, and with no inspector attached
+its methods silently discard everything. An authoritative script therefore
+logged nothing while the identical script on SpiderMonkey logged normally —
+a silent divergence rather than a visible gap, which is the one failure mode
+this experiment is meant not to have. The realm now deletes it, so
+`console.log` is a `ReferenceError` until a real host binding exists. Anything
+else V8 puts on the global that the web platform also defines deserves the same
+treatment.
 
 Servo performs a V8 microtask checkpoint at HTML's "clean up after running
 script" boundary, in `ScriptThread::perform_a_microtask_checkpoint`, before its
@@ -280,6 +290,8 @@ Three proof pages use that same counting argument:
 | `authoritative_url_proof.html` | `Document.URL` is served by the V8 host, getter-only |
 | `authoritative_visibility_nodetype_proof.html` | the enum and numeric shapes, the latter inherited from `Node` |
 | `authoritative_timer_proof.html` | a string timer handler runs on V8, handed off across a task boundary |
+| `authoritative_realm_surface_proof.html` | the realm exposes no API it cannot implement |
+| `authoritative_document_open_proof.html` | the realm survives `document.open()` |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
