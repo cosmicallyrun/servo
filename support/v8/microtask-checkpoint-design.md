@@ -7,8 +7,10 @@ inline below, marked **As built**.
 The retained-script run path still performs no checkpoint of its own; the drain
 happens at the task boundary, which is the point of the design.
 
-Job failures are reported as of ABI 9. What remains is routing them to the
-owning global's events rather than the log — see "Reporting a job that throws".
+Job failures are reported as of ABI 9 and attributed to the owning global as of
+ABI 12, so a page observes its own failing promise. What remains is delivering
+rejections as `unhandledrejection` events carrying the rejection value, rather
+than as errors carrying its message — see "Reporting a job that throws".
 
 ## The boundary
 
