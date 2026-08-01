@@ -214,6 +214,7 @@ struct V8DocumentHiddenStats {
     getter_calls: Cell<u64>,
     bg_color_getter_calls: Cell<u64>,
     bg_color_setter_calls: Cell<u64>,
+    url_getter_calls: Cell<u64>,
 }
 
 #[cfg(feature = "v8-shadow")]
@@ -244,6 +245,15 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             .root()
             .get_body_attribute(&local_name!("bgcolor"))
             .into()
+    }
+
+    fn url(&self) -> String {
+        self.stats
+            .url_getter_calls
+            .set(self.stats.url_getter_calls.get().wrapping_add(1));
+        // Servo's production getter returns a USVString, which is already
+        // well-formed UTF-8, so the C ABI transfer needs no further conversion.
+        self.document.root().URL().0
     }
 
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
@@ -1074,10 +1084,12 @@ impl ScriptThread {
                     let realm = shadow.realms.remove(&pipeline_id).unwrap();
                     debug!(
                         "V8 shadow destroyed realm for {pipeline_id} after {} Document.hidden, \
-                         {} Document.bgColor getter, and {} Document.bgColor setter host calls",
+                         {} Document.bgColor getter, {} Document.bgColor setter, and {} \
+                         Document.URL host calls",
                         realm.document_hidden_stats.getter_calls.get(),
                         realm.document_hidden_stats.bg_color_getter_calls.get(),
-                        realm.document_hidden_stats.bg_color_setter_calls.get()
+                        realm.document_hidden_stats.bg_color_setter_calls.get(),
+                        realm.document_hidden_stats.url_getter_calls.get()
                     );
                     None
                 },

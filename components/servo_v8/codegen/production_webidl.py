@@ -28,12 +28,14 @@ import WebIDL  # noqa: E402
 SKIP_UNLESS_PATTERN = re.compile(r"// skip-unless ([A-Z_]+)\n")
 DOCUMENT_HIDDEN = "Document.hidden"
 DOCUMENT_BG_COLOR = "Document.bgColor"
+DOCUMENT_URL = "Document.URL"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
 # supported by naming an existing shape rather than by touching the emitters.
 READONLY_BOOLEAN = "readonly boolean"
 WRITABLE_LEGACY_DOMSTRING = "CEReactions writable LegacyNullToEmptyString DOMString"
+READONLY_USVSTRING = "readonly USVString"
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
@@ -41,12 +43,18 @@ WRITABLE_LEGACY_DOMSTRING = "CEReactions writable LegacyNullToEmptyString DOMStr
 # emitters honour and rejects the rest, as `generate.py` does for its own members.
 READONLY_BOOLEAN_EXTENDED_ATTRIBUTES = frozenset()
 WRITABLE_LEGACY_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"CEReactions"})
+# `[Constant]` is a SpiderMonkey JIT alias-set hint with no bearing on the value
+# produced, and the V8 accessor is already installed with `kHasNoSideEffect`, so
+# honouring it costs nothing. It is allowed rather than required so that dropping
+# it upstream does not break the build.
+READONLY_USVSTRING_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
 
 # The supported Document slice is data, in declaration order: selection and
 # generation both walk it, so widening the slice is an edit to this tuple alone.
 DOCUMENT_HOST: tuple[tuple[str, str], ...] = (
     (DOCUMENT_HIDDEN, READONLY_BOOLEAN),
     (DOCUMENT_BG_COLOR, WRITABLE_LEGACY_DOMSTRING),
+    (DOCUMENT_URL, READONLY_USVSTRING),
 )
 
 
@@ -159,6 +167,25 @@ def _select_instance_attribute(
     return member
 
 
+def select_readonly_usvstring_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLAttribute:
+    """Select one ordinary readonly, non-nullable USVString attribute."""
+
+    member = _select_instance_attribute(parser_results, qualified_name, READONLY_USVSTRING_EXTENDED_ATTRIBUTES)
+    if not member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be readonly")
+    if member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be non-nullable")
+    # `USVString` and `DOMString` differ in whether lone surrogates are
+    # replaced, so accepting either here would silently pick one conversion.
+    if not member.type.isUSVString():
+        raise WebIDLSelectionError(f"`{qualified_name}` must use `USVString`, got `{member.type.prettyName()}`")
+
+    return member
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -173,6 +200,7 @@ def select_document_hidden(
 _SHAPE_SELECTORS = {
     READONLY_BOOLEAN: select_readonly_boolean_attribute,
     WRITABLE_LEGACY_DOMSTRING: select_writable_legacy_domstring_attribute,
+    READONLY_USVSTRING: select_readonly_usvstring_attribute,
 }
 
 

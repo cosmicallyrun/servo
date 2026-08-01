@@ -61,9 +61,16 @@ both survival and final reclamation are asserted after test-only full
 collections with an explicit no-heap-pointers stack state so conservative
 stack scanning cannot hide a broken edge or make the test flaky.
 
-The first production binding slice is generated separately from the enabled
-`Document.hidden` and `Document.bgColor` declarations in Servo's real
-`components/script_bindings/webidls/Document.webidl`. Each pipeline realm owns
+The production binding slice is generated from the enabled `Document.hidden`,
+`Document.bgColor`, and `Document.URL` declarations in Servo's real
+`components/script_bindings/webidls/Document.webidl`. Which members are exposed
+is a data manifest of `(qualified name, shape)` pairs, with one selector and
+one emitter registered per shape, so widening the slice with a member of a
+known shape is an edit to that manifest. Each shape also declares an
+extended-attribute allowlist and fails on anything outside it, because an
+unlisted extended attribute usually changes conversion or reaction semantics
+that the generated glue implements literally -- it would be silently wrong
+rather than merely unsupported. Each pipeline realm owns
 a stable V8 `document` facade. Its native accessors recover tagged per-context
 embedder state from the holder's creation context and call typed Rust C ABI
 thunks. The Rust host owns a `Trusted<Document>` rather than a raw DOM pointer;
@@ -166,8 +173,8 @@ the script safely rather than aborting — so the fix is tractable, and it shoul
 land before this route is used for anything beyond experiments.
 
 The current visible host
-surface is deliberately limited to `window`, `document.hidden`, and
-`document.bgColor`.
+surface is deliberately limited to `window`, `document.hidden`,
+`document.bgColor`, and `document.URL`.
 
 Servo performs a V8 microtask checkpoint at HTML's "clean up after running
 script" boundary, in `ScriptThread::perform_a_microtask_checkpoint`, before its
@@ -230,6 +237,7 @@ Three proof pages use that same counting argument:
 | `authoritative_defer_proof.html` | a deferred script runs on V8 after the widest compile-to-run window |
 | `authoritative_async_proof.html` | an async script runs on V8 off the parser's critical path |
 | `authoritative_dynamic_proof.html` | SpiderMonkey can insert a script that V8 then executes |
+| `authoritative_url_proof.html` | `Document.URL` is served by the V8 host, getter-only |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -253,7 +261,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 9 and remains experimental. The original
+The current exported C ABI is version 10 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

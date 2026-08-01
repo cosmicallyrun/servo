@@ -32,6 +32,7 @@ proofs=(
   "authoritative_defer_proof.html:(0, 255, 0):1:1"
   "authoritative_async_proof.html:(0, 255, 0):1:1"
   "authoritative_dynamic_proof.html:(0, 255, 0):1:1"
+  "authoritative_url_proof.html:(0, 255, 0):1:1"
 )
 
 failures=0
@@ -44,7 +45,7 @@ for proof in "${proofs[@]}"; do
     "$servoshell" -z -x --hard-fail -o "$png" "$here/$page" >"$log" 2>&1
 
   # Realm teardown reports the host-call counts this proof depends on.
-  counts="$(sed -n 's/.*after \([0-9]*\) Document.hidden, \([0-9]*\) Document.bgColor getter, and \([0-9]*\) Document.bgColor setter.*/\2 \3/p' "$log" | tail -1)"
+  counts="$(sed -n 's/.*, \([0-9]*\) Document.bgColor getter, \([0-9]*\) Document.bgColor setter,.*/\1 \2/p' "$log" | tail -1)"
   read -r actual_get actual_set <<<"${counts:-none none}"
 
   actual_rgb="$(python3 - "$png" <<'PY'
@@ -87,7 +88,7 @@ sed 's|</body>|  <script data-servo-v8="authoritative">document.bgColor = docume
   "$here/authoritative_bgcolor_proof.html" >"$control"
 RUST_LOG=warn,script::script_thread=debug \
   "$servoshell" -z -x --hard-fail -o "$out/control.png" "$control" >"$out/control.log" 2>&1
-control_counts="$(sed -n 's/.*after \([0-9]*\) Document.hidden, \([0-9]*\) Document.bgColor getter, and \([0-9]*\) Document.bgColor setter.*/\2 \3/p' "$out/control.log" | tail -1)"
+control_counts="$(sed -n 's/.*, \([0-9]*\) Document.bgColor getter, \([0-9]*\) Document.bgColor setter,.*/\1 \2/p' "$out/control.log" | tail -1)"
 if [ "$control_counts" = "2 2" ]; then
   echo "ok    control: two executions report two getters and two setters"
 else
@@ -116,7 +117,7 @@ open(sys.argv[1], "w").write("\n".join(parts))
 PY
 RUST_LOG=warn,script::script_thread=debug \
   "$servoshell" -z -x --hard-fail -o "$out/stress.png" "$stress" >"$out/stress.log" 2>&1
-stress_counts="$(sed -n 's/.*after \([0-9]*\) Document.hidden, \([0-9]*\) Document.bgColor getter, and \([0-9]*\) Document.bgColor setter.*/\2 \3/p' "$out/stress.log" | tail -1)"
+stress_counts="$(sed -n 's/.*, \([0-9]*\) Document.bgColor getter, \([0-9]*\) Document.bgColor setter,.*/\1 \2/p' "$out/stress.log" | tail -1)"
 stress_rgb="$(python3 - "$out/stress.png" <<'PY'
 import sys
 from collections import Counter

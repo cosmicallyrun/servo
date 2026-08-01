@@ -82,7 +82,13 @@ def stable_interface_id(interface_name: str) -> int:
 
 
 def snake_case(name: str) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    # Split on case transitions rather than before every capital, so an acronym
+    # stays one word: WebIDL is full of them and `URL` must become `url`, not
+    # `u_r_l`. The second rule splits a trailing word off an acronym run, so
+    # `innerHTMLValue` becomes `inner_html_value`.
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    name = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
+    return name.lower()
 
 
 def upper_snake_case(name: str) -> str:

@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 9u
+#define SERVO_V8_ABI_VERSION 10u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -132,10 +132,11 @@ int32_t servo_v8_realm_script_discard(ServoV8Runtime* runtime,
  * so the ephemeral host context is installed on every live realm for the
  * duration of the drain and cleared from all of them on every return path.
  *
- * Only termination is reported through the outcome. A job that throws is
- * buffered instead, because one drain can produce many errors; pull them with
- * servo_v8_runtime_take_pending_job_error. An unhandled promise rejection is
- * still silent: that needs the promise-rejection callback. */
+ * Only termination is reported through the outcome. A job that fails is
+ * buffered instead, because one drain can produce many failures; pull them
+ * with servo_v8_runtime_take_pending_job_error. That covers both channels: an
+ * uncaught job exception and a rejection still unhandled when the drain
+ * ends. */
 int32_t servo_v8_runtime_perform_microtask_checkpoint(
     ServoV8Runtime* runtime,
     void* host_context,

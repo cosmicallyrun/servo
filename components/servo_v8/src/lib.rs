@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 9;
+const ABI_VERSION: u32 = 10;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -971,6 +971,12 @@ mod tests {
             self.bg_color.borrow().clone()
         }
 
+        fn url(&self) -> String {
+            // A lone surrogate cannot survive a Rust String, so the USVString
+            // guarantee is met by construction rather than by conversion.
+            "https://example.com/probe?q=\u{2713}".to_owned()
+        }
+
         unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
             assert!(!host_context.is_null());
             self.bg_color_setter_calls
@@ -1549,6 +1555,40 @@ mod tests {
         assert!(
             runtime
                 .eval_bool_in_realm(first, "document.bgColor === 'red'")
+                .unwrap()
+        );
+
+        // Document.URL is the first read-only member added through the shape
+        // manifest. It shares the owned-UTF-8 transfer with bgColor's getter
+        // but has no setter, so the descriptor must expose a getter alone, and
+        // assigning to it must be silently ignored rather than mutate anything.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.URL === 'https://example.com/probe?q=\u{2713}'"
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "(() => {\n\
+                       const descriptor = Object.getOwnPropertyDescriptor(\n\
+                         Object.getPrototypeOf(document), 'URL');\n\
+                       if (typeof descriptor.get !== 'function') return false;\n\
+                       if (descriptor.set !== undefined) return false;\n\
+                       if (!descriptor.enumerable || !descriptor.configurable) return false;\n\
+                       let rejectsWrongBrand = false;\n\
+                       try {\n\
+                         descriptor.get.call({});\n\
+                       } catch (error) {\n\
+                         rejectsWrongBrand = error instanceof TypeError;\n\
+                       }\n\
+                       return rejectsWrongBrand;\n\
+                     })()"
+                )
                 .unwrap()
         );
 

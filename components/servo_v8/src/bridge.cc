@@ -561,6 +561,17 @@ bool CallDocumentHostGetBgColor(ServoV8DocumentHostState* state,
   return state->vtable.get_bg_color(state->native, value) != 0;
 }
 
+bool CallDocumentHostGetUrl(ServoV8DocumentHostState* state,
+                            ServoV8OwnedUtf8* value) {
+  if (!state || !value || !state->runtime ||
+      state->runtime->rust_callback_depth != 0 || !state->native ||
+      !state->vtable.get_url) {
+    return false;
+  }
+  RustCallbackScope callback_scope(state->runtime);
+  return state->vtable.get_url(state->native, value) != 0;
+}
+
 bool CallDocumentHostSetBgColor(ServoV8DocumentHostState* state,
                                 const uint8_t* value,
                                 size_t value_length) {
@@ -815,6 +826,7 @@ extern "C" int32_t servo_v8_realm_create(
   v8::Local<v8::Function> hidden_getter;
   v8::Local<v8::Function> bg_color_getter;
   v8::Local<v8::Function> bg_color_setter;
+  v8::Local<v8::Function> url_getter;
   const v8::PropertyAttribute immutable = static_cast<v8::PropertyAttribute>(
       v8::ReadOnly | v8::DontDelete);
   if (!v8::Function::New(context, DocumentHostGetHidden,
@@ -837,7 +849,12 @@ extern "C" int32_t servo_v8_realm_create(
                          v8::Local<v8::Data>(), 1,
                          v8::ConstructorBehavior::kThrow,
                          v8::SideEffectType::kHasSideEffect)
-           .ToLocal(&bg_color_setter)) {
+           .ToLocal(&bg_color_setter) ||
+      !v8::Function::New(context, DocumentHostGetUrl,
+                         v8::Local<v8::Data>(), 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&url_getter)) {
     context->SetAlignedPointerInEmbedderData(
         kServoRealmStateEmbedderSlot, nullptr,
         kServoRealmStateEmbedderTag);
@@ -847,6 +864,7 @@ extern "C" int32_t servo_v8_realm_create(
   hidden_getter->SetName(V8String(isolate, "get hidden"));
   bg_color_getter->SetName(V8String(isolate, "get bgColor"));
   bg_color_setter->SetName(V8String(isolate, "set bgColor"));
+  url_getter->SetName(V8String(isolate, "get URL"));
   v8::PropertyDescriptor hidden_descriptor(hidden_getter,
                                             v8::Undefined(isolate));
   hidden_descriptor.set_enumerable(true);
@@ -855,6 +873,9 @@ extern "C" int32_t servo_v8_realm_create(
                                               bg_color_setter);
   bg_color_descriptor.set_enumerable(true);
   bg_color_descriptor.set_configurable(true);
+  v8::PropertyDescriptor url_descriptor(url_getter, v8::Undefined(isolate));
+  url_descriptor.set_enumerable(true);
+  url_descriptor.set_configurable(true);
   if (!document_prototype
            ->DefineProperty(context, V8String(isolate, "hidden"),
                             hidden_descriptor)
@@ -862,6 +883,9 @@ extern "C" int32_t servo_v8_realm_create(
       !document_prototype
            ->DefineProperty(context, V8String(isolate, "bgColor"),
                             bg_color_descriptor)
+           .FromMaybe(false) ||
+      !document_prototype
+           ->DefineProperty(context, V8String(isolate, "URL"), url_descriptor)
            .FromMaybe(false) ||
       !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
       !global

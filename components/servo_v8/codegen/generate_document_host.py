@@ -220,11 +220,20 @@ def _per_member(members: Sequence[Member], field: str) -> list[str]:
 
 
 def _shape_blocks(members: Sequence[Member], field: str) -> list[Block]:
-    """Collect each shape's once-only blocks, in order of first use."""
+    """Collect each shape's once-only blocks, in order of first use.
+
+    Keyed on block identity rather than on shape: distinct shapes share blocks,
+    because every string-valued member needs the same owned-UTF-8 transfer, and
+    a shared block must still be emitted exactly once.
+    """
 
     blocks: list[Block] = []
+    seen: set[int] = set()
     for shape in dict.fromkeys(member.shape for member in members):
-        blocks.extend(getattr(SHAPE_EMITTERS[shape], field))
+        for block in getattr(SHAPE_EMITTERS[shape], field):
+            if id(block) not in seen:
+                seen.add(id(block))
+                blocks.append(block)
     return blocks
 
 
@@ -232,12 +241,13 @@ def _interleaved_blocks(members: Sequence[Member], shared_field: str, member_fie
     """Emit each shape's once-only blocks just before its first member's blocks."""
 
     blocks: list[Block] = []
-    emitted: set[str] = set()
+    seen: set[int] = set()
     for member in members:
         emitter = _emitter(member)
-        if member.shape not in emitted:
-            emitted.add(member.shape)
-            blocks.extend(getattr(emitter, shared_field))
+        for block in getattr(emitter, shared_field):
+            if id(block) not in seen:
+                seen.add(id(block))
+                blocks.append(block)
         blocks.extend(getattr(emitter, member_field)(member))
     return blocks
 
@@ -521,6 +531,101 @@ def _legacy_domstring_cpp_vtable_terms(member: Member) -> list[str]:
     ]
 
 
+# A readonly string getter is the DOMString shape's getter half: same owned
+# UTF-8 transfer, no setter, and so no CEReactions stack and no host context.
+def _readonly_usvstring_header_slots(member: Member) -> Block:
+    return [
+        f"  uint8_t (*{_getter_name(member.attribute)})(void* native, ServoV8OwnedUtf8* output);",
+    ]
+
+
+def _readonly_usvstring_rust_trait_members(member: Member) -> Block:
+    return [f"    fn {_rust_member_name(member.attribute)}(&self) -> String;"]
+
+
+def _readonly_usvstring_rust_vtable_fields(member: Member) -> Block:
+    return [
+        f'    pub {_getter_name(member.attribute)}: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,',
+    ]
+
+
+def _readonly_usvstring_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    getter = _getter_name(member.attribute)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{getter}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    output: *mut OwnedUtf8,",
+            ") -> u8 {",
+            "    if output.is_null() {",
+            "        return 0;",
+            "    }",
+            "    // SAFETY: The vtable contract requires a live Box<T> native pointer.",
+            "    let native = unsafe { &*native.cast::<T>() };",
+            f"    let owner = Box::new(native.{name}().into_bytes());",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe {",
+            "        *output = OwnedUtf8 {",
+            "            data: owner.as_ptr(),",
+            "            length: owner.len(),",
+            "            owner: Box::into_raw(owner).cast::<c_void>(),",
+            "            drop_owner: Some(document_host_owned_utf8_drop),",
+            "        };",
+            "    }",
+            "    1",
+            "}",
+        ],
+    )
+
+
+def _readonly_usvstring_rust_vtable_init(member: Member) -> Block:
+    getter = _getter_name(member.attribute)
+    return [f"            {getter}: Some(document_host_{getter}::<T>),"]
+
+
+def _readonly_usvstring_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    getter = _getter_name(member.attribute)
+    accessor = _cpp_member_name(member.attribute)
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostGet{accessor}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{getter}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  ServoV8OwnedUtf8 value{};",
+            f"  if (!CallDocumentHostGet{accessor}(state, &value)) {{",
+            '    ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "    return;",
+            "  }",
+            "  DocumentHostOwnedUtf8Scope value_scope(&value);",
+            "  if ((!value.data && value.length != 0) ||",
+            "      value.length > static_cast<size_t>(std::numeric_limits<int>::max())) {",
+            f'    ThrowTypeError(isolate, "invalid {qualified_name} UTF-8 result");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::String> result;",
+            "  if (!v8::String::NewFromUtf8(",
+            "           isolate, reinterpret_cast<const char*>(value.data),",
+            "           v8::NewStringType::kNormal, static_cast<int>(value.length))",
+            "           .ToLocal(&result)) {",
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(result);",
+            "}",
+        ],
+    )
+
+
+def _readonly_usvstring_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_getter_name(member.attribute)}"]
+
+
 # The owned UTF-8 transfer is shared by every DOMString member: one C type, one
 # Rust type, one Rust owner drop, and one C++ scope guard, emitted once.
 _OWNED_UTF8_C_TYPE: Block = [
@@ -592,6 +697,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
         cpp_bodies=_legacy_domstring_cpp_bodies,
         cpp_vtable_terms=_legacy_domstring_cpp_vtable_terms,
+    ),
+    production_webidl.READONLY_USVSTRING: ShapeEmitter(
+        header_type_blocks=(_OWNED_UTF8_C_TYPE,),
+        header_slots=_readonly_usvstring_header_slots,
+        rust_type_blocks=(_OWNED_UTF8_RUST_TYPE,),
+        rust_trait_members=_readonly_usvstring_rust_trait_members,
+        rust_vtable_fields=_readonly_usvstring_rust_vtable_fields,
+        rust_thunk_blocks=(_OWNED_UTF8_RUST_DROP,),
+        rust_thunks=_readonly_usvstring_rust_thunks,
+        rust_vtable_init=_readonly_usvstring_rust_vtable_init,
+        cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
+        cpp_bodies=_readonly_usvstring_cpp_bodies,
+        cpp_vtable_terms=_readonly_usvstring_cpp_vtable_terms,
     ),
 }
 
