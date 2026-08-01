@@ -1,6 +1,6 @@
 # V8 microtask checkpoint integration
 
-Status: implemented, at exported C ABI version 9. `authoritative_microtask_proof.html`
+Status: implemented, at exported C ABI version 12. `authoritative_microtask_proof.html`
 is the runtime proof. Deviations from the design as first written are noted
 inline below, marked **As built**.
 
@@ -139,12 +139,19 @@ Registering the listener requires an entered isolate. Doing it immediately
 after `Isolate::New`, before the isolate scope, segfaults: registering
 allocates on the V8 heap.
 
-**Still missing:** the failures are logged, not delivered to the owning
-global's `error` and `unhandledrejection` events. Servo's half of that already
-exists — `notify_about_rejected_promises` runs at the end of the SpiderMonkey
-checkpoint, and the V8-drains-first ordering already puts V8 rejections in the
-right place to be picked up. What blocks it is attribution: the realm does not
-travel with the error across the C ABI, so there is no global to fire on.
+**Attribution (ABI 12):** each failure now carries the realm that produced it,
+which for a rejection is the realm that created the promise rather than
+whichever was entered. Servo maps that realm back to a pipeline and reports the
+failure on the owning global, so a page observes its own failing V8 promise
+through `onerror`. The sidecar borrow is released before any of this runs,
+because reporting fires page-visible events whose handlers must not find the
+sidecar already borrowed.
+
+**Still missing:** rejections are reported as errors rather than delivered as
+`unhandledrejection` events with the rejection value attached. Servo's half of
+that exists — `notify_about_rejected_promises` runs at the end of the
+SpiderMonkey checkpoint — but wiring V8 rejections into it needs the rejected
+promise itself to cross the ABI, not just its message.
 
 ## Knowing whether to drain at all
 

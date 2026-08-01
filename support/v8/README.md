@@ -241,9 +241,13 @@ buffers what they deliver, and Servo pulls it after the drain, so a handler
 attached during the same drain revokes its entry rather than reporting a
 spurious failure. Failures are logged with resource, line, column, and stack.
 
-They are not yet routed to the owning global's `error` and `unhandledrejection`
-events, because the realm does not travel with the error across the C ABI. That
-is the next piece of this work.
+Each failure is tagged with the realm that produced it — for a rejection, the
+realm that created the promise rather than whichever happened to be entered —
+and Servo maps that realm back to a pipeline so the failure is reported on the
+owning global. A page therefore observes its own failing V8 promise through
+`onerror`, which `authoritative_job_error_proof.html` pins. A failure whose
+realm cannot be determined, or whose pipeline has already gone, still falls
+back to the log because there is no global left to fire on.
 
 Entering that route is guarded by an explicit test-then-set on the script
 thread. `V8AuthoritativeScriptGuard::enter` fails on a flag that is already
@@ -292,6 +296,7 @@ Three proof pages use that same counting argument:
 | `authoritative_timer_proof.html` | a string timer handler runs on V8, handed off across a task boundary |
 | `authoritative_realm_surface_proof.html` | the realm exposes no API it cannot implement |
 | `authoritative_document_open_proof.html` | the realm survives `document.open()` |
+| `authoritative_job_error_proof.html` | a page sees its own failing V8 promise via `onerror` |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -315,7 +320,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 11 and remains experimental. The original
+The current exported C ABI is version 12 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

@@ -231,6 +231,9 @@ struct ServoV8DocumentHostState {
 
 struct ServoV8RealmState {
   ServoV8Runtime* runtime = nullptr;
+  // Needed so a microtask failure can name the realm that produced it; Servo
+  // maps that back to a pipeline and fires the event on the right global.
+  ServoV8RealmId id = 0;
   v8::Global<v8::Context> context;
   v8::Global<v8::Object> document;
   std::unordered_map<ServoV8ScriptId, v8::Global<v8::Script>> scripts;
@@ -245,6 +248,7 @@ struct ServoV8RealmState {
 // running. The strings are owned here because the caller's outcome buffers
 // belong to a single call, and one drain can produce many errors.
 struct ServoV8PendingJobError {
+  ServoV8RealmId realm_id = 0;
   std::string message;
   std::string resource_name;
   std::string stack;
@@ -368,6 +372,15 @@ std::string FormatStackTrace(v8::Isolate* isolate,
 // installs at the checkpoint boundary can observe it. This is the only channel
 // that can. It must not call into Rust: it runs with the drain still on the
 // stack and the host context installed on every realm.
+ServoV8RealmId RealmIdForContext(v8::Isolate* isolate,
+                                v8::Local<v8::Context> context) {
+  if (context.IsEmpty()) return 0;
+  auto* realm = static_cast<ServoV8RealmState*>(
+      context->GetAlignedPointerFromEmbedderData(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  return realm ? realm->id : 0;
+}
+
 void FillFromMessage(v8::Isolate* isolate,
                      v8::Local<v8::Message> message,
                      ServoV8PendingJobError* pending) {
@@ -397,6 +410,8 @@ void OnUncaughtMessage(v8::Local<v8::Message> message,
 
   v8::HandleScope handle_scope(isolate);
   ServoV8PendingJobError pending;
+  pending.realm_id =
+      RealmIdForContext(isolate, isolate->GetEnteredOrMicrotaskContext());
   // Registered with the default data, so V8 passes the thrown value itself.
   if (!data.IsEmpty()) {
     v8::String::Utf8Value text(isolate, data);
@@ -434,6 +449,14 @@ void OnPromiseReject(v8::PromiseRejectMessage message) {
   switch (message.GetEvent()) {
     case v8::kPromiseRejectWithNoHandler: {
       ServoV8PendingJobError pending;
+      // A rejection belongs to the realm that created the promise, which is
+      // not necessarily the one currently entered.
+      v8::Local<v8::Context> creation_context;
+      pending.realm_id =
+          promise->GetCreationContext(isolate).ToLocal(&creation_context)
+              ? RealmIdForContext(isolate, creation_context)
+              : RealmIdForContext(isolate,
+                                  isolate->GetEnteredOrMicrotaskContext());
       v8::Local<v8::Value> value = message.GetValue();
       if (!value.IsEmpty()) {
         v8::String::Utf8Value text(isolate, value);
@@ -970,6 +993,7 @@ extern "C" int32_t servo_v8_realm_create(
   }
 
   const ServoV8RealmId id = runtime->next_realm_id++;
+  realm->id = id;
   realm->context.Reset(isolate, context);
   realm->document.Reset(isolate, document);
   auto [entry, inserted] = runtime->realms.try_emplace(id, std::move(realm));
@@ -1224,15 +1248,17 @@ extern "C" int32_t servo_v8_runtime_perform_microtask_checkpoint(
 
 extern "C" int32_t servo_v8_runtime_take_pending_job_error(
     ServoV8Runtime* runtime,
+    ServoV8RealmId* realm_id,
     ServoV8ScriptException* exception,
     uint8_t* has_error,
     ServoV8ErrorBuffer* error) {
   ClearError(error);
-  if (!exception || !has_error) {
+  if (!exception || !has_error || !realm_id) {
     WriteError(error, "microtask job error output pointer is null");
     return 0;
   }
   *has_error = 0;
+  *realm_id = 0;
   ClearScriptException(exception);
   if (!CheckRuntime(runtime, error)) return 0;
 
@@ -1248,6 +1274,7 @@ extern "C" int32_t servo_v8_runtime_take_pending_job_error(
   } else {
     return 1;
   }
+  *realm_id = pending.realm_id;
   WriteError(&exception->message, pending.message);
   WriteError(&exception->resource_name, pending.resource_name);
   WriteError(&exception->stack, pending.stack);

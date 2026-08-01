@@ -125,6 +125,10 @@ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
+#[cfg(feature = "v8-classic-script-authoritative")]
+use crate::dom::bindings::error::ErrorInfo;
+#[cfg(feature = "v8-classic-script-authoritative")]
+use js::gc::HandleValue;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
@@ -928,22 +932,54 @@ impl ScriptThread {
             return;
         };
 
-        let mut slot = self.v8_shadow.borrow_mut();
-        let Some(shadow) = slot.as_mut() else {
-            // The sidecar is gone, so its jobs are too. Nothing to fall back
-            // to and nothing to report.
+        // Everything that touches the sidecar happens inside this borrow, and
+        // the borrow is released before anything is reported: reporting fires
+        // page-visible events whose handlers must not find the sidecar
+        // already borrowed.
+        let (outcome, job_failures): (_, Vec<(Option<PipelineId>, servo_v8::ScriptException)>) = {
+            let mut slot = self.v8_shadow.borrow_mut();
+            let Some(shadow) = slot.as_mut() else {
+                // The sidecar is gone, so its jobs are too. Nothing to fall
+                // back to and nothing to report.
+                self.v8_may_have_pending_jobs.set(false);
+                return;
+            };
             self.v8_may_have_pending_jobs.set(false);
-            return;
-        };
-        self.v8_may_have_pending_jobs.set(false);
 
-        // SAFETY: cx is synchronously borrowed for this call, the bridge
-        // clears it from every realm on every return path, and generated
-        // hosts cannot retain it.
-        let outcome = unsafe {
-            shadow
-                .runtime
-                .perform_microtask_checkpoint_with_host_context((cx as *mut JSContext).cast())
+            // SAFETY: cx is synchronously borrowed for this call, the bridge
+            // clears it from every realm on every return path, and generated
+            // hosts cannot retain it.
+            let outcome = unsafe {
+                shadow
+                    .runtime
+                    .perform_microtask_checkpoint_with_host_context((cx as *mut JSContext).cast())
+            };
+
+            // A job that fails never reaches the outcome above: V8 catches it
+            // inside its own microtask builtin, and a reaction that throws
+            // rejects its derived promise instead. Both are pulled here, after
+            // the drain, so a handler attached during the drain has already
+            // revoked its entry.
+            let job_failures = match shadow.runtime.take_pending_job_errors() {
+                Ok(failures) => failures
+                    .into_iter()
+                    .map(|failure| {
+                        // Resolve the realm to its pipeline while the map is
+                        // still borrowed; the realm may be destroyed by the
+                        // time anything is reported.
+                        let pipeline_id = failure.realm_id.and_then(|realm_id| {
+                            shadow
+                                .realms
+                                .iter()
+                                .find(|(_, realm)| realm.id == realm_id)
+                                .map(|(pipeline_id, _)| *pipeline_id)
+                        });
+                        (pipeline_id, failure.exception)
+                    })
+                    .collect(),
+                Err(error) => panic!("collecting V8 microtask job errors failed: {error}"),
+            };
+            (outcome, job_failures)
         };
         match outcome {
             Ok(servo_v8::ScriptRunOutcome::Completed) => {},
@@ -963,28 +999,37 @@ impl ScriptThread {
             Err(error) => panic!("authoritative V8 microtask checkpoint failed internally: {error}"),
         }
 
-        // A job that throws never reaches the outcome above: V8 catches it
-        // inside its own microtask builtin, and a reaction that throws rejects
-        // its derived promise instead. Both are pulled here, after the drain,
-        // so a handler attached during the drain has already revoked its entry.
-        match shadow.runtime.take_pending_job_errors() {
-            Ok(job_errors) => {
-                for exception in job_errors {
-                    // TODO: route these to the owning global's `error` and
-                    // `unhandledrejection` events instead of the log. That
-                    // needs the realm to travel with the error across the C
-                    // ABI, which it does not yet.
-                    warn!(
-                        "uncaught error in a V8 microtask at {}:{}:{}: {}{}",
-                        exception.resource_name,
-                        exception.line_number,
-                        exception.column_number,
-                        exception.message,
-                        exception.stack
-                    );
-                }
-            },
-            Err(error) => panic!("collecting V8 microtask job errors failed: {error}"),
+        // Report each failure on the global that owns it, so a page observes
+        // its own failing promise through `onerror` rather than only in the
+        // browser's log.
+        for (pipeline_id, exception) in job_failures {
+            let global = pipeline_id.and_then(|id| self.documents.borrow().find_global(id));
+            let Some(global) = global else {
+                // The realm was unknown, or its pipeline is already gone, so
+                // there is no global left to fire on.
+                warn!(
+                    "uncaught error in a V8 microtask with no reportable global, at {}:{}:{}: \
+                     {}{}",
+                    exception.resource_name,
+                    exception.line_number,
+                    exception.column_number,
+                    exception.message,
+                    exception.stack
+                );
+                continue;
+            };
+            let mut realm = enter_auto_realm(cx, &*global);
+            let cx = &mut realm.current_realm();
+            global.report_an_error(
+                cx,
+                ErrorInfo {
+                    message: exception.message,
+                    filename: exception.resource_name,
+                    lineno: exception.line_number,
+                    column: exception.column_number,
+                },
+                HandleValue::null(),
+            );
         }
     }
 

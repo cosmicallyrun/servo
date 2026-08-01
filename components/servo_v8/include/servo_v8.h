@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 11u
+#define SERVO_V8_ABI_VERSION 12u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -146,9 +146,13 @@ int32_t servo_v8_runtime_perform_microtask_checkpoint(
 /* Pops the oldest buffered microtask job error, if any.
  *
  * Sets *has_error to 0 and leaves the exception cleared once drained, so the
- * caller loops until it reports none. */
+ * caller loops until it reports none. *realm_id names the realm the failure
+ * belongs to -- for a rejection, the realm that created the promise rather
+ * than whichever was entered -- so the embedder can fire the event on the
+ * right global. It is 0 when the realm could not be determined. */
 int32_t servo_v8_runtime_take_pending_job_error(
     ServoV8Runtime* runtime,
+    ServoV8RealmId* realm_id,
     ServoV8ScriptException* exception,
     uint8_t* has_error,
     ServoV8ErrorBuffer* error);

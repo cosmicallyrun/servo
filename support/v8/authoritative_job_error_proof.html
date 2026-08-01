@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+Runtime proof that a page observes its own failing V8 promise.
+
+A job that fails reaches neither the checkpoint's TryCatch nor the script's
+return value: V8 catches an uncaught job exception inside its own microtask
+builtin, and a reaction that throws rejects its derived promise instead. The
+bridge buffers both, tags each with the realm that produced it, and Servo maps
+that realm back to a pipeline so the failure is reported on the right global.
+
+Before that attribution existed the failure reached the browser's log but never
+the page. Here the page's own error listener -- ordinary SpiderMonkey JS --
+turns the page lime only if it receives the V8 job's message, so lime means the
+two engines' error paths are actually joined.
+
+Note the host-call expectation: bgColor is set by the SpiderMonkey handler, not
+by V8, so this proof reports zero V8 bgColor calls.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative job error reporting proof</title>
+  </head>
+  <body bgcolor="red">
+    <script>
+      window.addEventListener("error", function (event) {
+        document.bgColor =
+          /job boom/.test(String(event.message)) ? "lime" : "blue";
+      });
+    </script>
+    <script data-servo-v8="authoritative">
+      Promise.resolve().then(function () {
+        throw new Error("job boom");
+      });
+    </script>
+  </body>
+</html>

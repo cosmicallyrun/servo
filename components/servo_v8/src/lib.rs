@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 11;
+const ABI_VERSION: u32 = 12;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -91,6 +91,16 @@ pub struct ScriptException {
     pub stack: String,
     pub line_number: u32,
     pub column_number: u32,
+}
+
+/// One failed microtask job, and the realm it belongs to.
+///
+/// `realm_id` is `None` only when V8 could not name a context for the failure,
+/// which leaves the embedder no global to report it on.
+#[derive(Debug, Eq, PartialEq)]
+pub struct JobError {
+    pub realm_id: Option<RealmId>,
+    pub exception: ScriptException,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -198,6 +208,7 @@ unsafe extern "C" {
     ) -> i32;
     fn servo_v8_runtime_take_pending_job_error(
         runtime: *mut RawRuntime,
+        realm_id: *mut RealmId,
         exception: *mut RawScriptException,
         has_error: *mut u8,
         error: *mut ErrorBuffer,
@@ -646,7 +657,7 @@ impl Runtime {
     /// V8 catches a throwing job inside its own microtask builtin, reports the
     /// message, and lets execution continue, so these never reach a `TryCatch`
     /// at the checkpoint boundary and must be pulled instead.
-    pub fn take_pending_job_errors(&mut self) -> Result<Vec<ScriptException>, Error> {
+    pub fn take_pending_job_errors(&mut self) -> Result<Vec<JobError>, Error> {
         let mut errors = Vec::new();
         loop {
             let mut error_storage = [0; ERROR_CAPACITY];
@@ -662,11 +673,13 @@ impl Runtime {
                 column_number: 0,
             };
             let mut has_error = 0u8;
+            let mut realm_id = RealmId(0);
             // SAFETY: The runtime is live and every output buffer has
             // independent live backing storage for the duration of the call.
             let succeeded = unsafe {
                 servo_v8_runtime_take_pending_job_error(
                     self.raw.as_ptr(),
+                    &mut realm_id,
                     &mut exception,
                     &mut has_error,
                     &mut error,
@@ -678,12 +691,15 @@ impl Runtime {
             if has_error == 0 {
                 return Ok(errors);
             }
-            errors.push(ScriptException {
-                message: text_from(&message_storage, &exception.message),
-                resource_name: text_from(&resource_storage, &exception.resource_name),
-                stack: text_from(&stack_storage, &exception.stack),
-                line_number: exception.line_number,
-                column_number: exception.column_number,
+            errors.push(JobError {
+                realm_id: (realm_id != RealmId(0)).then_some(realm_id),
+                exception: ScriptException {
+                    message: text_from(&message_storage, &exception.message),
+                    resource_name: text_from(&resource_storage, &exception.resource_name),
+                    stack: text_from(&stack_storage, &exception.stack),
+                    line_number: exception.line_number,
+                    column_number: exception.column_number,
+                },
             });
         }
     }
@@ -1366,8 +1382,11 @@ mod tests {
         );
         let job_errors = runtime.take_pending_job_errors().unwrap();
         assert_eq!(job_errors.len(), 1);
-        assert!(job_errors[0].message.contains("job boom"));
-        assert_eq!(job_errors[0].resource_name, "throwing-job.js");
+        assert!(job_errors[0].exception.message.contains("job boom"));
+        assert_eq!(job_errors[0].exception.resource_name, "throwing-job.js");
+        // The failure must name the realm that produced it, or Servo has no
+        // global to fire the event on.
+        assert_eq!(job_errors[0].realm_id, Some(first));
         assert!(
             runtime
                 .eval_bool_in_realm(first, "jobAfterThrowRan")
