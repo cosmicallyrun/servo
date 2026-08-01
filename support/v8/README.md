@@ -94,11 +94,13 @@ embedder state from the holder's creation context and call typed Rust C ABI
 thunks. The Rust host owns a `Trusted<Document>` rather than a raw DOM pointer;
 realm destruction first detaches and resets all V8 handles, then drops that
 host synchronously and exactly once. The callbacks root the live Servo document
-for the operation. The `bgColor` setter uses Servo's production CEReactions
-stack and an owned UTF-8 transfer across the C ABI. A C++/Rust reentry barrier
-turns accidental recursive entry into a deterministic failure. Failed
-installation leaves ownership with Rust, so every host transfer is
-transactional.
+for the operation. The `bgColor` setter uses an owned UTF-8 transfer across the
+C ABI and leaves custom-element reactions on Servo's current or backup element
+queue. Servo drains them only after the V8 callback and sidecar borrow unwind;
+`ce-reactions-boundary.md` records the ordering and remaining limitation. A
+C++/Rust reentry barrier turns accidental recursive entry into a deterministic
+failure. Failed installation leaves ownership with Rust, so every host
+transfer is transactional.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -133,24 +135,21 @@ Servo's native value. It makes only `document.hidden` V8-authoritative;
 SpiderMonkey still parses and executes page JavaScript and owns all other DOM
 bindings.
 
-Re-entrancy is the one deliberate exception, because it is reachable from
-ordinary page script rather than from a bug. Setting `document.bgColor` runs
-Servo's production CEReactions stack, which can synchronously invoke a custom
-element's `attributeChangedCallback` — SpiderMonkey JS running inside a live V8
-stack frame, with the sidecar already mutably borrowed — and that callback may
-read `document.hidden`. Aborting there would let any page crash the script
-thread. Such a read is instead answered from the host's own native source and
-logged as a short circuit. This is not a SpiderMonkey fallback: the V8
-accessor's host implementation reads `hidden_state_for_v8` and returns it
-unchanged, so only the round trip is skipped, and the value cannot differ.
-`authoritative_cereactions_proof.html` exercises exactly that path; it needs
-both authoritative features and so is not part of `run_proofs.sh`.
+Setting `document.bgColor` can enqueue a customized element's
+`attributeChangedCallback`, which is SpiderMonkey JavaScript. That callback is
+never invoked inside the live V8 setter. It stays on Servo's rooted current or
+backup element queue and runs from Servo's existing microtask checkpoint after
+the V8 frames, C++/Rust callback, authoritative-entry guard, and sidecar borrow
+have all unwound. A defensive native-value short circuit remains for any other
+page-reachable reentry route, but the CEReactions proof now requires that this
+normal mutation path performs a real V8 `Document.hidden` round trip with no
+short-circuit warning. `authoritative_cereactions_proof.html` needs both
+authoritative features and so is not part of `run_proofs.sh`. After building
+with both features, run its focused checks with:
 
-The deeper fix is to stop running the CEReactions stack inline inside the V8
-setter and push that boundary out to the V8 script and checkpoint boundary, so
-reactions drain after the V8 frames unwind. That removes the re-entrancy class
-rather than tolerating it, and should land before the host surface grows any
-further mutating members.
+```sh
+support/v8/run_cereactions_proof.sh
+```
 
 An additional non-default experiment makes one tightly scoped classic script
 V8-authoritative:

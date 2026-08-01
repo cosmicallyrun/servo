@@ -124,19 +124,17 @@ use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
-use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
-#[cfg(feature = "v8-classic-script-authoritative")]
-use crate::dom::bindings::error::ErrorInfo;
-#[cfg(feature = "v8-classic-script-authoritative")]
-use js::gc::HandleValue;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
+use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::conversions::{
     ConversionResult, FromJSValConvertible, StringificationBehavior,
 };
+#[cfg(feature = "v8-classic-script-authoritative")]
+use crate::dom::bindings::error::ErrorInfo;
 use crate::dom::bindings::inheritance::Castable;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::refcounted::Trusted;
@@ -182,6 +180,8 @@ use crate::svg_font::SvgFontResolver;
 use crate::task_queue::TaskQueue;
 use crate::webdriver_handlers::jsval_to_webdriver;
 use crate::{devtools, webdriver_handlers};
+#[cfg(feature = "v8-classic-script-authoritative")]
+use js::gc::HandleValue;
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
 
@@ -257,8 +257,9 @@ struct V8DocumentHost {
 #[expect(unsafe_code)]
 // SAFETY: This host stays on the Document's originating script thread, roots
 // only for a synchronous callback, and never retains the ephemeral JSContext
-// or touches the V8 sidecar RefCell. The mutation path runs Servo's production
-// CEReactions wrapper and reports a SpiderMonkey exception as callback failure.
+// or touches the V8 sidecar RefCell. The mutation path deliberately leaves
+// custom-element reactions on Servo's current or backup element queue, so a
+// SpiderMonkey callback cannot run beneath the live V8 host callback.
 unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
     fn hidden(&self) -> bool {
         self.stats
@@ -321,14 +322,18 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         self.stats
             .bg_color_setter_calls
             .set(self.stats.bg_color_setter_calls.get().wrapping_add(1));
-        let reactions = ScriptThread::custom_element_reaction_stack();
-        reactions.push_new_element_queue();
+        // Do not push and pop a CEReactions queue here. Popping would invoke a
+        // SpiderMonkey custom-element callback while the V8 accessor and the
+        // sidecar's mutable borrow are still on the stack. With no wrapper of
+        // our own, Servo enqueues the reaction on an already active outer
+        // queue or on its rooted backup queue. The latter schedules Servo's
+        // CustomElementReaction microtask, which runs after the V8 call and
+        // authoritative-entry guard have unwound.
         self.document.root().set_body_attribute(
             cx,
             &local_name!("bgcolor"),
             DOMString::from(value),
         );
-        reactions.pop_current_element_queue(cx);
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         !unsafe { JS_IsExceptionPending(cx) }
     }
@@ -363,8 +368,9 @@ enum V8DocumentHiddenError {
 impl std::fmt::Display for V8DocumentHiddenError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            V8DocumentHiddenError::Reentrant(reason) |
-            V8DocumentHiddenError::Failed(reason) => formatter.write_str(reason),
+            V8DocumentHiddenError::Reentrant(reason) | V8DocumentHiddenError::Failed(reason) => {
+                formatter.write_str(reason)
+            },
         }
     }
 }
@@ -897,9 +903,9 @@ impl ScriptThread {
             };
             match shadow.runtime.discard_script_in_realm(realm_id, script_id) {
                 Ok(()) => debug!("discarded unexecuted V8 {script_id:?} in {realm_id:?}"),
-                Err(error) => debug!(
-                    "discarding unexecuted V8 {script_id:?} in {realm_id:?} failed: {error}"
-                ),
+                Err(error) => {
+                    debug!("discarding unexecuted V8 {script_id:?} in {realm_id:?} failed: {error}")
+                },
             }
         });
     }
@@ -1034,7 +1040,9 @@ impl ScriptThread {
             // Authoritative mode fails strictly. There is no SpiderMonkey
             // fallback for a V8 job, so a bridge failure is a bug, not a
             // condition to recover from.
-            Err(error) => panic!("authoritative V8 microtask checkpoint failed internally: {error}"),
+            Err(error) => {
+                panic!("authoritative V8 microtask checkpoint failed internally: {error}")
+            },
         }
 
         // Report each failure on the global that owns it, so a page observes
@@ -1277,8 +1285,8 @@ impl ScriptThread {
         });
     }
 
-    /// Reads `Document.hidden` through V8, or short-circuits when the bridge
-    /// is already on the stack.
+    /// Reads `Document.hidden` through V8, or defensively short-circuits when
+    /// the bridge is already on the stack.
     ///
     /// `native` is only consulted for the re-entrant case, and that is not a
     /// SpiderMonkey fallback: the V8 accessor's own host implementation reads
@@ -1286,11 +1294,11 @@ impl ScriptThread {
     /// doubt — only the round trip is skipped, because the sidecar is already
     /// mutably borrowed further up the stack.
     ///
-    /// Re-entry is reachable from ordinary page script. A custom element's
-    /// `attributeChangedCallback`, invoked by CEReactions during the V8
-    /// `bgColor` setter, can read `document.hidden`. Aborting there would let
-    /// a page crash the script thread, so only a genuine bridge failure — a
-    /// disposed sidecar, a missing realm, a V8 error — still aborts.
+    /// V8-originated CEReactions are now deferred until the existing Servo
+    /// checkpoint, after V8 frames and the sidecar borrow unwind. The short
+    /// circuit remains a safety net for any other page-reachable nested route;
+    /// only a genuine bridge failure — a disposed sidecar, a missing realm, a
+    /// V8 error — aborts.
     #[cfg(feature = "v8-document-hidden-authoritative")]
     pub(crate) fn v8_document_hidden_strict(pipeline_id: PipelineId, native: bool) -> bool {
         let result = with_optional_script_thread(|script_thread| {
