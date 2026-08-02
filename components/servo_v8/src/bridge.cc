@@ -179,29 +179,22 @@ struct ServoV8TraceVisitor {
 
 struct ServoV8DomCell final : public v8::Object::Wrappable {
  public:
-  ServoV8DomCell(void* native,
+  ServoV8DomCell(ServoV8Runtime* runtime,
+                 void* native,
                  uint32_t interface_id,
                  const ServoV8EngineBindingSmokeVTable& vtable)
-      : native_(native), interface_id_(interface_id), vtable_(vtable) {}
+      : runtime_(runtime),
+        native_(native),
+        interface_id_(interface_id),
+        vtable_(vtable) {}
 
-  ~ServoV8DomCell() override {
-    wrapper_.Reset();
-    if (native_ && vtable_.drop) vtable_.drop(native_);
-    native_ = nullptr;
-  }
+  ~ServoV8DomCell() override;
 
   void SetWrapper(v8::Isolate* isolate, v8::Local<v8::Object> wrapper) {
     wrapper_.Reset(isolate, wrapper);
   }
 
-  void Trace(cppgc::Visitor* visitor) const override {
-    v8::Object::Wrappable::Trace(visitor);
-    visitor->Trace(wrapper_);
-    if (native_ && vtable_.trace) {
-      ServoV8TraceVisitor rust_visitor{visitor};
-      vtable_.trace(native_, &rust_visitor);
-    }
-  }
+  void Trace(cppgc::Visitor* visitor) const override;
 
   const v8::Object::WrapperTypeInfo* GetWrapperTypeInfo() const override {
     return &kTypeInfo;
@@ -212,11 +205,13 @@ struct ServoV8DomCell final : public v8::Object::Wrappable {
   }
 
   void* native() const { return native_; }
+  ServoV8Runtime* runtime() const { return runtime_; }
   uint32_t interface_id() const { return interface_id_; }
   const ServoV8EngineBindingSmokeVTable& vtable() const { return vtable_; }
 
  private:
   static constexpr v8::Object::WrapperTypeInfo kTypeInfo{1};
+  ServoV8Runtime* runtime_;
   void* native_;
   const uint32_t interface_id_;
   ServoV8EngineBindingSmokeVTable vtable_;
@@ -800,7 +795,7 @@ void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
       return;
     }
   }
-  DocumentHostOwnedUtf8Scope value_scope(&value);
+  DocumentHostOwnedUtf8Scope value_scope(realm->runtime, &value);
   if ((!value.data && value.length != 0) ||
       value.length > static_cast<size_t>(std::numeric_limits<int>::max())) {
     ThrowTypeError(isolate, "invalid Element.tagName UTF-8 result");
@@ -1030,6 +1025,23 @@ bool CompileScript(ServoV8Runtime* runtime,
 }
 
 }  // namespace
+
+ServoV8DomCell::~ServoV8DomCell() {
+  wrapper_.Reset();
+  void* native = std::exchange(native_, nullptr);
+  if (!native || !vtable_.drop) return;
+  RustCallbackScope callback_scope(runtime_);
+  vtable_.drop(native);
+}
+
+void ServoV8DomCell::Trace(cppgc::Visitor* visitor) const {
+  v8::Object::Wrappable::Trace(visitor);
+  visitor->Trace(wrapper_);
+  if (!native_ || !vtable_.trace) return;
+  ServoV8TraceVisitor rust_visitor{visitor};
+  RustCallbackScope callback_scope(runtime_);
+  vtable_.trace(native_, &rust_visitor);
+}
 
 void ServoV8HostCell::ReleaseHost() {
   if (!native_) return;

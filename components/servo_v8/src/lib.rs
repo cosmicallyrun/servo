@@ -1035,6 +1035,59 @@ mod tests {
     use super::*;
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
+        static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    struct CallbackReentryConfig;
+
+    impl CallbackReentryConfig {
+        fn new(runtime: *mut RawRuntime) -> Self {
+            CALLBACK_REENTRY_RUNTIME.with(|slot| {
+                assert!(slot.replace(runtime).is_null());
+            });
+            CALLBACK_REENTRY_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+            Self
+        }
+    }
+
+    impl Drop for CallbackReentryConfig {
+        fn drop(&mut self) {
+            CALLBACK_REENTRY_RUNTIME.with(|slot| slot.set(std::ptr::null_mut()));
+        }
+    }
+
+    fn attempt_callback_reentry(phase: &'static str) {
+        CALLBACK_REENTRY_RUNTIME.with(|runtime| {
+            let runtime = runtime.get();
+            if runtime.is_null() {
+                return;
+            }
+            let source = b"true";
+            let mut storage = [0; ERROR_CAPACITY];
+            let mut error = error_buffer(&mut storage);
+            let mut result = 0;
+            // SAFETY: Each test callback receives a still-live runtime. The
+            // C++ callback scope must reject this nested entry before V8 is
+            // touched, including while cppgc is tracing or sweeping.
+            let succeeded = unsafe {
+                servo_v8_eval_bool(
+                    runtime,
+                    source.as_ptr(),
+                    source.len(),
+                    &mut result,
+                    &mut error,
+                )
+            };
+            CALLBACK_REENTRY_ATTEMPTS.with(|attempts| {
+                attempts
+                    .borrow_mut()
+                    .push((phase, succeeded, text_from(&storage, &error)));
+            });
+        });
+    }
 
     fn compiled(result: Result<ScriptCompileOutcome, Error>) -> ScriptId {
         match result.unwrap() {
@@ -1048,6 +1101,53 @@ mod tests {
     struct NativeSmoke {
         value: i32,
         child: Cell<Option<EngineBindingSmokeHandle>>,
+    }
+
+    struct CallbackReentrySmoke {
+        value: i32,
+    }
+
+    impl Drop for CallbackReentrySmoke {
+        fn drop(&mut self) {
+            attempt_callback_reentry("drop");
+        }
+    }
+
+    // SAFETY: Every attempted nested runtime entry is expected to be rejected
+    // by the surrounding C++ callback scope. The callbacks do not unwind, and
+    // this probe stores no outgoing cppgc edges.
+    unsafe impl EngineBindingSmokeBinding for CallbackReentrySmoke {
+        fn constructor(value: i32) -> Option<Self> {
+            attempt_callback_reentry("constructor");
+            Some(Self { value })
+        }
+
+        fn value(&self) -> i32 {
+            attempt_callback_reentry("getter");
+            self.value
+        }
+
+        fn set_value(&mut self, value: i32) {
+            attempt_callback_reentry("setter");
+            self.value = value;
+        }
+
+        fn add(&self, rhs: i32) -> i32 {
+            attempt_callback_reentry("method");
+            self.value.wrapping_add(rhs)
+        }
+
+        fn set_child(&self, _child: EngineBindingSmokeHandle) -> i32 {
+            self.value
+        }
+
+        fn child_value(&self) -> i32 {
+            self.value
+        }
+
+        unsafe fn trace(&self, _visitor: *mut TraceVisitor) {
+            attempt_callback_reentry("trace");
+        }
     }
 
     /// A stand-in for one Servo Element.
@@ -1354,6 +1454,47 @@ mod tests {
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         drop(runtime);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn generated_callbacks_reject_runtime_reentry_including_during_gc() {
+        let options = Options {
+            expose_gc: 1,
+            ..Options::default()
+        };
+        let mut runtime = Runtime::new(options).unwrap();
+        runtime
+            .install_engine_binding_smoke::<CallbackReentrySmoke>()
+            .unwrap();
+        let _reentry_config = CallbackReentryConfig::new(runtime.raw.as_ptr());
+
+        assert!(
+            runtime
+                .eval_bool(
+                    "globalThis.reentrySmoke = new EngineBindingSmoke(4); \
+                     reentrySmoke.value = 9; \
+                     reentrySmoke.value === 9 && reentrySmoke.add(1) === 10"
+                )
+                .unwrap()
+        );
+        // The live wrapper makes cppgc invoke the Rust trace callback.
+        runtime.collect_garbage_for_testing();
+        assert!(runtime.eval_bool("delete globalThis.reentrySmoke").unwrap());
+        // With no JS root, sweeping invokes the Rust destructor.
+        runtime.collect_garbage_for_testing();
+
+        let attempts = CALLBACK_REENTRY_ATTEMPTS.with(|attempts| attempts.borrow().clone());
+        for expected_phase in ["constructor", "getter", "setter", "method", "trace", "drop"] {
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == expected_phase),
+                "missing hostile {expected_phase} callback: {attempts:?}"
+            );
+        }
+        assert!(attempts.iter().all(|(_, status, error)| {
+            *status == 0 && error.contains("re-entered from a Rust host callback")
+        }));
     }
 
     #[test]

@@ -65,6 +65,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
         output = self.outputs[generate_document_host.CPP_NAME]
         expected_fragments = (
             "class DocumentHostOwnedUtf8Scope {",
+            "RustCallbackScope callback_scope(runtime_);",
+            "DocumentHostOwnedUtf8Scope value_scope(state->runtime, &value);",
             "DocumentHostGetHidden(",
             "DocumentHostGetBgColor(",
             "DocumentHostSetBgColor(",

@@ -61,6 +61,12 @@ both survival and final reclamation are asserted after test-only full
 collections with an explicit no-heap-pointers stack state so conservative
 stack scanning cannot hide a broken edge or make the test flaky.
 
+Every generated C++ call into Rust is covered by the runtime's callback-depth
+scope, including constructors, attributes, methods, cppgc tracing and
+destruction. Rust-owned UTF-8 release callbacks use the same scope. A hostile
+test implementation attempts to enter its runtime from each phase, including
+inside marking and sweeping, and must be rejected before V8 is touched.
+
 The production binding slice is generated from the enabled `Document.hidden`,
 `Document.bgColor`, `Document.URL`, `Document.visibilityState`, and
 `Node.nodeType` declarations in Servo's real
