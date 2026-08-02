@@ -52,7 +52,23 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
 
         self.assertEqual(
             list(attributes),
-            [qualified_name for qualified_name, _ in production_webidl.DOCUMENT_HOST],
+            [member.qualified_name for member in production_webidl.DOCUMENT_HOST],
+        )
+
+    def test_pins_each_real_interface_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_attributes(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            attributes[production_webidl.DOCUMENT_DOCUMENT_ELEMENT].type.inner.name,
+            "Element",
+        )
+        self.assertEqual(
+            attributes[production_webidl.DOCUMENT_HEAD].type.inner.name,
+            "HTMLHeadElement",
         )
 
 
@@ -223,6 +239,47 @@ class SyntheticSelectionTests(unittest.TestCase):
             "[CEReactions, Throws] attribute [LegacyNullToEmptyString] DOMString bgColor;",
             "`Document.bgColor` carries extended attributes that are not implemented: Throws",
         )
+
+    def test_rejects_the_wrong_nullable_interface_return(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface Element {};
+                    interface HTMLHeadElement : Element {};
+                    interface Document { readonly attribute Element? head; };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape("`Document.head` must return `HTMLHeadElement`, got `Element`"),
+        ):
+            production_webidl.select_readonly_nullable_interface_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_HEAD,
+                "HTMLHeadElement",
+            )
+
+    def test_rejects_a_nonnullable_interface_return(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface HTMLHeadElement {};
+                    interface Document { readonly attribute HTMLHeadElement head; };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape("`Document.head` must be nullable"),
+        ):
+            production_webidl.select_readonly_nullable_interface_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_HEAD,
+                "HTMLHeadElement",
+            )
 
 
 if __name__ == "__main__":

@@ -2,11 +2,11 @@
 <!--
 Runtime proof that a DOM object handed to V8 has a stable wrapper.
 
-This is the first member whose value is another DOM object, so it is the first
-that needs the per-realm wrapper cache. Reading the same element twice must
-produce the same JavaScript object, not merely an equal one -- and the test for
-that is a property set on the wrapper surviving a re-read, which an
-equal-but-distinct object could not manage.
+document.documentElement and document.head are distinct DOM objects sharing the
+per-realm wrapper cache. Reading either element twice must produce the same
+JavaScript object, not merely an equal one -- and the test for that is a
+property set on each wrapper surviving a re-read, which equal-but-distinct
+objects could not manage.
 
 The wrapper holds a Trusted<Element>, which is the only cross-heap edge in the
 design: strong from cppgc into SpiderMonkey, with nothing pointing back, so no
@@ -41,6 +41,20 @@ Run via support/v8/run_proofs.sh.
       first.servoMarker = 41;
       if (document.documentElement.servoMarker !== 41) {
         throw new Error("expando lost, so a second wrapper was created");
+      }
+      var head = document.head;
+      if (head === null || head.tagName !== "HEAD") {
+        throw new Error("unexpected document.head: " + head);
+      }
+      if (head === first) {
+        throw new Error("distinct DOM objects shared one wrapper");
+      }
+      if (head !== document.head) {
+        throw new Error("head wrapper identity is not stable across reads");
+      }
+      head.servoHeadMarker = 23;
+      if (document.head.servoHeadMarker !== 23) {
+        throw new Error("head expando lost on a second read");
       }
       // tagName is brand-checked, like every other host accessor.
       var descriptor =

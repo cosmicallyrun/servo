@@ -50,6 +50,7 @@ class Member(NamedTuple):
 
     shape: str
     qualified_name: str
+    expected_interface: str | None
     attribute: WebIDL.IDLAttribute
 
 
@@ -165,6 +166,7 @@ def generate_cpp(attributes: Mapping[str, WebIDL.IDLAttribute]) -> str:
             "}",
         ],
         *_interleaved_blocks(members, "cpp_body_blocks", "cpp_bodies"),
+        _cpp_accessor_installation(members),
     ]
     return _render(blocks)
 
@@ -195,17 +197,24 @@ def write_outputs(webidls_dir: Path, out_dir: Path) -> None:
 def _members(attributes: Mapping[str, WebIDL.IDLAttribute]) -> list[Member]:
     """Pair the selected attributes with the shapes the manifest expects."""
 
-    expected = [qualified_name for qualified_name, _ in production_webidl.DOCUMENT_HOST]
+    expected = [member.qualified_name for member in production_webidl.DOCUMENT_HOST]
     if list(attributes) != expected:
         raise production_webidl.WebIDLSelectionError(
             f"Document host generation expected {expected}, found {list(attributes)}"
         )
-    for _, shape in production_webidl.DOCUMENT_HOST:
-        if shape not in SHAPE_EMITTERS:
-            raise production_webidl.WebIDLSelectionError(f"Document host generation cannot emit shape `{shape}`")
+    for member in production_webidl.DOCUMENT_HOST:
+        if member.shape not in SHAPE_EMITTERS:
+            raise production_webidl.WebIDLSelectionError(
+                f"Document host generation cannot emit shape `{member.shape}`"
+            )
     return [
-        Member(shape=shape, qualified_name=qualified_name, attribute=attributes[qualified_name])
-        for qualified_name, shape in production_webidl.DOCUMENT_HOST
+        Member(
+            shape=member.shape,
+            qualified_name=member.qualified_name,
+            expected_interface=member.expected_interface,
+            attribute=attributes[member.qualified_name],
+        )
+        for member in production_webidl.DOCUMENT_HOST
     ]
 
 
@@ -294,6 +303,83 @@ def _getter_name(attribute: WebIDL.IDLAttribute) -> str:
 
 def _setter_name(attribute: WebIDL.IDLAttribute) -> str:
     return f"set_{_rust_member_name(attribute)}"
+
+
+def _cpp_accessor_installation(members: Sequence[Member]) -> Block:
+    """Generate all V8 function objects and prototype properties from the manifest."""
+
+    lines = [
+        "bool InstallDocumentHostAccessors(",
+        "    v8::Isolate* isolate,",
+        "    v8::Local<v8::Context> context,",
+        "    v8::Local<v8::Object> prototype) {",
+    ]
+    for member in members:
+        local = _rust_member_name(member.attribute)
+        lines.append(f"  v8::Local<v8::Function> {local}_getter;")
+        if not member.attribute.readonly:
+            lines.append(f"  v8::Local<v8::Function> {local}_setter;")
+
+    for member in members:
+        local = _rust_member_name(member.attribute)
+        callback = _cpp_member_name(member.attribute)
+        lines.extend(
+            [
+                f"  if (!v8::Function::New(context, DocumentHostGet{callback},",
+                "                         v8::Local<v8::Data>(), 0,",
+                "                         v8::ConstructorBehavior::kThrow,",
+                "                         v8::SideEffectType::kHasNoSideEffect)",
+                f"           .ToLocal(&{local}_getter)) {{",
+                "    return false;",
+                "  }",
+            ]
+        )
+        if not member.attribute.readonly:
+            lines.extend(
+                [
+                    f"  if (!v8::Function::New(context, DocumentHostSet{callback},",
+                    "                         v8::Local<v8::Data>(), 1,",
+                    "                         v8::ConstructorBehavior::kThrow,",
+                    "                         v8::SideEffectType::kHasSideEffect)",
+                    f"           .ToLocal(&{local}_setter)) {{",
+                    "    return false;",
+                    "  }",
+                ]
+            )
+
+    for member in members:
+        local = _rust_member_name(member.attribute)
+        member_name = member.attribute.identifier.name
+        lines.append(f'  {local}_getter->SetName(V8String(isolate, "get {member_name}"));')
+        if not member.attribute.readonly:
+            lines.append(f'  {local}_setter->SetName(V8String(isolate, "set {member_name}"));')
+
+    for member in members:
+        local = _rust_member_name(member.attribute)
+        setter = f"{local}_setter" if not member.attribute.readonly else "v8::Undefined(isolate)"
+        lines.extend(
+            [
+                f"  v8::PropertyDescriptor {local}_descriptor({local}_getter, {setter});",
+                f"  {local}_descriptor.set_enumerable(true);",
+                f"  {local}_descriptor.set_configurable(true);",
+            ]
+        )
+
+    for member in members:
+        local = _rust_member_name(member.attribute)
+        member_name = member.attribute.identifier.name
+        lines.extend(
+            [
+                "  if (!prototype",
+                f'           ->DefineProperty(context, V8String(isolate, "{member_name}"),',
+                f"                            {local}_descriptor)",
+                "           .FromMaybe(false)) {",
+                "    return false;",
+                "  }",
+            ]
+        )
+    lines.extend(["  return true;", "}"])
+    return lines
 
 
 def _readonly_boolean_header_slots(member: Member) -> Block:
@@ -767,7 +853,69 @@ def _readonly_nullable_interface_rust_vtable_init(member: Member) -> Block:
 
 
 def _readonly_nullable_interface_cpp_bodies(member: Member) -> tuple[Block, ...]:
-    return ()
+    getter = _getter_name(member.attribute)
+    accessor = _cpp_member_name(member.attribute)
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostGet{accessor}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{getter}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->element_template.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "Element host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  ServoV8InterfaceValue value{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{getter}(state->native, &value) != 0;",
+            "  }",
+            "  if (!succeeded) {",
+            "    DropUnownedElementHost(state->runtime, value.native,",
+            "                           state->runtime->element_host_vtable.drop);",
+            f'    ThrowTypeError(isolate, "{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            "  const bool malformed =",
+            "      value.is_null > 1 ||",
+            "      (value.is_null != 0 && (value.key || value.native)) ||",
+            "      (value.is_null == 0 && (!value.key || !value.native));",
+            "  if (malformed) {",
+            "    DropUnownedElementHost(state->runtime, value.native,",
+            "                           state->runtime->element_host_vtable.drop);",
+            f'    ThrowTypeError(isolate, "invalid {qualified_name} interface result");',
+            "    return;",
+            "  }",
+            "  if (value.is_null != 0) {",
+            "    info.GetReturnValue().SetNull();",
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            "  v8::Local<v8::Object> wrapper =",
+            "      WrapperForInterfaceValue(realm, isolate, context, value);",
+            "  if (wrapper.IsEmpty()) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} wrapper could not be created");',
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(wrapper);",
+            "}",
+        ],
+    )
 
 
 def _readonly_nullable_interface_cpp_vtable_terms(member: Member) -> list[str]:

@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 13;
+const ABI_VERSION: u32 = 14;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -832,8 +832,8 @@ impl Runtime {
         Ok(())
     }
 
-    /// Installs a realm-owned host for Servo's production `Document.hidden`
-    /// binding. After successful installation, the native host is destroyed
+    /// Installs a realm-owned host for the selected production `Document`
+    /// bindings. After successful installation, the native host is destroyed
     /// synchronously when its realm or runtime is destroyed. Failed
     /// installation leaves ownership in Rust and drops the host here.
     pub fn install_document_host<T: DocumentHostBinding>(
@@ -1212,6 +1212,9 @@ mod tests {
         /// Stands in for the address of a Servo Element the host would root.
         /// Stable for this probe's lifetime, which is what identity needs.
         element_identity: Box<u8>,
+        head_identity: Box<u8>,
+        document_element_present: bool,
+        head_present: bool,
         element_drops: Rc<Cell<usize>>,
         element_drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -1230,6 +1233,9 @@ mod tests {
                 bg_color_setter_calls: Rc::new(Cell::new(0)),
                 drops,
                 element_identity: Box::new(0),
+                head_identity: Box::new(0),
+                document_element_present: true,
+                head_present: true,
                 element_drops: Rc::new(Cell::new(0)),
                 element_drop_reentry: None,
             }
@@ -1278,6 +1284,9 @@ mod tests {
         }
 
         fn document_element(&self) -> Option<InterfaceHandle> {
+            if !self.document_element_present {
+                return None;
+            }
             // SAFETY: `element_identity` lives as long as this host, which is
             // what the probe stands in for -- a real host roots its element.
             Some(unsafe {
@@ -1285,6 +1294,24 @@ mod tests {
                     (&*self.element_identity as *const u8).cast::<c_void>(),
                     ElementHostProbe {
                         tag_name: "HTML".to_owned(),
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        fn head(&self) -> Option<InterfaceHandle> {
+            if !self.head_present {
+                return None;
+            }
+            // SAFETY: `head_identity` stands in for a distinct, rooted
+            // HTMLHeadElement whose inherited Element facade reports HEAD.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    (&*self.head_identity as *const u8).cast::<c_void>(),
+                    ElementHostProbe {
+                        tag_name: "HEAD".to_owned(),
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -1881,6 +1908,24 @@ mod tests {
                 .eval_bool_in_realm(realm, "document.documentElement.tagName === 'HTML'")
                 .unwrap()
         );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.head.tagName === 'HEAD' && \
+                     document.head !== document.documentElement && \
+                     document.head === document.head",
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.head.marker = 23; document.head.marker === 23",
+                )
+                .unwrap()
+        );
         // A property set on the wrapper survives a re-read, which an
         // equal-but-distinct object would not manage.
         assert!(
@@ -1924,7 +1969,7 @@ mod tests {
         // destroyed pipeline's DOM for as long as the isolate stays idle.
         // Every read past the first hits the cache, and each hit drops the
         // host that read speculatively allocated -- so those drops have
-        // already happened, and exactly one live host remains.
+        // already happened, and exactly two live hosts remain.
         let dropped_on_cache_hits = element_drops.get();
         assert!(
             dropped_on_cache_hits > 0,
@@ -1942,8 +1987,8 @@ mod tests {
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(
             element_drops.get(),
-            dropped_on_cache_hits + 1,
-            "realm destruction must release the one cached host, synchronously"
+            dropped_on_cache_hits + 2,
+            "realm destruction must release both cached hosts, synchronously"
         );
         assert_eq!(drop_reentry_attempts.borrow().len(), element_drops.get());
         assert!(
@@ -1954,6 +1999,27 @@ mod tests {
                     *status == 0 && error.contains("re-entered from a Rust host callback")
                 })
         );
+
+        let nullable_realm = runtime.create_realm().unwrap();
+        let mut nullable_host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        nullable_host.document_element_present = false;
+        nullable_host.head_present = false;
+        runtime
+            .install_document_host(nullable_realm, nullable_host)
+            .unwrap();
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    nullable_realm,
+                    "document.documentElement === null && document.head === null",
+                )
+                .unwrap()
+        );
+        runtime.destroy_realm(nullable_realm).unwrap();
         drop(runtime);
     }
 

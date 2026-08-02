@@ -215,10 +215,12 @@ boundary, which is observable and wrong.
 Two queues drained back to back is not HTML's single FIFO queue. The
 interleaving of V8 and SpiderMonkey jobs is not spec-accurate.
 
-Today the difference is unobservable: only authoritative classic scripts can
-enqueue V8 jobs, and the host surface is `window`, `document`, and two
-`Document` attributes. It becomes observable as soon as the host surface grows
-promise-returning APIs or custom-element reactions that queue on both sides.
+The difference is now observable when a V8 script combines a promise job with
+the `[CEReactions]` `Document.bgColor` setter. The experiment deliberately
+defers that reaction until the mixed-engine checkpoint to prevent SpiderMonkey
+callbacks from running beneath V8; `ce-reactions-boundary.md` records the
+resulting V8-jobs-first ordering deviation. The mode remains explicitly opt-in
+until the queues are unified.
 
 The eventual fix is one Servo-owned queue with V8 jobs represented as a
 `Microtask::V8Job` variant drained in enqueue order, which needs an ABI-level

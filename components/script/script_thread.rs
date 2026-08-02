@@ -312,6 +312,21 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         })
     }
 
+    fn head(&self) -> Option<servo_v8::InterfaceHandle> {
+        let head = self.document.root().GetHead()?;
+        let element = head.upcast::<Element>();
+        // SAFETY: HTMLHeadElement inherits from Element. The cache key is the
+        // address of the same Element allocation the host roots.
+        Some(unsafe {
+            servo_v8::InterfaceHandle::new(
+                (element as *const Element).cast::<c_void>(),
+                V8ElementHost {
+                    element: Trusted::new(element),
+                },
+            )
+        })
+    }
+
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
         if host_context.is_null() {
             return false;

@@ -218,8 +218,8 @@ fn main() {
         .arg("-Wl,-install_name,@rpath/libservo_v8_bridge.dylib")
         // Keep these in sync with SERVO_V8_ABI_VERSION in servo_v8.h.
         .args([
-            "-Wl,-compatibility_version,13.0.0",
-            "-Wl,-current_version,13.0.0",
+            "-Wl,-compatibility_version,14.0.0",
+            "-Wl,-current_version,14.0.0",
         ])
         .arg("-o")
         .arg(&dylib)

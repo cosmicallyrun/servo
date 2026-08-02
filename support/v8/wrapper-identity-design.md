@@ -1,12 +1,13 @@
 # Per-realm wrapper identity for DOM objects
 
-Status: implemented, at exported C ABI version 13. `Document.documentElement`
-and `Element.tagName` are the first members built on it.
+Status: implemented, at exported C ABI version 14. `Document.documentElement`,
+`Document.head`, and `Element.tagName` are built on it.
 
 This is the subsystem every interface-typed binding waits on.
-`Document.documentElement`, `Element.tagName`, and eventually anything that
-hands a DOM node to script all need the same thing: asking for the same DOM
-object twice must produce the *same* JavaScript object.
+`Document.documentElement`, `Document.head`, `Element.tagName`, and eventually
+anything that hands a DOM node to script all need the same thing: asking for
+the same DOM object twice must produce the *same* JavaScript object, while two
+different DOM objects must never share one wrapper.
 
 ## What already exists, and why it does not generalise
 
@@ -113,8 +114,8 @@ cache on the side that owns it; the alternative is a second round trip to ask
 whether a wrapper exists before building one.
 
 A nullable return needs no extra machinery: the null flag becomes JavaScript
-`null`, which is what `documentElement` yields before the tree has a root
-element.
+`null`, which is what `documentElement` and `head` yield when those elements do
+not exist.
 
 ## Why not simply hold every wrapper strongly
 
@@ -132,17 +133,16 @@ identifies the object it was created for.
 
 ## Where the generator fits
 
-The manifest carries `Document.documentElement` like any other member, and the
-generator emits its ABI slot, its Rust trait method, thunk and vtable wiring
-from a `readonly nullable interface` shape — so the selector still rejects a
-member whose WebIDL drifts.
+The manifest carries `Document.documentElement` and `Document.head` like any
+other members and pins their exact declared interfaces (`Element` and
+`HTMLHeadElement`). The generator emits their ABI slots, Rust trait methods,
+thunks, checked C++ accessor bodies, and prototype registration from one
+`readonly nullable interface` shape. The current wrapper deliberately exposes
+only inherited `Element` behavior, but WebIDL drift in either declared return
+type is still a build failure rather than silent type erasure.
 
-What the generator does *not* emit for this shape is the C++ accessor body. The
-wrapper cache, the cell, and the per-realm `Element` template are
-infrastructure, and live in `bridge.cc` beside the hand-written `document`
-facade, because the generator has always written accessor bodies onto a facade
-someone else builds. Teaching it to emit interface-return bodies is worth doing
-once a second such member exists to generalise from.
+The wrapper cache, cell, and per-realm `Element` template remain hand-written
+infrastructure in `bridge.cc`; member-specific code no longer lives there.
 
 ## What this does not do
 
@@ -208,8 +208,8 @@ size.
 
 Servo solves the identical problem for `Trusted<T>` by pruning nulls on table
 growth and at every GC trace, and this cache should do the same. It is not
-urgent while the host surface exposes one element per document, and it becomes
-urgent the moment anything walks the tree.
+urgent while the host surface exposes only the document root and head, and it
+becomes urgent the moment anything walks an unbounded part of the tree.
 
 ## Proofs
 
@@ -219,8 +219,9 @@ covers the bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by
   an expando surviving a re-read rather than by equality alone
+- `documentElement` and `head` are distinct wrappers with independent expandos
 - the wrapper is not the document facade, and `tagName` is brand-checked
 - a cache hit drops the host the reading path speculatively allocated
 - a hostile surplus-host `Drop` is rejected before it can re-enter V8
-- realm destruction releases the one live host synchronously
-- `documentElement` is `null` when there is no root element
+- realm destruction releases both live hosts synchronously
+- both interface getters produce `null` when their native objects are absent

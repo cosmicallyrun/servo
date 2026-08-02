@@ -704,9 +704,6 @@ bool CallDocumentHostSetBgColor(ServoV8DocumentHostState* state,
                                     value_length) != 0;
 }
 
-#include "servo_v8_generated.inc"
-#include "servo_v8_document_host_generated.inc"
-
 // Drops a host that was never installed into a cell, using the same re-entry
 // barrier as an installed host's ReleaseHost path. Cache hits create one
 // speculative Rust host that must be discarded, and wrapper allocation can
@@ -719,6 +716,15 @@ void DropUnownedElementHost(ServoV8Runtime* runtime,
   RustCallbackScope callback_scope(runtime);
   drop(native);
 }
+
+v8::Local<v8::Object> WrapperForInterfaceValue(
+    ServoV8RealmState* realm,
+    v8::Isolate* isolate,
+    v8::Local<v8::Context> context,
+    const ServoV8InterfaceValue& value);
+
+#include "servo_v8_generated.inc"
+#include "servo_v8_document_host_generated.inc"
 
 // Finds or creates the wrapper for one DOM object, preserving identity.
 //
@@ -811,49 +817,6 @@ void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
   info.GetReturnValue().Set(result);
 }
-
-void DocumentHostGetDocumentElement(
-    const v8::FunctionCallbackInfo<v8::Value>& info) {
-  v8::Isolate* isolate = info.GetIsolate();
-  auto* state = UnwrapDocumentHostState(info);
-  if (!state || !state->native || !state->vtable.get_document_element) {
-    ThrowTypeError(isolate, "invalid Document host state");
-    return;
-  }
-  auto* realm = static_cast<ServoV8RealmState*>(
-      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
-          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
-  if (!realm || realm->element_template.IsEmpty()) {
-    ThrowTypeError(isolate, "Element host is not installed in this realm");
-    return;
-  }
-
-  ServoV8InterfaceValue value{};
-  {
-    if (state->runtime->rust_callback_depth != 0) {
-      ThrowTypeError(isolate, "re-entrant Document host callback");
-      return;
-    }
-    RustCallbackScope callback_scope(state->runtime);
-    if (!state->vtable.get_document_element(state->native, &value)) {
-      ThrowTypeError(isolate, "Document.documentElement host callback failed");
-      return;
-    }
-  }
-  if (value.is_null) {
-    info.GetReturnValue().SetNull();
-    return;
-  }
-  v8::Local<v8::Context> context = isolate->GetCurrentContext();
-  v8::Local<v8::Object> wrapper =
-      WrapperForInterfaceValue(realm, isolate, context, value);
-  if (wrapper.IsEmpty()) {
-    ThrowTypeError(isolate, "Element wrapper could not be created");
-    return;
-  }
-  info.GetReturnValue().Set(wrapper);
-}
-
 
 void ResetDocumentHost(ServoV8DocumentHostState* state) {
   void* native = std::exchange(state->native, nullptr);
@@ -1172,56 +1135,9 @@ extern "C" int32_t servo_v8_realm_create(
   v8::Local<v8::Object> document_prototype = v8::Object::New(isolate);
   v8::Local<v8::Object> document = v8::Object::New(isolate);
   v8::Local<v8::Object> global = context->Global();
-  v8::Local<v8::Function> hidden_getter;
-  v8::Local<v8::Function> bg_color_getter;
-  v8::Local<v8::Function> bg_color_setter;
-  v8::Local<v8::Function> url_getter;
-  v8::Local<v8::Function> visibility_state_getter;
-  v8::Local<v8::Function> node_type_getter;
-  v8::Local<v8::Function> document_element_getter;
   const v8::PropertyAttribute immutable = static_cast<v8::PropertyAttribute>(
       v8::ReadOnly | v8::DontDelete);
-  if (!v8::Function::New(context, DocumentHostGetHidden,
-                         v8::Local<v8::Data>(), 0,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&hidden_getter)) {
-    context->SetAlignedPointerInEmbedderData(
-        kServoRealmStateEmbedderSlot, nullptr,
-        kServoRealmStateEmbedderTag);
-    WriteError(error, TryCatchMessage(isolate, try_catch));
-    return 0;
-  }
-  if (!v8::Function::New(context, DocumentHostGetBgColor,
-                         v8::Local<v8::Data>(), 0,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&bg_color_getter) ||
-      !v8::Function::New(context, DocumentHostSetBgColor,
-                         v8::Local<v8::Data>(), 1,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasSideEffect)
-           .ToLocal(&bg_color_setter) ||
-      !v8::Function::New(context, DocumentHostGetUrl,
-                         v8::Local<v8::Data>(), 0,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&url_getter) ||
-      !v8::Function::New(context, DocumentHostGetVisibilityState,
-                         v8::Local<v8::Data>(), 0,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&visibility_state_getter) ||
-      !v8::Function::New(context, DocumentHostGetNodeType,
-                         v8::Local<v8::Data>(), 0,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&node_type_getter) ||
-      !v8::Function::New(context, DocumentHostGetDocumentElement,
-                         v8::Local<v8::Data>(), 0,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&document_element_getter)) {
+  if (!InstallDocumentHostAccessors(isolate, context, document_prototype)) {
     context->SetAlignedPointerInEmbedderData(
         kServoRealmStateEmbedderSlot, nullptr,
         kServoRealmStateEmbedderTag);
@@ -1240,13 +1156,6 @@ extern "C" int32_t servo_v8_realm_create(
     WriteError(error, "V8 realm could not remove the built-in console");
     return 0;
   }
-  hidden_getter->SetName(V8String(isolate, "get hidden"));
-  bg_color_getter->SetName(V8String(isolate, "get bgColor"));
-  bg_color_setter->SetName(V8String(isolate, "set bgColor"));
-  url_getter->SetName(V8String(isolate, "get URL"));
-  visibility_state_getter->SetName(V8String(isolate, "get visibilityState"));
-  node_type_getter->SetName(V8String(isolate, "get nodeType"));
-  document_element_getter->SetName(V8String(isolate, "get documentElement"));
 
   // Element instances are built from a FunctionTemplate instance template,
   // which is what makes them wrappable by v8::Object::Wrap.
@@ -1262,54 +1171,7 @@ extern "C" int32_t servo_v8_realm_create(
                                 v8::Local<v8::Signature>(), 0,
                                 v8::ConstructorBehavior::kThrow,
                                 v8::SideEffectType::kHasNoSideEffect));
-  v8::PropertyDescriptor hidden_descriptor(hidden_getter,
-                                            v8::Undefined(isolate));
-  hidden_descriptor.set_enumerable(true);
-  hidden_descriptor.set_configurable(true);
-  v8::PropertyDescriptor bg_color_descriptor(bg_color_getter,
-                                              bg_color_setter);
-  bg_color_descriptor.set_enumerable(true);
-  bg_color_descriptor.set_configurable(true);
-  v8::PropertyDescriptor url_descriptor(url_getter, v8::Undefined(isolate));
-  url_descriptor.set_enumerable(true);
-  url_descriptor.set_configurable(true);
-  v8::PropertyDescriptor visibility_state_descriptor(visibility_state_getter,
-                                                     v8::Undefined(isolate));
-  visibility_state_descriptor.set_enumerable(true);
-  visibility_state_descriptor.set_configurable(true);
-  // Document inherits from Node, so nodeType belongs on this same facade.
-  v8::PropertyDescriptor node_type_descriptor(node_type_getter,
-                                               v8::Undefined(isolate));
-  node_type_descriptor.set_enumerable(true);
-  node_type_descriptor.set_configurable(true);
-  v8::PropertyDescriptor document_element_descriptor(document_element_getter,
-                                                      v8::Undefined(isolate));
-  document_element_descriptor.set_enumerable(true);
-  document_element_descriptor.set_configurable(true);
-  if (!document_prototype
-           ->DefineProperty(context, V8String(isolate, "hidden"),
-                            hidden_descriptor)
-           .FromMaybe(false) ||
-      !document_prototype
-           ->DefineProperty(context, V8String(isolate, "bgColor"),
-                            bg_color_descriptor)
-           .FromMaybe(false) ||
-      !document_prototype
-           ->DefineProperty(context, V8String(isolate, "URL"), url_descriptor)
-           .FromMaybe(false) ||
-      !document_prototype
-           ->DefineProperty(context, V8String(isolate, "visibilityState"),
-                            visibility_state_descriptor)
-           .FromMaybe(false) ||
-      !document_prototype
-           ->DefineProperty(context, V8String(isolate, "nodeType"),
-                            node_type_descriptor)
-           .FromMaybe(false) ||
-      !document_prototype
-           ->DefineProperty(context, V8String(isolate, "documentElement"),
-                            document_element_descriptor)
-           .FromMaybe(false) ||
-      !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
+  if (!document->SetPrototype(context, document_prototype).FromMaybe(false) ||
       !global
            ->DefineOwnProperty(context, V8String(isolate, "window"), global,
                                immutable)

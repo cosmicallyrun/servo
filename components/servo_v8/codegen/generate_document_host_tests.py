@@ -39,6 +39,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_hidden)(void* native);",
             "uint8_t (*get_bg_color)(void* native, ServoV8OwnedUtf8* output);",
             "uint8_t (*set_bg_color)(void* native, void* host_context,",
+            "uint8_t (*get_head)(void* native, ServoV8InterfaceValue* output);",
             "ServoV8DropCallback drop;",
         )
         for fragment in expected_fragments:
@@ -55,6 +56,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "Box::new(native.bg_color().into_bytes())",
             "Box::from_raw(owner.cast::<Vec<u8>>())",
             "std::str::from_utf8(bytes)",
+            "fn head(&self) -> Option<InterfaceHandle>;",
             "set_bg_color: Some(document_host_set_bg_color::<T>)",
         )
         for fragment in expected_fragments:
@@ -70,11 +72,15 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "DocumentHostGetHidden(",
             "DocumentHostGetBgColor(",
             "DocumentHostSetBgColor(",
+            "DocumentHostGetDocumentElement(",
+            "DocumentHostGetHead(",
             "auto* state = UnwrapDocumentHostState(info);",
             "if (info[0]->IsNull()) {",
             "info[0]->ToString(context)",
             "v8::String::Utf8Value utf8(isolate, value);",
             "CallDocumentHostSetBgColor(",
+            "value.is_null > 1",
+            "InstallDocumentHostAccessors(",
         )
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
@@ -91,10 +97,22 @@ class DocumentHostGenerationTests(unittest.TestCase):
     def test_emits_one_slot_per_manifest_member(self) -> None:
         header = self.outputs[generate_document_host.HEADER_NAME]
 
-        for qualified_name, _ in production_webidl.DOCUMENT_HOST:
-            member_name = qualified_name.split(".")[1]
-            with self.subTest(member=qualified_name):
+        for member in production_webidl.DOCUMENT_HOST:
+            member_name = member.qualified_name.split(".")[1]
+            with self.subTest(member=member.qualified_name):
                 self.assertIn(f"(*get_{generate.snake_case(member_name)})", header)
+
+    def test_registers_every_manifest_member_on_the_document_prototype(self) -> None:
+        output = self.outputs[generate_document_host.CPP_NAME]
+
+        for member in production_webidl.DOCUMENT_HOST:
+            member_name = member.qualified_name.split(".")[1]
+            callback = generate.upper_camel_case(member_name)
+            local = generate.snake_case(member_name)
+            with self.subTest(member=member.qualified_name):
+                self.assertIn(f"DocumentHostGet{callback}", output)
+                self.assertIn(f"v8::PropertyDescriptor {local}_descriptor", output)
+                self.assertIn(f'V8String(isolate, "{member_name}")', output)
 
     def test_cli_writes_exactly_the_three_document_host_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

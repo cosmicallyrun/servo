@@ -69,15 +69,18 @@ inside marking and sweeping, and must be rejected before V8 is touched.
 
 The production binding slice is generated from the enabled `Document.hidden`,
 `Document.bgColor`, `Document.URL`, `Document.visibilityState`, and
-`Node.nodeType` declarations in Servo's real
+`Node.nodeType`, `Document.documentElement`, and `Document.head` declarations
+in Servo's real
 `components/script_bindings/webidls/Document.webidl`. Which members are exposed
-is a data manifest of `(qualified name, shape)` pairs, with one selector and
-one emitter registered per shape, so widening the slice with a member of a
-known shape is an edit to that manifest. Each shape also declares an
-extended-attribute allowlist and fails on anything outside it, because an
-unlisted extended attribute usually changes conversion or reaction semantics
-that the generated glue implements literally -- it would be silently wrong
-rather than merely unsupported.
+is a data manifest of `(qualified name, shape, exact returned interface)`
+records, with the interface field absent for non-interface values. One selector
+and one emitter are registered per shape, so widening the slice with a member
+of a known shape is an edit to that manifest. The generator emits accessor
+bodies and prototype registration as well as the ABI and Rust thunks. Each
+shape also declares an extended-attribute allowlist and fails on anything
+outside it, because an unlisted extended attribute usually changes conversion
+or reaction semantics that the generated glue implements literally -- it
+would be silently wrong rather than merely unsupported.
 
 `Node.nodeType` lands on the existing `document` facade rather than needing a
 second host: `Document` inherits from `Node`, so no second native pointer and
@@ -86,13 +89,15 @@ its selector pins the exact value set the glue was generated against; a new
 state appearing upstream becomes a build failure rather than an unvalidated
 string.
 
-`Document.documentElement` and `Element.tagName` are the first members whose
-value is another DOM object, and they rest on the per-realm wrapper cache
-described in `wrapper-identity-design.md`. That cache was recorded here as
-blocked by a cross-heap cycle; it is not, because every edge between the heaps
-points from cppgc into SpiderMonkey and none point back. The design doc records
-the constraint that keeps that true, along with why the DOM object's address is
-a safe cache key and why realm teardown must release hosts synchronously.
+`Document.documentElement`, `Document.head`, and `Element.tagName` are the
+members whose value or receiver is another DOM object, and they rest on the
+per-realm wrapper cache described in `wrapper-identity-design.md`. The two
+Document getters prove that distinct DOM identities get distinct stable
+wrappers in one realm. That cache was recorded here as blocked by a cross-heap
+cycle; it is not, because every edge between the heaps points from cppgc into
+SpiderMonkey and none point back. The design doc records the constraint that
+keeps that true, along with why the DOM object's address is a safe cache key
+and why realm teardown must release hosts synchronously.
 
 Each pipeline realm owns
 a stable V8 `document` facade. Its native accessors recover tagged per-context
@@ -218,8 +223,8 @@ than cached.
 The current visible host
 surface is deliberately limited to `window`, `document.hidden`,
 `document.bgColor`, `document.URL`, `document.visibilityState`,
-`document.nodeType`, `document.documentElement`, and `Element.tagName` on the
-element that returns.
+`document.nodeType`, `document.documentElement`, `document.head`, and
+`Element.tagName` on the elements that return.
 
 V8 installs its own `console` on every context, and with no inspector attached
 its methods silently discard everything. An authoritative script therefore
@@ -325,7 +330,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 13 and remains experimental. The original
+The current exported C ABI is version 14 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

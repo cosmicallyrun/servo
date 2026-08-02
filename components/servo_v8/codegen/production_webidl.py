@@ -11,6 +11,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -32,6 +33,7 @@ DOCUMENT_URL = "Document.URL"
 DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
 NODE_NODE_TYPE = "Node.nodeType"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
+DOCUMENT_HEAD = "Document.head"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -65,19 +67,35 @@ READONLY_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 # a new state upstream a build failure rather than an unvalidated string.
 DOCUMENT_VISIBILITY_STATE_VALUES = ("visible", "hidden")
 
-# The supported Document slice is data, in declaration order: selection and
-# generation both walk it, so widening the slice is an edit to this tuple alone.
-DOCUMENT_HOST: tuple[tuple[str, str], ...] = (
-    (DOCUMENT_HIDDEN, READONLY_BOOLEAN),
-    (DOCUMENT_BG_COLOR, WRITABLE_LEGACY_DOMSTRING),
-    (DOCUMENT_URL, READONLY_USVSTRING),
-    (DOCUMENT_VISIBILITY_STATE, READONLY_ENUM),
+class DocumentHostMember(NamedTuple):
+    qualified_name: str
+    shape: str
+    expected_interface: str | None = None
+
+
+# The supported Document slice is data: selection and generation both walk it,
+# so widening the slice with a known shape is an edit to this tuple alone. An
+# interface-valued member also pins its exact declared return interface even
+# though the current V8 facade intentionally exposes only inherited Element
+# behavior.
+DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
+    DocumentHostMember(DOCUMENT_HIDDEN, READONLY_BOOLEAN),
+    DocumentHostMember(DOCUMENT_BG_COLOR, WRITABLE_LEGACY_DOMSTRING),
+    DocumentHostMember(DOCUMENT_URL, READONLY_USVSTRING),
+    DocumentHostMember(DOCUMENT_VISIBILITY_STATE, READONLY_ENUM),
     # Document inherits from Node, so this lands on the existing document
     # facade: no second host, no second native pointer, no second vtable.
-    (NODE_NODE_TYPE, READONLY_UNSIGNED_SHORT),
+    DocumentHostMember(NODE_NODE_TYPE, READONLY_UNSIGNED_SHORT),
     # The first member whose value is another DOM object, and so the first that
     # needs the per-realm wrapper cache to preserve identity.
-    (DOCUMENT_DOCUMENT_ELEMENT, READONLY_NULLABLE_INTERFACE),
+    DocumentHostMember(
+        DOCUMENT_DOCUMENT_ELEMENT,
+        READONLY_NULLABLE_INTERFACE,
+        "Element",
+    ),
+    # A second identity exercises multiple wrapper-cache entries in one realm.
+    # HTMLHeadElement is exposed through the current inherited Element facade.
+    DocumentHostMember(DOCUMENT_HEAD, READONLY_NULLABLE_INTERFACE, "HTMLHeadElement"),
 )
 
 
@@ -303,10 +321,28 @@ _SHAPE_SELECTORS = {
         results, name, DOCUMENT_VISIBILITY_STATE_VALUES
     ),
     READONLY_UNSIGNED_SHORT: select_readonly_unsigned_short_attribute,
-    READONLY_NULLABLE_INTERFACE: lambda results, name: select_readonly_nullable_interface_attribute(
-        results, name, "Element"
-    ),
 }
+
+
+def _select_document_host_member(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    member: DocumentHostMember,
+) -> WebIDL.IDLAttribute:
+    if member.shape == READONLY_NULLABLE_INTERFACE:
+        if member.expected_interface is None:
+            raise WebIDLSelectionError(
+                f"`{member.qualified_name}` must pin its returned interface"
+            )
+        return select_readonly_nullable_interface_attribute(
+            parser_results,
+            member.qualified_name,
+            member.expected_interface,
+        )
+    if member.expected_interface is not None:
+        raise WebIDLSelectionError(
+            f"non-interface member `{member.qualified_name}` cannot pin a returned interface"
+        )
+    return _SHAPE_SELECTORS[member.shape](parser_results, member.qualified_name)
 
 
 def select_document_host_attributes(
@@ -322,8 +358,8 @@ def select_document_host_attributes(
 
     parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
     return {
-        qualified_name: _SHAPE_SELECTORS[shape](parser_results, qualified_name)
-        for qualified_name, shape in DOCUMENT_HOST
+        member.qualified_name: _select_document_host_member(parser_results, member)
+        for member in DOCUMENT_HOST
     }
 
 
