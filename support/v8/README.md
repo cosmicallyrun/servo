@@ -98,7 +98,9 @@ was recorded here as blocked by a cross-heap cycle; it is not, because every
 edge between the heaps points from cppgc into SpiderMonkey and none point back.
 The design doc records the constraint that keeps that true, along with why the
 DOM object's address is a safe cache key and why realm teardown must release
-hosts synchronously.
+hosts synchronously. A major-GC epilogue prunes every cleared weak entry after
+cppgc has finished atomic sweeping, so the cache tracks live wrappers instead
+of the historical set of elements exposed by `getElementById`.
 
 Each pipeline realm owns
 a stable V8 `document` facade. Its native accessors recover tagged per-context
@@ -335,7 +337,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 15 and remains experimental. The original
+The current exported C ABI is version 16 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

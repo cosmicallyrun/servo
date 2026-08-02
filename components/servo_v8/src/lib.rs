@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 15;
+const ABI_VERSION: u32 = 16;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -346,6 +346,13 @@ unsafe extern "C" {
     fn servo_v8_terminate_execution(runtime: *mut RawRuntime);
     #[cfg(test)]
     fn servo_v8_collect_garbage_for_testing(runtime: *mut RawRuntime);
+    #[cfg(test)]
+    fn servo_v8_realm_wrapper_cache_size_for_testing(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        result: *mut usize,
+        error: *mut ErrorBuffer,
+    ) -> i32;
     fn servo_v8_dom_cell_native(cell: *mut DomCell, expected_interface_id: u32) -> *mut c_void;
     fn servo_v8_trace_dom_cell(
         visitor: *mut TraceVisitor,
@@ -991,6 +998,27 @@ impl Runtime {
         // SAFETY: Tests create this runtime with expose_gc, and Runtime's
         // thread confinement keeps the request on the isolate owner thread.
         unsafe { servo_v8_collect_garbage_for_testing(self.raw.as_ptr()) }
+    }
+
+    #[cfg(test)]
+    fn wrapper_cache_size_for_testing(&mut self, realm_id: RealmId) -> Result<usize, Error> {
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        let mut result = 0;
+        // SAFETY: The result and error storage remain writable for the call;
+        // Runtime's thread confinement keeps inspection on the owner thread.
+        let succeeded = unsafe {
+            servo_v8_realm_wrapper_cache_size_for_testing(
+                self.raw.as_ptr(),
+                realm_id,
+                &mut result,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(result)
     }
 }
 
@@ -1892,6 +1920,68 @@ mod tests {
         assert_eq!(outcome, ScriptRunOutcome::Terminated);
         drop(runtime);
         assert!(!interrupt.terminate_execution());
+    }
+
+    #[test]
+    fn major_gc_prunes_dead_wrapper_cache_entries() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+        let realm = runtime.create_realm().unwrap();
+        let element_drops = Rc::new(Cell::new(0));
+        let mut host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        host.element_drops = Rc::clone(&element_drops);
+        runtime.install_document_host(realm, host).unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.kept = document.documentElement; kept.tagName === 'HTML'",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+
+        // A major collection must retain both the live wrapper and its cache
+        // entry while JavaScript still reaches it.
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+        assert_eq!(element_drops.get(), 0);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "globalThis.kept = null; true")
+                .unwrap()
+        );
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 0);
+        assert_eq!(element_drops.get(), 1);
+
+        // The same DOM address can be wrapped again after pruning without a
+        // stale entry colliding with the new cell.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.recreated = document.documentElement; \
+                     recreated.tagName === 'HTML'",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(element_drops.get(), 2);
+        assert!(runtime.wrapper_cache_size_for_testing(realm).is_err());
     }
 
     #[test]

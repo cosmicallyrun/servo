@@ -599,6 +599,34 @@ ServoV8RealmState* FindRealm(ServoV8Runtime* runtime,
   return realm->second.get();
 }
 
+// cppgc clears WeakPersistent handles during major-GC weakness processing and,
+// because this runtime requires atomic sweeping, finishes every HostCell
+// destructor before V8 invokes this epilogue. Erasing the now-empty off-heap
+// handles here is therefore same-thread and collection-safe. It also bounds
+// the weak persistent region by the live wrapper set instead of every Element
+// this realm has ever exposed.
+void PruneDeadWrapperCacheEntries(v8::Isolate* isolate,
+                                  v8::GCType,
+                                  v8::GCCallbackFlags,
+                                  void* data) {
+  auto* runtime = static_cast<ServoV8Runtime*>(data);
+  if (!runtime || runtime->isolate != isolate ||
+      runtime->owner_thread != std::this_thread::get_id() ||
+      runtime->rust_callback_depth != 0) {
+    return;
+  }
+  for (auto& realm_entry : runtime->realms) {
+    auto& wrappers = realm_entry.second->wrappers;
+    for (auto entry = wrappers.begin(); entry != wrappers.end();) {
+      if (entry->second.Get()) {
+        ++entry;
+      } else {
+        entry = wrappers.erase(entry);
+      }
+    }
+  }
+}
+
 v8::Local<v8::Context> FindRealmContext(ServoV8Runtime* runtime,
                                         ServoV8RealmId realm_id,
                                         ServoV8ErrorBuffer* error) {
@@ -1076,6 +1104,9 @@ extern "C" ServoV8Runtime* servo_v8_runtime_new(
     }
     runtime->context.Reset(runtime->isolate, context);
   }
+  runtime->isolate->AddGCEpilogueCallback(
+      &PruneDeadWrapperCacheEntries, runtime.get(),
+      v8::kGCTypeMarkSweepCompact);
   return runtime.release();
 }
 
@@ -1091,6 +1122,8 @@ extern "C" void servo_v8_runtime_delete(ServoV8Runtime* runtime) {
     {
       v8::Isolate::Scope isolate_scope(runtime->isolate);
       v8::HandleScope handle_scope(runtime->isolate);
+      runtime->isolate->RemoveGCEpilogueCallback(
+          &PruneDeadWrapperCacheEntries, runtime);
       for (auto& realm : runtime->realms) {
         DetachRealm(runtime, realm.second.get());
       }
@@ -1700,6 +1733,28 @@ extern "C" void servo_v8_collect_garbage_for_testing(
   runtime->isolate->RequestGarbageCollectionForTesting(
       v8::Isolate::kFullGarbageCollection,
       v8::StackState::kNoHeapPointers);
+}
+
+extern "C" int32_t servo_v8_realm_wrapper_cache_size_for_testing(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    size_t* result,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!result) {
+    WriteError(error, "wrapper-cache size result pointer is null");
+    return 0;
+  }
+  *result = 0;
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!runtime->expose_gc) {
+    WriteError(error, "wrapper-cache test inspection is not enabled");
+    return 0;
+  }
+  ServoV8RealmState* realm = FindRealm(runtime, realm_id, error);
+  if (!realm) return 0;
+  *result = realm->wrappers.size();
+  return 1;
 }
 
 extern "C" void* servo_v8_dom_cell_native(ServoV8DomCell* cell,

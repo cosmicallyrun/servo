@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 15u
+#define SERVO_V8_ABI_VERSION 16u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -230,6 +230,13 @@ void servo_v8_terminate_execution(ServoV8Runtime* runtime);
 
 /* Requires the runtime to have been created with expose_gc for test use. */
 void servo_v8_collect_garbage_for_testing(ServoV8Runtime* runtime);
+
+/* Test-only visibility into weak wrapper-cache pruning; requires expose_gc. */
+int32_t servo_v8_realm_wrapper_cache_size_for_testing(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    size_t* result,
+    ServoV8ErrorBuffer* error);
 
 /* Returns the native allocation only when the live cell's interface ID matches. */
 void* servo_v8_dom_cell_native(ServoV8DomCell* cell,

@@ -20,5 +20,6 @@ _servo_v8_compile
 _servo_v8_low_memory_notification
 _servo_v8_terminate_execution
 _servo_v8_collect_garbage_for_testing
+_servo_v8_realm_wrapper_cache_size_for_testing
 _servo_v8_dom_cell_native
 _servo_v8_trace_dom_cell

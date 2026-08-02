@@ -1,6 +1,6 @@
 # Per-realm wrapper identity for DOM objects
 
-Status: implemented, at exported C ABI version 15. `Document.documentElement`,
+Status: implemented, at exported C ABI version 16. `Document.documentElement`,
 `Document.head`, `Document.getElementById()`, and `Element.tagName` are built on
 it.
 
@@ -201,21 +201,21 @@ check would *accept* a bridge call made from a host's `Drop`, which during
 sweeping means re-entering V8 mid-collection and during a cache hit means
 re-entering beneath an accessor.
 
-## Known limitation: dead entries are pruned lazily
+## Dead entries are pruned after major GC
 
-A cleared entry is removed only when the same key is looked up again, or when
-the realm dies. An element exposed once, collected, and never queried again
-leaves a dead slot behind. That costs map memory, and more importantly a node
-in cppgc's weak persistent region, which is walked in full at every collection
-— so GC pause time grows with historical DOM churn rather than with live DOM
-size.
+cppgc clears `WeakPersistent` handles during major-GC weakness processing.
+This runtime requires atomic sweeping, so V8 finishes every `HostCell`
+destructor before invoking the public GC epilogue callbacks. The runtime
+registers one major-GC epilogue callback that walks every live realm and erases
+only cleared cache entries. V8 prohibits JavaScript execution in the callback
+but explicitly permits allocation; destroying same-thread weak handles and
+unordered-map nodes therefore fits the callback contract.
 
-Servo solves the identical problem for `Trusted<T>` by pruning nulls on table
-growth and at every GC trace, and this cache should do the same.
-`getElementById` can now expose an unbounded historical set of elements, so
-this is an active GC-performance limitation rather than a future concern. The
-next cache-lifetime milestone needs a collection-safe pruning hook before this
-surface is treated as production-ready.
+The pass is linear in the current cache size, but cppgc has just walked the
+same weak persistent region. Paying that cost once per major collection keeps
+future marking work and map memory proportional to the live wrapper set rather
+than to every element a long-lived realm has ever exposed. Realm teardown
+still clears the cache synchronously and releases live Servo hosts first.
 
 ## Proofs
 
@@ -233,3 +233,5 @@ bridge:
 - a hostile surplus-host `Drop` is rejected before it can re-enter V8
 - realm destruction releases all three live hosts synchronously
 - nullable interface attributes and an unsuccessful operation produce `null`
+- a major GC retains a reachable wrapper entry, prunes it after the wrapper
+  becomes unreachable, and permits the same DOM address to be wrapped again
