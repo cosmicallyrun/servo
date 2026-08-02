@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 14;
+const ABI_VERSION: u32 = 15;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -1213,8 +1213,10 @@ mod tests {
         /// Stable for this probe's lifetime, which is what identity needs.
         element_identity: Box<u8>,
         head_identity: Box<u8>,
+        id_element_identity: Box<u8>,
         document_element_present: bool,
         head_present: bool,
+        get_element_by_id_calls: Rc<RefCell<Vec<String>>>,
         element_drops: Rc<Cell<usize>>,
         element_drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -1234,8 +1236,10 @@ mod tests {
                 drops,
                 element_identity: Box::new(0),
                 head_identity: Box::new(0),
+                id_element_identity: Box::new(0),
                 document_element_present: true,
                 head_present: true,
+                get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
                 element_drops: Rc::new(Cell::new(0)),
                 element_drop_reentry: None,
             }
@@ -1312,6 +1316,32 @@ mod tests {
                     (&*self.head_identity as *const u8).cast::<c_void>(),
                     ElementHostProbe {
                         tag_name: "HEAD".to_owned(),
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        unsafe fn get_element_by_id(
+            &self,
+            host_context: *mut c_void,
+            element_id: &str,
+        ) -> Option<InterfaceHandle> {
+            assert!(!host_context.is_null());
+            self.get_element_by_id_calls
+                .borrow_mut()
+                .push(element_id.to_owned());
+            if element_id != "target" {
+                return None;
+            }
+            // SAFETY: `id_element_identity` stands in for the rooted Element
+            // returned for the probe's one known id.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    (&*self.id_element_identity as *const u8).cast::<c_void>(),
+                    ElementHostProbe {
+                        tag_name: "DIV".to_owned(),
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -1885,6 +1915,7 @@ mod tests {
             Rc::new(Cell::new(0)),
         );
         host.element_drops = Rc::clone(&element_drops);
+        let get_element_by_id_calls = Rc::clone(&host.get_element_by_id_calls);
         let drop_reentry_attempts = Rc::new(RefCell::new(Vec::new()));
         host.element_drop_reentry = Some(ElementDropReentryProbe {
             runtime: runtime.raw.as_ptr(),
@@ -1902,6 +1933,73 @@ mod tests {
                     "document.documentElement === document.documentElement",
                 )
                 .unwrap()
+        );
+
+        let operation_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               const descriptor = Object.getOwnPropertyDescriptor(\n\
+                 Object.getPrototypeOf(document), 'getElementById');\n\
+               globalThis.getElementByIdWrongBrandStringified = false;\n\
+               let rejectsWrongBrand = false;\n\
+               try { descriptor.value.call({}, { toString() {\n\
+                 getElementByIdWrongBrandStringified = true; return 'target';\n\
+               }}); } catch (error) { rejectsWrongBrand = error instanceof TypeError; }\n\
+               const conversionError = new Error('conversion sentinel');\n\
+               let preservesConversionError = false;\n\
+               try { document.getElementById({ toString() { throw conversionError; }}); }\n\
+               catch (error) { preservesConversionError = error === conversionError; }\n\
+               let rejectsSymbol = false;\n\
+               try { document.getElementById(Symbol('target')); }\n\
+               catch (error) { rejectsSymbol = error instanceof TypeError; }\n\
+               let rejectsMissing = false;\n\
+               try { document.getElementById(); }\n\
+               catch (error) { rejectsMissing = error instanceof TypeError; }\n\
+               const found = document.getElementById({\n\
+                 toString() { return 'target'; }\n\
+               });\n\
+               found.marker = 29;\n\
+               globalThis.getElementByIdBindingProof =\n\
+                 !Object.hasOwn(document, 'getElementById') && descriptor &&\n\
+                 descriptor.writable && descriptor.enumerable &&\n\
+                 descriptor.configurable && descriptor.value.length === 1 &&\n\
+                 descriptor.value.name === 'getElementById' &&\n\
+                 rejectsWrongBrand && !getElementByIdWrongBrandStringified &&\n\
+                 preservesConversionError && rejectsSymbol && rejectsMissing &&\n\
+                 found.tagName === 'DIV' &&\n\
+                 found !== document.documentElement && found !== document.head &&\n\
+                 document.getElementById('target') === found &&\n\
+                 document.getElementById('target').marker === 29 &&\n\
+                 document.getElementById('missing') === null &&\n\
+                 document.getElementById('') === null &&\n\
+                 document.getElementById('a\\0b') === null &&\n\
+                 document.getElementById('\\uD800') === null;\n\
+             })();",
+            "get-element-by-id-binding.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token remains live for this synchronous run, and the
+        // probe validates but does not dereference or retain it.
+        let operation_outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                operation_script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(operation_outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "getElementByIdBindingProof")
+                .unwrap()
+        );
+        assert_eq!(
+            &*get_element_by_id_calls.borrow(),
+            &[
+                "target", "target", "target", "missing", "", "a\0b", "\u{fffd}",
+            ]
         );
         assert!(
             runtime
@@ -1969,7 +2067,7 @@ mod tests {
         // destroyed pipeline's DOM for as long as the isolate stays idle.
         // Every read past the first hits the cache, and each hit drops the
         // host that read speculatively allocated -- so those drops have
-        // already happened, and exactly two live hosts remain.
+        // already happened, and exactly three live hosts remain.
         let dropped_on_cache_hits = element_drops.get();
         assert!(
             dropped_on_cache_hits > 0,
@@ -1987,8 +2085,8 @@ mod tests {
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(
             element_drops.get(),
-            dropped_on_cache_hits + 2,
-            "realm destruction must release both cached hosts, synchronously"
+            dropped_on_cache_hits + 3,
+            "realm destruction must release all three cached hosts, synchronously"
         );
         assert_eq!(drop_reentry_attempts.borrow().len(), element_drops.get());
         assert!(
@@ -2239,6 +2337,78 @@ mod tests {
         runtime.destroy_realm(second).unwrap();
         assert_eq!(first_drops.get(), 1);
         assert_eq!(second_drops.get(), 1);
+    }
+
+    #[test]
+    fn document_host_operation_thunk_validates_abi_inputs() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let drops = Rc::new(Cell::new(0));
+        let mut host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&drops),
+        );
+        host.get_element_by_id_calls = Rc::clone(&calls);
+        let native = Box::into_raw(Box::new(host)).cast::<c_void>();
+        let vtable = DocumentHostVTable::for_type::<DocumentHostProbe>();
+        let callback = vtable.get_element_by_id.unwrap();
+        let mut host_context = 0_u8;
+        let host_context = (&mut host_context as *mut u8).cast::<c_void>();
+        let mut output = RawInterfaceValue {
+            is_null: 0,
+            key: std::ptr::null(),
+            native: std::ptr::null_mut(),
+        };
+        let invalid_utf8 = [0xff];
+
+        // SAFETY: Each pointer is either deliberately invalid in the precise
+        // way the thunk must reject, or remains live for the synchronous call.
+        unsafe {
+            assert_eq!(
+                callback(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut output,
+                ),
+                0,
+            );
+            assert_eq!(
+                callback(native, host_context, std::ptr::null(), 1, &mut output,),
+                0,
+            );
+            assert_eq!(
+                callback(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut output,
+                ),
+                0,
+            );
+            assert_eq!(
+                callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                0,
+            );
+            // Null plus zero length is the valid ABI spelling of an empty
+            // borrowed byte slice and reaches the host as an empty DOMString.
+            assert_eq!(
+                callback(native, host_context, std::ptr::null(), 0, &mut output,),
+                1,
+            );
+            assert_eq!(output.is_null, 1);
+            vtable.drop.unwrap()(native);
+        }
+        assert_eq!(&*calls.borrow(), &[""]);
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]

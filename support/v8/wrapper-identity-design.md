@@ -1,13 +1,15 @@
 # Per-realm wrapper identity for DOM objects
 
-Status: implemented, at exported C ABI version 14. `Document.documentElement`,
-`Document.head`, and `Element.tagName` are built on it.
+Status: implemented, at exported C ABI version 15. `Document.documentElement`,
+`Document.head`, `Document.getElementById()`, and `Element.tagName` are built on
+it.
 
 This is the subsystem every interface-typed binding waits on.
-`Document.documentElement`, `Document.head`, `Element.tagName`, and eventually
-anything that hands a DOM node to script all need the same thing: asking for
-the same DOM object twice must produce the *same* JavaScript object, while two
-different DOM objects must never share one wrapper.
+`Document.documentElement`, `Document.head`, `Document.getElementById`,
+`Element.tagName`, and eventually anything that hands a DOM node to script all
+need the same thing: asking for the same DOM object twice must produce the
+*same* JavaScript object, while two different DOM objects must never share one
+wrapper.
 
 ## What already exists, and why it does not generalise
 
@@ -114,8 +116,8 @@ cache on the side that owns it; the alternative is a second round trip to ask
 whether a wrapper exists before building one.
 
 A nullable return needs no extra machinery: the null flag becomes JavaScript
-`null`, which is what `documentElement` and `head` yield when those elements do
-not exist.
+`null`, which is what `documentElement`, `head`, and an unsuccessful
+`getElementById` yield.
 
 ## Why not simply hold every wrapper strongly
 
@@ -133,13 +135,15 @@ identifies the object it was created for.
 
 ## Where the generator fits
 
-The manifest carries `Document.documentElement` and `Document.head` like any
-other members and pins their exact declared interfaces (`Element` and
-`HTMLHeadElement`). The generator emits their ABI slots, Rust trait methods,
-thunks, checked C++ accessor bodies, and prototype registration from one
-`readonly nullable interface` shape. The current wrapper deliberately exposes
-only inherited `Element` behavior, but WebIDL drift in either declared return
-type is still a build failure rather than silent type erasure.
+The manifest carries `Document.documentElement`, `Document.head`, and
+`Document.getElementById` like any other members and pins their exact declared
+interfaces (`Element`, `HTMLHeadElement`, and `Element`). The generator emits
+their ABI slots, Rust trait methods, thunks, checked C++ callbacks, and
+prototype registration. Attributes use the `readonly nullable interface`
+shape; the operation additionally pins one required DOMString argument and
+`[Pure]`. The current wrapper deliberately exposes only inherited `Element`
+behavior, but WebIDL drift in any declared return type is still a build failure
+rather than silent type erasure.
 
 The wrapper cache, cell, and per-realm `Element` template remain hand-written
 infrastructure in `bridge.cc`; member-specific code no longer lives there.
@@ -207,21 +211,25 @@ in cppgc's weak persistent region, which is walked in full at every collection
 size.
 
 Servo solves the identical problem for `Trusted<T>` by pruning nulls on table
-growth and at every GC trace, and this cache should do the same. It is not
-urgent while the host surface exposes only the document root and head, and it
-becomes urgent the moment anything walks an unbounded part of the tree.
+growth and at every GC trace, and this cache should do the same.
+`getElementById` can now expose an unbounded historical set of elements, so
+this is an active GC-performance limitation rather than a future concern. The
+next cache-lifetime milestone needs a collection-safe pruning hook before this
+surface is treated as production-ready.
 
 ## Proofs
 
-`authoritative_wrapper_identity_proof.html` covers the runtime behaviour
-against real Servo DOM, and `interface_returns_preserve_wrapper_identity`
-covers the bridge:
+`authoritative_wrapper_identity_proof.html` and
+`authoritative_get_element_by_id_proof.html` cover runtime behaviour against
+real Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the
+bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by
   an expando surviving a re-read rather than by equality alone
-- `documentElement` and `head` are distinct wrappers with independent expandos
+- `documentElement`, `head`, and the id-selected `DIV` are distinct wrappers
+  with independent expandos
 - the wrapper is not the document facade, and `tagName` is brand-checked
 - a cache hit drops the host the reading path speculatively allocated
 - a hostile surplus-host `Drop` is rejected before it can re-enter V8
-- realm destruction releases both live hosts synchronously
-- both interface getters produce `null` when their native objects are absent
+- realm destruction releases all three live hosts synchronously
+- nullable interface attributes and an unsuccessful operation produce `null`

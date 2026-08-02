@@ -34,6 +34,7 @@ DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
 NODE_NODE_TYPE = "Node.nodeType"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_HEAD = "Document.head"
+DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -44,6 +45,7 @@ READONLY_USVSTRING = "readonly USVString"
 READONLY_ENUM = "readonly enum"
 READONLY_UNSIGNED_SHORT = "readonly unsigned short"
 READONLY_NULLABLE_INTERFACE = "readonly nullable interface"
+PURE_DOMSTRING_TO_NULLABLE_INTERFACE = "Pure operation DOMString -> nullable interface"
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
@@ -61,6 +63,9 @@ READONLY_UNSIGNED_SHORT_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
 # `[Pure]` is a SpiderMonkey alias-set hint, like `[Constant]` but weaker, and
 # says nothing the V8 accessor needs to honour.
 READONLY_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
+# This operation requires `[Pure]` and maps it to V8's no-side-effect callback
+# classification; accepting it is therefore part of the generated semantics.
+PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 
 # An enum crosses the ABI as its string value, so the generated glue is only
 # correct for the exact value set it was written against. Pinning the set makes
@@ -96,6 +101,13 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     # A second identity exercises multiple wrapper-cache entries in one realm.
     # HTMLHeadElement is exposed through the current inherited Element facade.
     DocumentHostMember(DOCUMENT_HEAD, READONLY_NULLABLE_INTERFACE, "HTMLHeadElement"),
+    # The first operation exercises argument conversion and the ephemeral
+    # SpiderMonkey JSContext needed by Servo's production DOM implementation.
+    DocumentHostMember(
+        DOCUMENT_GET_ELEMENT_BY_ID,
+        PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
+        "Element",
+    ),
 )
 
 
@@ -302,6 +314,96 @@ def select_readonly_nullable_interface_attribute(
     return member
 
 
+def select_pure_domstring_to_nullable_interface_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_interface: str,
+) -> WebIDL.IDLMethod:
+    """Select one pure instance operation with the exact generated signature."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{interface_name}`, found {len(interfaces)}"
+        )
+
+    members = [
+        member
+        for member in interfaces[0].members
+        if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+
+    member = members[0]
+    if not member.isMethod():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an operation")
+    if member.isStatic():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an instance operation")
+    if member.isSpecial():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an ordinary operation")
+
+    unsupported = (
+        set(member._extendedAttrDict)
+        - PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES
+    )
+    if unsupported:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` carries extended attributes that are not implemented: "
+            + ", ".join(sorted(unsupported))
+        )
+    if not member.getExtendedAttribute("Pure"):
+        raise WebIDLSelectionError(f"`{qualified_name}` must carry `[Pure]`")
+
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if not return_type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must return a nullable interface")
+    if not return_type.inner.isInterface():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return an interface, got `{return_type.prettyName()}`"
+        )
+    actual_interface = return_type.inner.name
+    if actual_interface != expected_interface:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return `{expected_interface}`, got `{actual_interface}`"
+        )
+
+    if len(arguments) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly one argument, found {len(arguments)}"
+        )
+    argument = arguments[0]
+    if argument.optional or argument.variadic:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument.identifier.name}` must be required and non-variadic"
+        )
+    if argument.type.nullable() or not argument.type.isDOMString():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument.identifier.name}` must use non-nullable `DOMString`, "
+            f"got `{argument.type.prettyName()}`"
+        )
+    argument_attributes = set(argument._extendedAttrDict) | set(argument.type._extendedAttrDict)
+    if argument_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument.identifier.name}` carries extended attributes "
+            "that are not implemented: " + ", ".join(sorted(argument_attributes))
+        )
+
+    return member
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -327,13 +429,22 @@ _SHAPE_SELECTORS = {
 def _select_document_host_member(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
     member: DocumentHostMember,
-) -> WebIDL.IDLAttribute:
-    if member.shape == READONLY_NULLABLE_INTERFACE:
+) -> WebIDL.IDLAttribute | WebIDL.IDLMethod:
+    if member.shape in {
+        READONLY_NULLABLE_INTERFACE,
+        PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
+    }:
         if member.expected_interface is None:
             raise WebIDLSelectionError(
                 f"`{member.qualified_name}` must pin its returned interface"
             )
-        return select_readonly_nullable_interface_attribute(
+        if member.shape == READONLY_NULLABLE_INTERFACE:
+            return select_readonly_nullable_interface_attribute(
+                parser_results,
+                member.qualified_name,
+                member.expected_interface,
+            )
+        return select_pure_domstring_to_nullable_interface_operation(
             parser_results,
             member.qualified_name,
             member.expected_interface,
@@ -345,11 +456,11 @@ def _select_document_host_member(
     return _SHAPE_SELECTORS[member.shape](parser_results, member.qualified_name)
 
 
-def select_document_host_attributes(
+def select_document_host_members(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
     webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
-) -> dict[str, WebIDL.IDLAttribute]:
+) -> dict[str, WebIDL.IDLAttribute | WebIDL.IDLMethod]:
     """Load the production corpus and select the supported Document slice.
 
     The result is keyed by qualified name and ordered like ``DOCUMENT_HOST``,

@@ -30,7 +30,7 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
 
     def test_selects_real_document_bg_color(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            attributes = production_webidl.select_document_host_attributes(
+            attributes = production_webidl.select_document_host_members(
                 Path(temporary_directory) / "cache",
                 environment={},
             )
@@ -45,7 +45,7 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
 
     def test_selects_the_slice_keyed_in_manifest_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            attributes = production_webidl.select_document_host_attributes(
+            attributes = production_webidl.select_document_host_members(
                 Path(temporary_directory) / "cache",
                 environment={},
             )
@@ -57,7 +57,7 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
 
     def test_pins_each_real_interface_return(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            attributes = production_webidl.select_document_host_attributes(
+            attributes = production_webidl.select_document_host_members(
                 Path(temporary_directory) / "cache",
                 environment={},
             )
@@ -70,6 +70,11 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
             attributes[production_webidl.DOCUMENT_HEAD].type.inner.name,
             "HTMLHeadElement",
         )
+        method = attributes[production_webidl.DOCUMENT_GET_ELEMENT_BY_ID]
+        return_type, arguments = method.signatures()[0]
+        self.assertEqual(return_type.inner.name, "Element")
+        self.assertEqual(arguments[0].identifier.name, "elementId")
+        self.assertTrue(arguments[0].type.isDOMString())
 
 
 class SyntheticSelectionTests(unittest.TestCase):
@@ -280,6 +285,85 @@ class SyntheticSelectionTests(unittest.TestCase):
                 production_webidl.DOCUMENT_HEAD,
                 "HTMLHeadElement",
             )
+
+    def assert_get_element_by_id_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": f"""
+                    interface Element {{}};
+                    interface Document {{ {declaration} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_pure_domstring_to_nullable_interface_operation(
+                parser_results,
+                production_webidl.DOCUMENT_GET_ELEMENT_BY_ID,
+                "Element",
+            )
+
+    def test_selects_the_exact_get_element_by_id_operation(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface Element {};
+                    interface Document {
+                      [Pure] Element? getElementById(DOMString elementId);
+                    };
+                """,
+            }
+        )
+
+        method = production_webidl.select_pure_domstring_to_nullable_interface_operation(
+            parser_results,
+            production_webidl.DOCUMENT_GET_ELEMENT_BY_ID,
+            "Element",
+        )
+
+        self.assertTrue(method.isMethod())
+        self.assertTrue(method.getExtendedAttribute("Pure"))
+
+    def test_rejects_get_element_by_id_without_pure(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "Element? getElementById(DOMString elementId);",
+            "`Document.getElementById` must carry `[Pure]`",
+        )
+
+    def test_rejects_unimplemented_get_element_by_id_extended_attribute(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure, Throws] Element? getElementById(DOMString elementId);",
+            "`Document.getElementById` carries extended attributes that are not implemented: Throws",
+        )
+
+    def test_rejects_overloaded_get_element_by_id(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            """
+              [Pure] Element? getElementById(DOMString elementId);
+              [Pure] Element? getElementById(DOMString elementId, DOMString extra);
+            """,
+            "`Document.getElementById` must have exactly one signature, found 2",
+        )
+
+    def test_rejects_nonnullable_get_element_by_id_return(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure] Element getElementById(DOMString elementId);",
+            "`Document.getElementById` must return a nullable interface",
+        )
+
+    def test_rejects_optional_get_element_by_id_argument(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure] Element? getElementById(optional DOMString elementId);",
+            "`Document.getElementById` argument `elementId` must be required and non-variadic",
+        )
+
+    def test_rejects_wrong_get_element_by_id_argument_type(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure] Element? getElementById(USVString elementId);",
+            "`Document.getElementById` argument `elementId` must use non-nullable `DOMString`, got `USVString`",
+        )
 
 
 if __name__ == "__main__":

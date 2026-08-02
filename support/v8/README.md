@@ -68,19 +68,19 @@ test implementation attempts to enter its runtime from each phase, including
 inside marking and sweeping, and must be rejected before V8 is touched.
 
 The production binding slice is generated from the enabled `Document.hidden`,
-`Document.bgColor`, `Document.URL`, `Document.visibilityState`, and
-`Node.nodeType`, `Document.documentElement`, and `Document.head` declarations
-in Servo's real
-`components/script_bindings/webidls/Document.webidl`. Which members are exposed
-is a data manifest of `(qualified name, shape, exact returned interface)`
-records, with the interface field absent for non-interface values. One selector
-and one emitter are registered per shape, so widening the slice with a member
-of a known shape is an edit to that manifest. The generator emits accessor
-bodies and prototype registration as well as the ABI and Rust thunks. Each
-shape also declares an extended-attribute allowlist and fails on anything
-outside it, because an unlisted extended attribute usually changes conversion
-or reaction semantics that the generated glue implements literally -- it
-would be silently wrong rather than merely unsupported.
+`Document.bgColor`, `Document.URL`, `Document.visibilityState`,
+`Node.nodeType`, `Document.documentElement`, `Document.head`, and
+`Document.getElementById` declarations in Servo's real production WebIDL
+corpus. Which members are exposed is a data manifest of `(qualified name,
+shape, exact returned interface)` records, with the interface field absent for
+non-interface values. One selector and one emitter are registered per shape,
+so widening the slice with a member of a known shape is an edit to that
+manifest. The generator emits accessor and operation bodies, prototype
+registration, ABI slots, and Rust thunks. Each shape also declares an
+extended-attribute allowlist and fails on anything outside it, because an
+unlisted extended attribute usually changes conversion or reaction semantics
+that the generated glue implements literally -- it would be silently wrong
+rather than merely unsupported.
 
 `Node.nodeType` lands on the existing `document` facade rather than needing a
 second host: `Document` inherits from `Node`, so no second native pointer and
@@ -89,15 +89,16 @@ its selector pins the exact value set the glue was generated against; a new
 state appearing upstream becomes a build failure rather than an unvalidated
 string.
 
-`Document.documentElement`, `Document.head`, and `Element.tagName` are the
-members whose value or receiver is another DOM object, and they rest on the
-per-realm wrapper cache described in `wrapper-identity-design.md`. The two
-Document getters prove that distinct DOM identities get distinct stable
-wrappers in one realm. That cache was recorded here as blocked by a cross-heap
-cycle; it is not, because every edge between the heaps points from cppgc into
-SpiderMonkey and none point back. The design doc records the constraint that
-keeps that true, along with why the DOM object's address is a safe cache key
-and why realm teardown must release hosts synchronously.
+`Document.documentElement`, `Document.head`, `Document.getElementById`, and
+`Element.tagName` are the members whose value or receiver is another DOM
+object, and they rest on the per-realm wrapper cache described in
+`wrapper-identity-design.md`. The two attributes and the operation prove that
+distinct DOM identities get distinct stable wrappers in one realm. That cache
+was recorded here as blocked by a cross-heap cycle; it is not, because every
+edge between the heaps points from cppgc into SpiderMonkey and none point back.
+The design doc records the constraint that keeps that true, along with why the
+DOM object's address is a safe cache key and why realm teardown must release
+hosts synchronously.
 
 Each pipeline realm owns
 a stable V8 `document` facade. Its native accessors recover tagged per-context
@@ -105,9 +106,12 @@ embedder state from the holder's creation context and call typed Rust C ABI
 thunks. The Rust host owns a `Trusted<Document>` rather than a raw DOM pointer;
 realm destruction first detaches and resets all V8 handles, then drops that
 host synchronously and exactly once. The callbacks root the live Servo document
-for the operation. The `bgColor` setter uses an owned UTF-8 transfer across the
-C ABI and leaves custom-element reactions on Servo's current or backup element
-queue. Servo drains them only after the V8 callback and sidecar borrow unwind;
+for the operation. `getElementById` performs V8 `ToString`, preserves a thrown
+conversion exception, transfers validated UTF-8 as a borrowed DOMString, and
+borrows the embedding JSContext only until its Rust callback returns. The
+`bgColor` setter uses the same ephemeral context and leaves custom-element
+reactions on Servo's current or backup element queue. Servo drains them only
+after the V8 callback and sidecar borrow unwind;
 `ce-reactions-boundary.md` records the ordering and remaining limitation. A
 C++/Rust reentry barrier turns accidental recursive entry into a deterministic
 failure. Failed installation leaves ownership with Rust, so every host
@@ -224,7 +228,7 @@ The current visible host
 surface is deliberately limited to `window`, `document.hidden`,
 `document.bgColor`, `document.URL`, `document.visibilityState`,
 `document.nodeType`, `document.documentElement`, `document.head`, and
-`Element.tagName` on the elements that return.
+`document.getElementById()`, plus `Element.tagName` on the elements that return.
 
 V8 installs its own `console` on every context, and with no inspector attached
 its methods silently discard everything. An authoritative script therefore
@@ -290,7 +294,7 @@ second identical authoritative script is the control: it reports two getters
 and two setters and renders pure red, which is what a page would show if
 SpiderMonkey had also executed the script.
 
-Three proof pages use that same counting argument:
+The proof suite uses that same counting argument:
 
 | Page | Proves |
 | --- | --- |
@@ -307,6 +311,7 @@ Three proof pages use that same counting argument:
 | `authoritative_document_open_proof.html` | the realm survives `document.open()` |
 | `authoritative_job_error_proof.html` | a page sees its own failing V8 promise via `onerror` |
 | `authoritative_wrapper_identity_proof.html` | a DOM object handed to V8 keeps one stable wrapper |
+| `authoritative_get_element_by_id_proof.html` | the generated DOMString operation preserves conversion, null, and wrapper semantics |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -330,7 +335,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 14 and remains experimental. The original
+The current exported C ABI is version 15 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

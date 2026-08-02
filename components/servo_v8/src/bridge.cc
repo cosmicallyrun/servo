@@ -1137,7 +1137,7 @@ extern "C" int32_t servo_v8_realm_create(
   v8::Local<v8::Object> global = context->Global();
   const v8::PropertyAttribute immutable = static_cast<v8::PropertyAttribute>(
       v8::ReadOnly | v8::DontDelete);
-  if (!InstallDocumentHostAccessors(isolate, context, document_prototype)) {
+  if (!InstallDocumentHostMembers(isolate, context, document_prototype)) {
     context->SetAlignedPointerInEmbedderData(
         kServoRealmStateEmbedderSlot, nullptr,
         kServoRealmStateEmbedderTag);

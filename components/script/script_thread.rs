@@ -327,6 +327,32 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         })
     }
 
+    unsafe fn get_element_by_id(
+        &self,
+        host_context: *mut c_void,
+        element_id: &str,
+    ) -> Option<servo_v8::InterfaceHandle> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative run API supplies this synchronously
+        // borrowed JSContext wrapper and clears the pointer before returning.
+        let cx = unsafe { &*host_context.cast::<JSContext>() };
+        let element = self
+            .document
+            .root()
+            .GetElementById(cx, DOMString::from(element_id))?;
+        // SAFETY: The key is the address of the same Element the host roots.
+        Some(unsafe {
+            servo_v8::InterfaceHandle::new(
+                (&*element as *const Element).cast::<c_void>(),
+                V8ElementHost {
+                    element: Trusted::new(&*element),
+                },
+            )
+        })
+    }
+
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
         if host_context.is_null() {
             return false;
