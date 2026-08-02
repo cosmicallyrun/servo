@@ -76,6 +76,30 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertEqual(arguments[0].identifier.name, "elementId")
         self.assertTrue(arguments[0].type.isDOMString())
 
+    def test_pins_each_real_enum_value_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            tuple(
+                members[
+                    production_webidl.DOCUMENT_VISIBILITY_STATE
+                ].type.inner.values()
+            ),
+            production_webidl.DOCUMENT_VISIBILITY_STATE_VALUES,
+        )
+        self.assertEqual(
+            tuple(
+                members[
+                    production_webidl.DOCUMENT_READY_STATE
+                ].type.inner.values()
+            ),
+            production_webidl.DOCUMENT_READY_STATE_VALUES,
+        )
+
 
 class SyntheticSelectionTests(unittest.TestCase):
     def parse(self, sources: dict[str, str], environment: dict[str, str] | None = None):
@@ -364,6 +388,31 @@ class SyntheticSelectionTests(unittest.TestCase):
             "[Pure] Element? getElementById(USVString elementId);",
             "`Document.getElementById` argument `elementId` must use non-nullable `DOMString`, got `USVString`",
         )
+
+    def test_rejects_changed_ready_state_enum_values(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    enum DocumentReadyState { "loading", "complete" };
+                    interface Document {
+                      readonly attribute DocumentReadyState readyState;
+                    };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(
+                "`Document.readyState` must have the values "
+                "['loading', 'interactive', 'complete'], got ['loading', 'complete']"
+            ),
+        ):
+            production_webidl.select_readonly_enum_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_READY_STATE,
+                production_webidl.DOCUMENT_READY_STATE_VALUES,
+            )
 
 
 if __name__ == "__main__":

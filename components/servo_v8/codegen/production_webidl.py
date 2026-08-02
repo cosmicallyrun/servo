@@ -31,6 +31,7 @@ DOCUMENT_HIDDEN = "Document.hidden"
 DOCUMENT_BG_COLOR = "Document.bgColor"
 DOCUMENT_URL = "Document.URL"
 DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
+DOCUMENT_READY_STATE = "Document.readyState"
 NODE_NODE_TYPE = "Node.nodeType"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_HEAD = "Document.head"
@@ -71,11 +72,14 @@ PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 # correct for the exact value set it was written against. Pinning the set makes
 # a new state upstream a build failure rather than an unvalidated string.
 DOCUMENT_VISIBILITY_STATE_VALUES = ("visible", "hidden")
+DOCUMENT_READY_STATE_VALUES = ("loading", "interactive", "complete")
+
 
 class DocumentHostMember(NamedTuple):
     qualified_name: str
     shape: str
     expected_interface: str | None = None
+    expected_enum_values: tuple[str, ...] | None = None
 
 
 # The supported Document slice is data: selection and generation both walk it,
@@ -87,7 +91,16 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     DocumentHostMember(DOCUMENT_HIDDEN, READONLY_BOOLEAN),
     DocumentHostMember(DOCUMENT_BG_COLOR, WRITABLE_LEGACY_DOMSTRING),
     DocumentHostMember(DOCUMENT_URL, READONLY_USVSTRING),
-    DocumentHostMember(DOCUMENT_VISIBILITY_STATE, READONLY_ENUM),
+    DocumentHostMember(
+        DOCUMENT_VISIBILITY_STATE,
+        READONLY_ENUM,
+        expected_enum_values=DOCUMENT_VISIBILITY_STATE_VALUES,
+    ),
+    DocumentHostMember(
+        DOCUMENT_READY_STATE,
+        READONLY_ENUM,
+        expected_enum_values=DOCUMENT_READY_STATE_VALUES,
+    ),
     # Document inherits from Node, so this lands on the existing document
     # facade: no second host, no second native pointer, no second vtable.
     DocumentHostMember(NODE_NODE_TYPE, READONLY_UNSIGNED_SHORT),
@@ -419,9 +432,6 @@ _SHAPE_SELECTORS = {
     READONLY_BOOLEAN: select_readonly_boolean_attribute,
     WRITABLE_LEGACY_DOMSTRING: select_writable_legacy_domstring_attribute,
     READONLY_USVSTRING: select_readonly_usvstring_attribute,
-    READONLY_ENUM: lambda results, name: select_readonly_enum_attribute(
-        results, name, DOCUMENT_VISIBILITY_STATE_VALUES
-    ),
     READONLY_UNSIGNED_SHORT: select_readonly_unsigned_short_attribute,
 }
 
@@ -430,6 +440,24 @@ def _select_document_host_member(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
     member: DocumentHostMember,
 ) -> WebIDL.IDLAttribute | WebIDL.IDLMethod:
+    if member.shape == READONLY_ENUM:
+        if member.expected_interface is not None:
+            raise WebIDLSelectionError(
+                f"enum member `{member.qualified_name}` cannot pin a returned interface"
+            )
+        if member.expected_enum_values is None:
+            raise WebIDLSelectionError(
+                f"`{member.qualified_name}` must pin its enum values"
+            )
+        return select_readonly_enum_attribute(
+            parser_results,
+            member.qualified_name,
+            member.expected_enum_values,
+        )
+    if member.expected_enum_values is not None:
+        raise WebIDLSelectionError(
+            f"non-enum member `{member.qualified_name}` cannot pin enum values"
+        )
     if member.shape in {
         READONLY_NULLABLE_INTERFACE,
         PURE_DOMSTRING_TO_NULLABLE_INTERFACE,

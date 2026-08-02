@@ -39,6 +39,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_hidden)(void* native);",
             "uint8_t (*get_bg_color)(void* native, ServoV8OwnedUtf8* output);",
             "uint8_t (*set_bg_color)(void* native, void* host_context,",
+            "uint8_t (*get_ready_state)(void* native, ServoV8OwnedUtf8* output);",
             "uint8_t (*get_head)(void* native, ServoV8InterfaceValue* output);",
             "uint8_t (*get_element_by_id)(void* native, void* host_context,",
             "const uint8_t* element_id,",
@@ -53,6 +54,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
         expected_fragments = (
             "fn hidden(&self) -> bool;",
             "fn bg_color(&self) -> String;",
+            "fn ready_state(&self) -> String;",
             "unsafe fn set_bg_color(",
             "pub struct OwnedUtf8 {",
             "Box::new(native.bg_color().into_bytes())",
@@ -84,7 +86,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "if (info[0]->IsNull()) {",
             "info[0]->ToString(context)",
             "v8::String::Utf8Value utf8(isolate, value);",
-            "CallDocumentHostSetBgColor(",
+            "state->vtable.set_bg_color(",
+            "state->vtable.get_ready_state(state->native, &value)",
             "value.is_null > 1",
             "Document.getElementById requires one argument",
             "InstallDocumentHostMembers(",
@@ -92,6 +95,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, output)
+        self.assertNotIn("CallDocumentHostGet", output)
+        self.assertNotIn("CallDocumentHostSet", output)
 
     def test_rejects_a_selection_that_does_not_match_the_manifest(self) -> None:
         incomplete = {

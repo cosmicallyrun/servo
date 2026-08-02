@@ -1,6 +1,6 @@
 # Per-realm wrapper identity for DOM objects
 
-Status: implemented, at exported C ABI version 16. `Document.documentElement`,
+Status: implemented, at exported C ABI version 17. `Document.documentElement`,
 `Document.head`, `Document.getElementById()`, and `Element.tagName` are built on
 it.
 

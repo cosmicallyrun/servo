@@ -293,6 +293,10 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         self.document.root().VisibilityState().as_str().to_owned()
     }
 
+    fn ready_state(&self) -> String {
+        self.document.root().ReadyState().as_str().to_owned()
+    }
+
     fn node_type(&self) -> u16 {
         // Document inherits from Node, so this is served by the same facade.
         self.document.root().upcast::<Node>().NodeType()

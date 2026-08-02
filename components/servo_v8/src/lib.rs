@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 16;
+const ABI_VERSION: u32 = 17;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -1310,6 +1310,10 @@ mod tests {
             .to_owned()
         }
 
+        fn ready_state(&self) -> String {
+            "complete".to_owned()
+        }
+
         fn node_type(&self) -> u16 {
             // Node.DOCUMENT_NODE.
             9
@@ -2328,6 +2332,15 @@ mod tests {
                 .eval_bool_in_realm(
                     first,
                     "['visible', 'hidden'].includes(document.visibilityState)"
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.readyState === 'complete' && \
+                     ['loading', 'interactive', 'complete'].includes(document.readyState)",
                 )
                 .unwrap()
         );
