@@ -73,7 +73,9 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.contentType`, `Document.referrer`, `Document.lastModified`,
 `Document.visibilityState`, `Document.readyState`, `Document.title`,
 `Node.nodeType`, `Document.documentElement`, `Document.head`, and
-`Document.getElementById` declarations in Servo's real production WebIDL
+`Document.firstElementChild`, `Document.lastElementChild`,
+`Document.childElementCount`, and `Document.getElementById` declarations in
+Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
 shape, exact returned interface)` records, with the interface field absent for
 non-interface values. One selector and one emitter are registered per shape,
@@ -92,11 +94,12 @@ its selector pins the exact value set the glue was generated against; a new
 state appearing upstream becomes a build failure rather than an unvalidated
 string.
 
-`Document.documentElement`, `Document.head`, `Document.getElementById`, and the
-scalar Element slice are the members whose value or receiver is another DOM
-object, and they rest on the per-realm wrapper cache described in
-`wrapper-identity-design.md`. The two Document attributes and operation prove
-that distinct DOM identities get distinct stable wrappers in one realm. That
+`Document.documentElement`, `Document.head`, `Document.getElementById`, the
+ParentNode traversal getters, and the Element slice are the members whose value
+or receiver is another DOM object, and they rest on the per-realm wrapper cache
+described in `wrapper-identity-design.md`. Independent Document, id, and child
+traversal paths prove that distinct DOM identities get distinct stable wrappers
+while repeated paths to one object converge on the same wrapper. That
 cache was recorded here as blocked by a cross-heap cycle; it is not, because
 every edge between the heaps points from cppgc into SpiderMonkey and none point
 back.
@@ -267,9 +270,11 @@ surface is deliberately limited to `window`, the `console` logging slice,
 `document.bgColor`, `document.URL`, `document.documentURI`, document metadata
 string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
-`document.head`, and `document.getElementById()`. Elements returned through that
+`document.head`, the three ParentNode traversal getters, and
+`document.getElementById()`. Elements returned through that
 surface share a per-realm prototype implementing `localName`, `tagName`, `id`,
-`className`, `hasAttributes()`, `getAttribute()`, and `hasAttribute()`. That
+`className`, `hasAttributes()`, `getAttribute()`, `hasAttribute()`,
+`firstElementChild`, `lastElementChild`, and `childElementCount`. That
 prototype inherits from a shared Node prototype implementing `nodeType`,
 `nodeName`, `isConnected`, `textContent`, and `hasChildNodes()`.
 
@@ -364,6 +369,7 @@ The proof suite uses that same counting argument:
 | `authoritative_get_element_by_id_proof.html` | the generated DOMString operation preserves conversion, null, and wrapper semantics |
 | `authoritative_element_scalar_proof.html` | common Element scalar reads and mutations use the live Servo DOM with WebIDL prototype semantics |
 | `authoritative_node_scalar_proof.html` | Element wrappers inherit common Node scalars and text mutation through a real Node prototype |
+| `authoritative_parent_node_proof.html` | Document and Element traversal share stable wrappers and update after live child mutation |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -387,7 +393,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 23 and remains experimental. The original
+The current exported C ABI is version 24 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

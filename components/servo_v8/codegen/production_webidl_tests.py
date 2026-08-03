@@ -109,6 +109,20 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
             attributes[production_webidl.DOCUMENT_HEAD].type.inner.name,
             "HTMLHeadElement",
         )
+        for qualified_name in (
+            production_webidl.DOCUMENT_FIRST_ELEMENT_CHILD,
+            production_webidl.DOCUMENT_LAST_ELEMENT_CHILD,
+        ):
+            with self.subTest(member=qualified_name):
+                attribute = attributes[qualified_name]
+                self.assertTrue(attribute.readonly)
+                self.assertTrue(attribute.type.nullable())
+                self.assertEqual(attribute.type.inner.name, "Element")
+                self.assertEqual(set(attribute._extendedAttrDict), {"Pure"})
+        child_count = attributes[production_webidl.DOCUMENT_CHILD_ELEMENT_COUNT]
+        self.assertTrue(child_count.readonly)
+        self.assertEqual(child_count.type.prettyName(), "unsigned long")
+        self.assertEqual(set(child_count._extendedAttrDict), {"Pure"})
         method = attributes[production_webidl.DOCUMENT_GET_ELEMENT_BY_ID]
         return_type, arguments = method.signatures()[0]
         self.assertEqual(return_type.inner.name, "Element")
@@ -216,6 +230,18 @@ class ProductionElementTests(unittest.TestCase):
         self.assertTrue(return_type.nullable())
         self.assertTrue(return_type.inner.isDOMString())
         self.assertEqual(arguments[0].identifier.name, "name")
+        for qualified_name in (
+            production_webidl.ELEMENT_FIRST_ELEMENT_CHILD,
+            production_webidl.ELEMENT_LAST_ELEMENT_CHILD,
+        ):
+            with self.subTest(member=qualified_name):
+                attribute = members[qualified_name]
+                self.assertTrue(attribute.readonly)
+                self.assertTrue(attribute.type.nullable())
+                self.assertEqual(attribute.type.inner.name, "Element")
+        child_count = members[production_webidl.ELEMENT_CHILD_ELEMENT_COUNT]
+        self.assertTrue(child_count.readonly)
+        self.assertEqual(child_count.type.prettyName(), "unsigned long")
 
 
 class ProductionNodeTests(unittest.TestCase):
@@ -529,6 +555,52 @@ class SyntheticSelectionTests(unittest.TestCase):
                 "HTMLHeadElement",
             )
 
+    def test_rejects_parent_node_interface_getter_without_pure(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface Element {};
+                    interface Document {
+                      readonly attribute Element? firstElementChild;
+                    };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(
+                "`Document.firstElementChild` must carry exactly ['Pure'], got []"
+            ),
+        ):
+            production_webidl.select_pure_readonly_nullable_interface_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_FIRST_ELEMENT_CHILD,
+                "Element",
+            )
+
+    def test_rejects_parent_node_count_without_pure(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface Document {
+                      readonly attribute unsigned long childElementCount;
+                    };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(
+                "`Document.childElementCount` must carry exactly ['Pure'], got []"
+            ),
+        ):
+            production_webidl.select_readonly_unsigned_long_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_CHILD_ELEMENT_COUNT,
+            )
+
     def assert_get_element_by_id_rejected(self, declaration: str, expected: str) -> None:
         parser_results = self.parse(
             {
@@ -824,6 +896,21 @@ class SyntheticSelectionTests(unittest.TestCase):
             "boolean hasAttribute(optional DOMString name);",
             "hasAttribute",
             "`Element.hasAttribute` must take required non-nullable `DOMString name`",
+        )
+
+    def test_rejects_nonnullable_first_element_child(self) -> None:
+        self.assert_element_rejected(
+            "[Pure] readonly attribute Element firstElementChild;",
+            "firstElementChild",
+            "`Element.firstElementChild` must use nullable `Element`, got `Element`",
+        )
+
+    def test_rejects_wrong_child_element_count_width(self) -> None:
+        self.assert_element_rejected(
+            "[Pure] readonly attribute unsigned short childElementCount;",
+            "childElementCount",
+            "`Element.childElementCount` must use non-nullable `unsigned long`, "
+            "got `unsigned short`",
         )
 
     def assert_node_rejected(

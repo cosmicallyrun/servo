@@ -929,6 +929,73 @@ def _readonly_unsigned_short_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_getter_name(member.attribute)}"]
 
 
+# `unsigned long` has the same infallible POD contract, widened to the WebIDL
+# 32-bit unsigned range on both sides of the C ABI.
+def _readonly_unsigned_long_header_slots(member: Member) -> Block:
+    return [f"  uint32_t (*{_getter_name(member.attribute)})(void* native);"]
+
+
+def _readonly_unsigned_long_rust_trait_members(member: Member) -> Block:
+    return [f"    fn {_rust_member_name(member.attribute)}(&self) -> u32;"]
+
+
+def _readonly_unsigned_long_rust_vtable_fields(member: Member) -> Block:
+    return [f'    pub {_getter_name(member.attribute)}: Option<unsafe extern "C" fn(*mut c_void) -> u32>,']
+
+
+def _readonly_unsigned_long_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    getter = _getter_name(member.attribute)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{getter}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            ") -> u32 {",
+            "    // SAFETY: The vtable contract requires a live Box<T> native pointer.",
+            f"    unsafe {{ &*native.cast::<T>() }}.{name}()",
+            "}",
+        ],
+    )
+
+
+def _readonly_unsigned_long_rust_vtable_init(member: Member) -> Block:
+    getter = _getter_name(member.attribute)
+    return [f"            {getter}: Some(document_host_{getter}::<T>),"]
+
+
+def _readonly_unsigned_long_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    getter = _getter_name(member.attribute)
+    accessor = _cpp_member_name(member.attribute)
+    return (
+        [
+            f"void DocumentHostGet{accessor}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->runtime || !state->native ||",
+            f"      !state->vtable.{getter}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  if (state->runtime->rust_callback_depth != 0) {",
+            '    ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "    return;",
+            "  }",
+            "  uint32_t value = 0;",
+            "  {",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    value = state->vtable.{getter}(state->native);",
+            "  }",
+            "  info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, value));",
+            "}",
+        ],
+    )
+
+
+def _readonly_unsigned_long_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_getter_name(member.attribute)}"]
+
+
 # An interface-typed member hands script another DOM object, so unlike every
 # shape above it needs the per-realm wrapper cache to preserve identity. That
 # cache, the wrapper cell, and the Element prototype are infrastructure and
@@ -1413,6 +1480,19 @@ SHAPE_EMITTERS = {
         cpp_bodies=_readonly_unsigned_short_cpp_bodies,
         cpp_vtable_terms=_readonly_unsigned_short_cpp_vtable_terms,
     ),
+    production_webidl.READONLY_UNSIGNED_LONG: ShapeEmitter(
+        header_type_blocks=(),
+        header_slots=_readonly_unsigned_long_header_slots,
+        rust_type_blocks=(),
+        rust_trait_members=_readonly_unsigned_long_rust_trait_members,
+        rust_vtable_fields=_readonly_unsigned_long_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_readonly_unsigned_long_rust_thunks,
+        rust_vtable_init=_readonly_unsigned_long_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_readonly_unsigned_long_cpp_bodies,
+        cpp_vtable_terms=_readonly_unsigned_long_cpp_vtable_terms,
+    ),
     production_webidl.READONLY_NULLABLE_INTERFACE: ShapeEmitter(
         header_type_blocks=(),
         header_slots=_readonly_nullable_interface_header_slots,
@@ -1440,6 +1520,12 @@ SHAPE_EMITTERS = {
         cpp_vtable_terms=_pure_domstring_to_nullable_interface_cpp_vtable_terms,
     ),
 }
+
+# `[Pure]` changes the fail-closed selection contract but not the generated
+# nullable-interface ABI or callback body.
+SHAPE_EMITTERS[production_webidl.PURE_READONLY_NULLABLE_INTERFACE] = (
+    SHAPE_EMITTERS[production_webidl.READONLY_NULLABLE_INTERFACE]
+)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

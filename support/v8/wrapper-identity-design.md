@@ -2,15 +2,16 @@
 
 Status: implemented, initially at exported C ABI version 19 and extended with a
 shared Element prototype at ABI version 22 and its inherited Node prototype at
-ABI version 23. `Document.documentElement`, `Document.head`,
-`Document.getElementById()`, and the scalar Element/Node slices are built on it.
+ABI version 23. ABI version 24 adds ParentNode Element traversal.
+`Document.documentElement`, `Document.head`, `Document.getElementById()`, the
+Element/Node scalar slices, and ParentNode traversal are built on it.
 
 This is the subsystem every interface-typed binding waits on.
-`Document.documentElement`, `Document.head`, `Document.getElementById`,
-the scalar Element and Node slices, and eventually anything that hands a DOM
-node to script all need the same thing: asking for the same DOM object twice must produce the
-*same* JavaScript object, while two different DOM objects must never share one
-wrapper.
+`Document.documentElement`, `Document.head`, `Document.getElementById`, the
+Element and Node slices, ParentNode traversal, and eventually anything that
+hands a DOM node to script all need the same thing: asking for the same DOM
+object twice must produce the *same* JavaScript object, while two different DOM
+objects must never share one wrapper.
 
 ## What already exists, and why it does not generalise
 
@@ -117,8 +118,8 @@ cache on the side that owns it; the alternative is a second round trip to ask
 whether a wrapper exists before building one.
 
 A nullable return needs no extra machinery: the null flag becomes JavaScript
-`null`, which is what `documentElement`, `head`, and an unsuccessful
-`getElementById` yield.
+`null`, which is what `documentElement`, `head`, empty first/last child getters,
+and an unsuccessful `getElementById` yield.
 
 ## Why not simply hold every wrapper strongly
 
@@ -136,14 +137,15 @@ identifies the object it was created for.
 
 ## Where the generator fits
 
-The manifest carries `Document.documentElement`, `Document.head`, and
-`Document.getElementById` like any other members and pins their exact declared
-interfaces (`Element`, `HTMLHeadElement`, and `Element`). The generator emits
-their ABI slots, Rust trait methods, thunks, checked C++ callbacks, and
-prototype registration. Attributes use the `readonly nullable interface`
-shape; the operation additionally pins one required DOMString argument and
-`[Pure]`. The current wrapper deliberately exposes only inherited `Element`
-behavior, but WebIDL drift in any declared return type is still a build failure
+The manifest carries `Document.documentElement`, `Document.head`, the
+ParentNode first/last/count getters, and `Document.getElementById` like any
+other members and pins their exact declared interfaces (`Element`,
+`HTMLHeadElement`, and `Element`). The generator emits their ABI slots, Rust
+trait methods, thunks, checked C++ callbacks, and prototype registration.
+Interface attributes use the `readonly nullable interface` shape; ParentNode's
+two interface getters additionally require exact `[Pure]`, its count uses a
+32-bit unsigned shape, and the operation pins one required DOMString argument
+and `[Pure]`. WebIDL drift in any declared return type remains a build failure
 rather than silent type erasure.
 
 The wrapper cache, cell, and per-realm `Element` template remain hand-written
@@ -151,12 +153,11 @@ infrastructure in `bridge.cc`; member-specific code no longer lives there.
 
 ## What this does not do
 
-Nothing here gives V8 the ability to *mutate* the DOM, and nothing here accepts
-a JavaScript function as a callback. Those are separate problems: the first
-needs the CEReactions boundary moved out of the accessor, and the second needs a
-story for a V8 function held by a Servo event target, which reverses the edge
-direction this design depends on and so has to be reasoned about again from
-scratch.
+The current scalar setters can mutate attributes and text, but nothing here
+accepts another DOM object or a JavaScript function. Node creation/reparenting
+and event listeners are separate problems: a V8 function held by a Servo event
+target reverses the edge direction this design depends on and must be reasoned
+about again from scratch.
 
 ## The constraint this design depends on
 
@@ -222,19 +223,20 @@ still clears the cache synchronously and releases live Servo hosts first.
 
 `authoritative_wrapper_identity_proof.html`,
 `authoritative_get_element_by_id_proof.html`, and
-`authoritative_element_scalar_proof.html`, and
-`authoritative_node_scalar_proof.html` cover runtime behaviour against real
+`authoritative_element_scalar_proof.html`,
+`authoritative_node_scalar_proof.html`, and
+`authoritative_parent_node_proof.html` cover runtime behaviour against real
 Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by
   an expando surviving a re-read rather than by equality alone
-- `documentElement`, `head`, and the id-selected `DIV` are distinct wrappers
-  with independent expandos
+- `documentElement`, `head`, the id-selected `DIV`, and its two Element children
+  are distinct wrappers with independent expandos
 - the wrapper is not the document facade, and members live on one shared,
   brand-checked Element prototype rather than being copied onto each wrapper
 - a cache hit drops the host the reading path speculatively allocated
 - a hostile surplus-host `Drop` is rejected before it can re-enter V8
-- realm destruction releases all three live hosts synchronously
+- realm destruction releases all five live hosts synchronously
 - nullable interface attributes and an unsuccessful operation produce `null`
 - a major GC retains a reachable wrapper entry, prunes it after the wrapper
   becomes unreachable, and permits the same DOM address to be wrapped again

@@ -48,6 +48,9 @@ NODE_TEXT_CONTENT = "Node.textContent"
 NODE_HAS_CHILD_NODES = "Node.hasChildNodes"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_HEAD = "Document.head"
+DOCUMENT_FIRST_ELEMENT_CHILD = "Document.firstElementChild"
+DOCUMENT_LAST_ELEMENT_CHILD = "Document.lastElementChild"
+DOCUMENT_CHILD_ELEMENT_COUNT = "Document.childElementCount"
 DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
 WINDOW_OR_WORKER_SET_TIMEOUT = "WindowOrWorkerGlobalScope.setTimeout"
 WINDOW_OR_WORKER_CLEAR_TIMEOUT = "WindowOrWorkerGlobalScope.clearTimeout"
@@ -66,6 +69,9 @@ ELEMENT_CLASS_NAME = "Element.className"
 ELEMENT_HAS_ATTRIBUTES = "Element.hasAttributes"
 ELEMENT_GET_ATTRIBUTE = "Element.getAttribute"
 ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
+ELEMENT_FIRST_ELEMENT_CHILD = "Element.firstElementChild"
+ELEMENT_LAST_ELEMENT_CHILD = "Element.lastElementChild"
+ELEMENT_CHILD_ELEMENT_COUNT = "Element.childElementCount"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -77,7 +83,9 @@ READONLY_DOMSTRING = "readonly DOMString"
 READONLY_USVSTRING = "readonly USVString"
 READONLY_ENUM = "readonly enum"
 READONLY_UNSIGNED_SHORT = "readonly unsigned short"
+READONLY_UNSIGNED_LONG = "readonly unsigned long"
 READONLY_NULLABLE_INTERFACE = "readonly nullable interface"
+PURE_READONLY_NULLABLE_INTERFACE = "Pure readonly nullable interface"
 PURE_DOMSTRING_TO_NULLABLE_INTERFACE = "Pure operation DOMString -> nullable interface"
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
@@ -95,6 +103,7 @@ READONLY_USVSTRING_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
 READONLY_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
 READONLY_ENUM_EXTENDED_ATTRIBUTES = frozenset()
 READONLY_UNSIGNED_SHORT_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
+READONLY_UNSIGNED_LONG_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 # `[Pure]` is a SpiderMonkey alias-set hint, like `[Constant]` but weaker, and
 # says nothing the V8 accessor needs to honour.
 READONLY_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
@@ -157,6 +166,20 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     # A second identity exercises multiple wrapper-cache entries in one realm.
     # HTMLHeadElement is exposed through the current inherited Element facade.
     DocumentHostMember(DOCUMENT_HEAD, READONLY_NULLABLE_INTERFACE, "HTMLHeadElement"),
+    # ParentNode mixin reads reuse the same stable Element wrappers. The parser
+    # resolves included mixins onto Document, so these also prove that the
+    # production inclusion remains enabled rather than pinning a detached copy.
+    DocumentHostMember(
+        DOCUMENT_FIRST_ELEMENT_CHILD,
+        PURE_READONLY_NULLABLE_INTERFACE,
+        "Element",
+    ),
+    DocumentHostMember(
+        DOCUMENT_LAST_ELEMENT_CHILD,
+        PURE_READONLY_NULLABLE_INTERFACE,
+        "Element",
+    ),
+    DocumentHostMember(DOCUMENT_CHILD_ELEMENT_COUNT, READONLY_UNSIGNED_LONG),
     # The first operation exercises argument conversion and the ephemeral
     # SpiderMonkey JSContext needed by Servo's production DOM implementation.
     DocumentHostMember(
@@ -189,9 +212,9 @@ CONSOLE_HOST = (
     CONSOLE_WARN,
 )
 
-# The scalar Element surface implemented by the per-object wrapper host. No
-# member returns or accepts an interface, so this keeps the existing one-way
-# cppgc -> SpiderMonkey ownership graph intact.
+# The Element surface implemented by the per-object wrapper host. ParentNode's
+# child getters can return another Element wrapper, but every cross-heap edge
+# still points from cppgc into a fresh Servo root; no Servo object retains V8.
 ELEMENT_HOST = (
     ELEMENT_LOCAL_NAME,
     ELEMENT_TAG_NAME,
@@ -200,6 +223,9 @@ ELEMENT_HOST = (
     ELEMENT_HAS_ATTRIBUTES,
     ELEMENT_GET_ATTRIBUTE,
     ELEMENT_HAS_ATTRIBUTE,
+    ELEMENT_FIRST_ELEMENT_CHILD,
+    ELEMENT_LAST_ELEMENT_CHILD,
+    ELEMENT_CHILD_ELEMENT_COUNT,
 )
 
 # Inherited scalar behavior installed on the Node prototype shared by Element
@@ -438,6 +464,33 @@ def select_readonly_unsigned_short_attribute(
     return member
 
 
+def select_readonly_unsigned_long_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLAttribute:
+    """Select one readonly, non-nullable `unsigned long` attribute."""
+
+    member = _select_instance_attribute(
+        parser_results, qualified_name, READONLY_UNSIGNED_LONG_EXTENDED_ATTRIBUTES
+    )
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != {"Pure"}:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly ['Pure'], "
+            f"got {sorted(actual_attributes)}"
+        )
+    if not member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be readonly")
+    if member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be non-nullable")
+    if member.type.tag() != WebIDL.IDLType.Tags.uint32:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must use `unsigned long`, got `{member.type.prettyName()}`"
+        )
+
+    return member
+
+
 def select_readonly_nullable_interface_attribute(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
     qualified_name: str,
@@ -465,6 +518,25 @@ def select_readonly_nullable_interface_attribute(
             f"`{qualified_name}` must return `{expected_interface}`, got `{actual_interface}`"
         )
 
+    return member
+
+
+def select_pure_readonly_nullable_interface_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_interface: str,
+) -> WebIDL.IDLAttribute:
+    """Select the exact `[Pure]` nullable-interface attribute shape."""
+
+    member = select_readonly_nullable_interface_attribute(
+        parser_results, qualified_name, expected_interface
+    )
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != {"Pure"}:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly ['Pure'], "
+            f"got {sorted(actual_attributes)}"
+        )
     return member
 
 
@@ -790,6 +862,9 @@ def _select_element_host_member(
         "tagName": {"Pure"},
         "id": {"CEReactions", "Pure"},
         "className": {"CEReactions", "Pure"},
+        "firstElementChild": {"Pure"},
+        "lastElementChild": {"Pure"},
+        "childElementCount": {"Pure"},
     }
     if member_name in attribute_attributes:
         if not member.isAttr() or member.isStatic():
@@ -803,11 +878,33 @@ def _select_element_host_member(
                 f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
                 f"got {sorted(actual_attributes)}"
             )
-        expected_readonly = member_name in {"localName", "tagName"}
+        expected_readonly = member_name in {
+            "localName",
+            "tagName",
+            "firstElementChild",
+            "lastElementChild",
+            "childElementCount",
+        }
         if member.readonly != expected_readonly:
             state = "readonly" if expected_readonly else "writable"
             raise WebIDLSelectionError(f"`{qualified_name}` must be {state}")
-        if member.type.nullable() or not member.type.isDOMString():
+        if member_name in {"firstElementChild", "lastElementChild"}:
+            if (
+                not member.type.nullable()
+                or not member.type.inner.isInterface()
+                or member.type.inner.name != "Element"
+            ):
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use nullable `Element`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member_name == "childElementCount":
+            if member.type.nullable() or member.type.tag() != WebIDL.IDLType.Tags.uint32:
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use non-nullable `unsigned long`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member.type.nullable() or not member.type.isDOMString():
             raise WebIDLSelectionError(
                 f"`{qualified_name}` must use non-nullable `DOMString`, "
                 f"got `{member.type.prettyName()}`"
@@ -994,6 +1091,7 @@ _SHAPE_SELECTORS = {
     READONLY_DOMSTRING: select_readonly_domstring_attribute,
     READONLY_USVSTRING: select_readonly_usvstring_attribute,
     READONLY_UNSIGNED_SHORT: select_readonly_unsigned_short_attribute,
+    READONLY_UNSIGNED_LONG: select_readonly_unsigned_long_attribute,
 }
 
 
@@ -1021,6 +1119,7 @@ def _select_document_host_member(
         )
     if member.shape in {
         READONLY_NULLABLE_INTERFACE,
+        PURE_READONLY_NULLABLE_INTERFACE,
         PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
     }:
         if member.expected_interface is None:
@@ -1029,6 +1128,12 @@ def _select_document_host_member(
             )
         if member.shape == READONLY_NULLABLE_INTERFACE:
             return select_readonly_nullable_interface_attribute(
+                parser_results,
+                member.qualified_name,
+                member.expected_interface,
+            )
+        if member.shape == PURE_READONLY_NULLABLE_INTERFACE:
+            return select_pure_readonly_nullable_interface_attribute(
                 parser_results,
                 member.qualified_name,
                 member.expected_interface,

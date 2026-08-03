@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 23u
+#define SERVO_V8_ABI_VERSION 24u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -128,6 +128,11 @@ typedef struct ServoV8ElementHostVTable {
                               const uint8_t* value,
                               size_t value_length);
   uint8_t (*has_child_nodes)(void* native, uint8_t* output);
+  uint8_t (*get_first_element_child)(void* native,
+                                     ServoV8InterfaceValue* output);
+  uint8_t (*get_last_element_child)(void* native,
+                                    ServoV8InterfaceValue* output);
+  uint8_t (*get_child_element_count)(void* native, uint32_t* output);
   ServoV8DropCallback drop;
 } ServoV8ElementHostVTable;
 

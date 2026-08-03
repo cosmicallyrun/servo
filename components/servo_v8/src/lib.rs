@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 23;
+const ABI_VERSION: u32 = 24;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -211,6 +211,9 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     fn text_content(&self) -> Option<String>;
     unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool;
     fn has_child_nodes(&self) -> bool;
+    fn first_element_child(&self) -> Option<InterfaceHandle>;
+    fn last_element_child(&self) -> Option<InterfaceHandle>;
+    fn child_element_count(&self) -> u32;
 }
 
 #[repr(C)]
@@ -247,6 +250,11 @@ pub struct ElementHostVTable {
     pub set_text_content:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
     pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_first_element_child:
+        Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
+    pub get_last_element_child:
+        Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
+    pub get_child_element_count: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
     pub drop: Option<DropCallback>,
 }
 
@@ -530,6 +538,31 @@ unsafe fn element_host_write_optional_owned_utf8(
     1
 }
 
+unsafe fn element_host_write_interface_value(
+    output: *mut RawInterfaceValue,
+    handle: Option<InterfaceHandle>,
+) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe {
+        *output = match handle {
+            Some(handle) => RawInterfaceValue {
+                is_null: 0,
+                key: handle.key,
+                native: handle.native,
+            },
+            None => RawInterfaceValue {
+                is_null: 1,
+                key: std::ptr::null(),
+                native: std::ptr::null_mut(),
+            },
+        }
+    };
+    1
+}
+
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -653,7 +686,7 @@ unsafe extern "C" fn element_host_get_text_content<T: ElementHostBinding>(
     native: *mut c_void,
     output: *mut OptionalOwnedUtf8,
 ) -> u8 {
-    if native.is_null() {
+    if native.is_null() || output.is_null() {
         return 0;
     }
     // SAFETY: The vtable contract supplies this exact live Box<T>.
@@ -697,6 +730,44 @@ unsafe extern "C" fn element_host_has_child_nodes<T: ElementHostBinding>(
     }
     // SAFETY: Both pointers satisfy the vtable contract.
     unsafe { *output = (&*native.cast::<T>()).has_child_nodes() as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_first_element_child<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let handle = unsafe { (&*native.cast::<T>()).first_element_child() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, handle) }
+}
+
+unsafe extern "C" fn element_host_get_last_element_child<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let handle = unsafe { (&*native.cast::<T>()).last_element_child() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, handle) }
+}
+
+unsafe extern "C" fn element_host_get_child_element_count<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u32,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).child_element_count() };
     1
 }
 
@@ -1336,6 +1407,9 @@ impl Runtime {
             get_text_content: Some(element_host_get_text_content::<T>),
             set_text_content: Some(element_host_set_text_content::<T>),
             has_child_nodes: Some(element_host_has_child_nodes::<T>),
+            get_first_element_child: Some(element_host_get_first_element_child::<T>),
+            get_last_element_child: Some(element_host_get_last_element_child::<T>),
+            get_child_element_count: Some(element_host_get_child_element_count::<T>),
             drop: Some(element_host_drop::<T>),
         };
         let mut storage = [0; ERROR_CAPACITY];
@@ -1863,12 +1937,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ElementProbeChild {
+        identity: Rc<u8>,
+        local_name: String,
+        tag_name: String,
+        state: Rc<ElementProbeState>,
+    }
+
     #[derive(Default)]
     struct ElementProbeState {
         attributes: RefCell<Vec<(String, String)>>,
         text_content: RefCell<Option<String>>,
         has_child_nodes: Cell<bool>,
         is_connected: Cell<bool>,
+        element_children: RefCell<Vec<ElementProbeChild>>,
     }
 
     impl ElementProbeState {
@@ -1891,6 +1974,7 @@ mod tests {
                 text_content: RefCell::new(Some(text_content.to_owned())),
                 has_child_nodes: Cell::new(has_child_nodes),
                 is_connected: Cell::new(true),
+                element_children: RefCell::new(Vec::new()),
             })
         }
 
@@ -1924,6 +2008,9 @@ mod tests {
         local_name: String,
         tag_name: String,
         state: Rc<ElementProbeState>,
+        // Child probes own their stand-in DOM identity through the host. The
+        // top-level identities remain owned by DocumentHostProbe instead.
+        _owned_identity: Option<Rc<u8>>,
         drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -2035,11 +2122,46 @@ mod tests {
             let value = value.unwrap_or_default();
             *self.state.text_content.borrow_mut() = Some(value.to_owned());
             self.state.has_child_nodes.set(!value.is_empty());
+            self.state.element_children.borrow_mut().clear();
             true
         }
 
         fn has_child_nodes(&self) -> bool {
             self.state.has_child_nodes.get()
+        }
+
+        fn first_element_child(&self) -> Option<InterfaceHandle> {
+            self.element_child(0)
+        }
+
+        fn last_element_child(&self) -> Option<InterfaceHandle> {
+            let index = self.state.element_children.borrow().len().checked_sub(1)?;
+            self.element_child(index)
+        }
+
+        fn child_element_count(&self) -> u32 {
+            self.state.element_children.borrow().len() as u32
+        }
+    }
+
+    impl ElementHostProbe {
+        fn element_child(&self, index: usize) -> Option<InterfaceHandle> {
+            let child = self.state.element_children.borrow().get(index)?.clone();
+            // SAFETY: The returned host owns the Rc allocation used as its key
+            // and shares the state that stands in for the rooted Servo Element.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    Rc::as_ptr(&child.identity).cast::<c_void>(),
+                    ElementHostProbe {
+                        local_name: child.local_name,
+                        tag_name: child.tag_name,
+                        state: child.state,
+                        _owned_identity: Some(child.identity),
+                        drops: Rc::clone(&self.drops),
+                        drop_reentry: self.drop_reentry.clone(),
+                    },
+                )
+            })
         }
     }
 
@@ -2202,6 +2324,29 @@ mod tests {
             getter_calls: Rc<Cell<usize>>,
             drops: Rc<Cell<usize>>,
         ) -> Self {
+            let id_element_state = ElementProbeState::with_node(
+                &[
+                    ("id", "target"),
+                    ("class", "alpha beta"),
+                    ("data-proof", "present"),
+                ],
+                "probe text",
+                true,
+            );
+            id_element_state.element_children.borrow_mut().extend([
+                ElementProbeChild {
+                    identity: Rc::new(0),
+                    local_name: "span".to_owned(),
+                    tag_name: "SPAN".to_owned(),
+                    state: ElementProbeState::with_node(&[("id", "first-child")], "first", false),
+                },
+                ElementProbeChild {
+                    identity: Rc::new(0),
+                    local_name: "em".to_owned(),
+                    tag_name: "EM".to_owned(),
+                    state: ElementProbeState::with_node(&[("id", "last-child")], "last", false),
+                },
+            ]);
             Self {
                 hidden,
                 bg_color: Rc::new(RefCell::new("red".to_owned())),
@@ -2215,15 +2360,7 @@ mod tests {
                 id_element_identity: Box::new(0),
                 element_state: ElementProbeState::with_attributes(&[]),
                 head_state: ElementProbeState::with_attributes(&[]),
-                id_element_state: ElementProbeState::with_node(
-                    &[
-                        ("id", "target"),
-                        ("class", "alpha beta"),
-                        ("data-proof", "present"),
-                    ],
-                    "probe text",
-                    true,
-                ),
+                id_element_state,
                 document_element_present: true,
                 head_present: true,
                 get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
@@ -2327,6 +2464,7 @@ mod tests {
                         local_name: "html".to_owned(),
                         tag_name: "HTML".to_owned(),
                         state: Rc::clone(&self.element_state),
+                        _owned_identity: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -2347,11 +2485,24 @@ mod tests {
                         local_name: "head".to_owned(),
                         tag_name: "HEAD".to_owned(),
                         state: Rc::clone(&self.head_state),
+                        _owned_identity: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
                 )
             })
+        }
+
+        fn first_element_child(&self) -> Option<InterfaceHandle> {
+            self.document_element()
+        }
+
+        fn last_element_child(&self) -> Option<InterfaceHandle> {
+            self.document_element()
+        }
+
+        fn child_element_count(&self) -> u32 {
+            u32::from(self.document_element_present)
         }
 
         unsafe fn get_element_by_id(
@@ -2375,6 +2526,7 @@ mod tests {
                         local_name: "div".to_owned(),
                         tag_name: "DIV".to_owned(),
                         state: Rc::clone(&self.id_element_state),
+                        _owned_identity: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -3387,6 +3539,13 @@ mod tests {
             "(() => {\n\
                const descriptor = Object.getOwnPropertyDescriptor(\n\
                  Object.getPrototypeOf(document), 'getElementById');\n\
+               const documentPrototype = Object.getPrototypeOf(document);\n\
+               const documentFirstDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 documentPrototype, 'firstElementChild');\n\
+               const documentLastDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 documentPrototype, 'lastElementChild');\n\
+               const documentCountDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 documentPrototype, 'childElementCount');\n\
                globalThis.getElementByIdWrongBrandStringified = false;\n\
                let rejectsWrongBrand = false;\n\
                try { descriptor.value.call({}, { toString() {\n\
@@ -3421,6 +3580,12 @@ mod tests {
                  elementPrototype, 'getAttribute');\n\
                const hasAttributeDescriptor = Object.getOwnPropertyDescriptor(\n\
                  elementPrototype, 'hasAttribute');\n\
+               const firstElementChildDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'firstElementChild');\n\
+               const lastElementChildDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'lastElementChild');\n\
+               const childElementCountDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'childElementCount');\n\
                const nodePrototype = Object.getPrototypeOf(elementPrototype);\n\
                const nodeTypeDescriptor = Object.getOwnPropertyDescriptor(\n\
                  nodePrototype, 'nodeType');\n\
@@ -3435,6 +3600,23 @@ mod tests {
                const initialNodeValues = found.nodeType === 1 &&\n\
                  found.nodeName === 'DIV' && found.isConnected === true &&\n\
                  found.textContent === 'probe text' && found.hasChildNodes();\n\
+               const firstElementChild = found.firstElementChild;\n\
+               const lastElementChild = found.lastElementChild;\n\
+               firstElementChild.marker = 31;\n\
+               lastElementChild.marker = 37;\n\
+               const initialParentNodeValues = found.childElementCount === 2 &&\n\
+                 firstElementChild.tagName === 'SPAN' &&\n\
+                 firstElementChild.id === 'first-child' &&\n\
+                 lastElementChild.tagName === 'EM' &&\n\
+                 lastElementChild.id === 'last-child' &&\n\
+                 firstElementChild !== lastElementChild &&\n\
+                 found.firstElementChild === firstElementChild &&\n\
+                 found.lastElementChild === lastElementChild &&\n\
+                 found.firstElementChild.marker === 31 &&\n\
+                 found.lastElementChild.marker === 37;\n\
+               const documentParentNodeValues = document.childElementCount === 1 &&\n\
+                 document.firstElementChild === document.documentElement &&\n\
+                 document.lastElementChild === document.documentElement;\n\
                globalThis.elementWrongBrandStringified = false;\n\
                let elementRejectsWrongBrand = false;\n\
                try { getAttributeDescriptor.value.call({}, { toString() {\n\
@@ -3485,6 +3667,8 @@ mod tests {
                found.textContent = 'null reset';\n\
                found.textContent = null;\n\
                const nullTextWorked = found.textContent === '' && !found.hasChildNodes();\n\
+               const parentNodeChildrenCleared = found.childElementCount === 0 &&\n\
+                 found.firstElementChild === null && found.lastElementChild === null;\n\
                found.id = { toString() { return 'changed-id'; }};\n\
                found.className = null;\n\
                globalThis.getElementByIdBindingProof =\n\
@@ -3503,7 +3687,8 @@ mod tests {
                  found.hasAttribute('ID') && !found.hasAttribute('missing') &&\n\
                  convertedAttribute === 'present' &&\n\
                  initialNodeValues && textMutationWorked && undefinedTextWorked &&\n\
-                 missingTextWorked && nullTextWorked &&\n\
+                 missingTextWorked && nullTextWorked && parentNodeChildrenCleared &&\n\
+                 initialParentNodeValues && documentParentNodeValues &&\n\
                  Object.getPrototypeOf(nodePrototype) === Object.prototype &&\n\
                  !Object.hasOwn(found, 'localName') &&\n\
                  !Object.hasOwn(found, 'tagName') && !Object.hasOwn(found, 'id') &&\n\
@@ -3511,6 +3696,9 @@ mod tests {
                  !Object.hasOwn(found, 'hasAttributes') &&\n\
                  !Object.hasOwn(found, 'getAttribute') &&\n\
                  !Object.hasOwn(found, 'hasAttribute') &&\n\
+                 !Object.hasOwn(found, 'firstElementChild') &&\n\
+                 !Object.hasOwn(found, 'lastElementChild') &&\n\
+                 !Object.hasOwn(found, 'childElementCount') &&\n\
                  !Object.hasOwn(found, 'nodeType') &&\n\
                  !Object.hasOwn(found, 'nodeName') &&\n\
                  !Object.hasOwn(found, 'isConnected') &&\n\
@@ -3534,6 +3722,11 @@ mod tests {
                  hasAttributeDescriptor.value.length === 1 &&\n\
                  [hasAttributesDescriptor, getAttributeDescriptor,\n\
                   hasAttributeDescriptor].every(d => d.writable &&\n\
+                    d.enumerable && d.configurable) &&\n\
+                 [firstElementChildDescriptor, lastElementChildDescriptor,\n\
+                  childElementCountDescriptor, documentFirstDescriptor,\n\
+                  documentLastDescriptor, documentCountDescriptor].every(d =>\n\
+                    d && d.get.length === 0 && d.set === undefined &&\n\
                     d.enumerable && d.configurable) &&\n\
                  [nodeTypeDescriptor, nodeNameDescriptor,\n\
                   isConnectedDescriptor].every(d => d && d.get.length === 0 &&\n\
@@ -3652,7 +3845,8 @@ mod tests {
         // destroyed pipeline's DOM for as long as the isolate stays idle.
         // Every read past the first hits the cache, and each hit drops the
         // host that read speculatively allocated -- so those drops have
-        // already happened, and exactly three live hosts remain.
+        // already happened, and exactly five live hosts remain: the document
+        // element, head, target, and the target's two Element children.
         let dropped_on_cache_hits = element_drops.get();
         assert!(
             dropped_on_cache_hits > 0,
@@ -3670,8 +3864,8 @@ mod tests {
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(
             element_drops.get(),
-            dropped_on_cache_hits + 3,
-            "realm destruction must release all three cached hosts, synchronously"
+            dropped_on_cache_hits + 5,
+            "realm destruction must release all five cached hosts, synchronously"
         );
         assert_eq!(drop_reentry_attempts.borrow().len(), element_drops.get());
         assert!(
@@ -3698,7 +3892,10 @@ mod tests {
             runtime
                 .eval_bool_in_realm(
                     nullable_realm,
-                    "document.documentElement === null && document.head === null",
+                    "document.documentElement === null && document.head === null && \
+                     document.firstElementChild === null && \
+                     document.lastElementChild === null && \
+                     document.childElementCount === 0",
                 )
                 .unwrap()
         );

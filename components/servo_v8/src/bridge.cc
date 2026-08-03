@@ -1016,6 +1016,93 @@ void ElementHostHasAttribute(
   info.GetReturnValue().Set(result != 0);
 }
 
+using ElementInterfaceGetter =
+    uint8_t (*)(void* native, ServoV8InterfaceValue* output);
+using ElementInterfaceGetterSlot =
+    ElementInterfaceGetter ServoV8ElementHostVTable::*;
+
+void ElementHostGetInterface(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ElementInterfaceGetterSlot getter_slot,
+    const char* member_name) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  const ElementInterfaceGetter getter =
+      realm->runtime->element_host_vtable.*getter_slot;
+  if (!getter) {
+    ThrowTypeError(isolate, "Element interface getter is not installed");
+    return;
+  }
+
+  ServoV8InterfaceValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = getter(native, &value) != 0;
+  }
+  if (!succeeded) {
+    DropUnownedElementHost(realm->runtime, value.native,
+                           realm->runtime->element_host_vtable.drop);
+    ThrowTypeError(isolate, member_name);
+    return;
+  }
+  const bool malformed =
+      value.is_null > 1 ||
+      (value.is_null != 0 && (value.key || value.native)) ||
+      (value.is_null == 0 && (!value.key || !value.native));
+  if (malformed) {
+    DropUnownedElementHost(realm->runtime, value.native,
+                           realm->runtime->element_host_vtable.drop);
+    ThrowTypeError(isolate, "invalid Element interface result");
+    return;
+  }
+  if (value.is_null != 0) {
+    info.GetReturnValue().SetNull();
+    return;
+  }
+  v8::Local<v8::Object> wrapper = WrapperForInterfaceValue(
+      realm, isolate, isolate->GetCurrentContext(), value);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(isolate, "Element child wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(wrapper);
+}
+
+void ElementHostGetFirstElementChild(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetInterface(
+      info, &ServoV8ElementHostVTable::get_first_element_child,
+      "Element.firstElementChild host callback failed");
+}
+
+void ElementHostGetLastElementChild(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetInterface(
+      info, &ServoV8ElementHostVTable::get_last_element_child,
+      "Element.lastElementChild host callback failed");
+}
+
+void ElementHostGetChildElementCount(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  uint32_t result = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_child_element_count(
+            native, &result)) {
+      ThrowTypeError(isolate, "Element.childElementCount host callback failed");
+      return;
+    }
+  }
+  info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, result));
+}
+
 void NodeHostGetNodeType(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   ServoV8RealmState* realm = nullptr;
@@ -1215,6 +1302,9 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"tagName", &ElementHostGetTagName, nullptr},
       {"id", &ElementHostGetId, &ElementHostSetId},
       {"className", &ElementHostGetClassName, &ElementHostSetClassName},
+      {"firstElementChild", &ElementHostGetFirstElementChild, nullptr},
+      {"lastElementChild", &ElementHostGetLastElementChild, nullptr},
+      {"childElementCount", &ElementHostGetChildElementCount, nullptr},
   };
   for (const auto& accessor : accessors) {
     v8::Local<v8::Function> getter;
@@ -2562,7 +2652,9 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_attribute || !vtable->has_attribute ||
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
-      !vtable->set_text_content || !vtable->has_child_nodes || !vtable->drop) {
+      !vtable->set_text_content || !vtable->has_child_nodes ||
+      !vtable->get_first_element_child || !vtable->get_last_element_child ||
+      !vtable->get_child_element_count || !vtable->drop) {
     WriteError(error, "Element host vtable is incomplete");
     return 0;
   }

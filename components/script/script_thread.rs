@@ -245,6 +245,21 @@ struct V8ElementHost {
 }
 
 #[cfg(feature = "v8-shadow")]
+fn v8_element_interface_handle(element: &Element) -> servo_v8::InterfaceHandle {
+    // SAFETY: The cache key is the address of the same Element allocation that
+    // the freshly boxed host roots. The Trusted root prevents address reuse for
+    // the complete lifetime of any wrapper cell that owns this host.
+    unsafe {
+        servo_v8::InterfaceHandle::new(
+            (element as *const Element).cast::<c_void>(),
+            V8ElementHost {
+                element: Trusted::new(element),
+            },
+        )
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
 #[expect(unsafe_code)]
 // SAFETY: This host stays on its element's originating script thread, roots
 // the element only for the duration of a synchronous read, and its Drop only
@@ -376,6 +391,20 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
     fn has_child_nodes(&self) -> bool {
         self.element.root().upcast::<Node>().HasChildNodes()
     }
+
+    fn first_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
+        let child = self.element.root().GetFirstElementChild()?;
+        Some(v8_element_interface_handle(&child))
+    }
+
+    fn last_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
+        let child = self.element.root().GetLastElementChild()?;
+        Some(v8_element_interface_handle(&child))
+    }
+
+    fn child_element_count(&self) -> u32 {
+        self.element.root().ChildElementCount()
+    }
 }
 
 #[cfg(feature = "v8-shadow")]
@@ -501,31 +530,27 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
 
     fn document_element(&self) -> Option<servo_v8::InterfaceHandle> {
         let element = self.document.root().GetDocumentElement()?;
-        // SAFETY: The key is the address of the element the host below roots,
-        // and that root outlives every cache entry keyed on it.
-        Some(unsafe {
-            servo_v8::InterfaceHandle::new(
-                (&*element as *const Element).cast::<c_void>(),
-                V8ElementHost {
-                    element: Trusted::new(&*element),
-                },
-            )
-        })
+        Some(v8_element_interface_handle(&element))
     }
 
     fn head(&self) -> Option<servo_v8::InterfaceHandle> {
         let head = self.document.root().GetHead()?;
         let element = head.upcast::<Element>();
-        // SAFETY: HTMLHeadElement inherits from Element. The cache key is the
-        // address of the same Element allocation the host roots.
-        Some(unsafe {
-            servo_v8::InterfaceHandle::new(
-                (element as *const Element).cast::<c_void>(),
-                V8ElementHost {
-                    element: Trusted::new(element),
-                },
-            )
-        })
+        Some(v8_element_interface_handle(element))
+    }
+
+    fn first_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
+        let element = self.document.root().GetFirstElementChild()?;
+        Some(v8_element_interface_handle(&element))
+    }
+
+    fn last_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
+        let element = self.document.root().GetLastElementChild()?;
+        Some(v8_element_interface_handle(&element))
+    }
+
+    fn child_element_count(&self) -> u32 {
+        self.document.root().ChildElementCount()
     }
 
     unsafe fn get_element_by_id(
@@ -543,15 +568,7 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             .document
             .root()
             .GetElementById(cx, DOMString::from(element_id))?;
-        // SAFETY: The key is the address of the same Element the host roots.
-        Some(unsafe {
-            servo_v8::InterfaceHandle::new(
-                (&*element as *const Element).cast::<c_void>(),
-                V8ElementHost {
-                    element: Trusted::new(&*element),
-                },
-            )
-        })
+        Some(v8_element_interface_handle(&element))
     }
 
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
