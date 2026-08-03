@@ -32,6 +32,7 @@ DOCUMENT_BG_COLOR = "Document.bgColor"
 DOCUMENT_URL = "Document.URL"
 DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
 DOCUMENT_READY_STATE = "Document.readyState"
+DOCUMENT_TITLE = "Document.title"
 NODE_NODE_TYPE = "Node.nodeType"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_HEAD = "Document.head"
@@ -42,6 +43,7 @@ DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
 # supported by naming an existing shape rather than by touching the emitters.
 READONLY_BOOLEAN = "readonly boolean"
 WRITABLE_LEGACY_DOMSTRING = "CEReactions writable LegacyNullToEmptyString DOMString"
+WRITABLE_DOMSTRING = "CEReactions writable DOMString"
 READONLY_USVSTRING = "readonly USVString"
 READONLY_ENUM = "readonly enum"
 READONLY_UNSIGNED_SHORT = "readonly unsigned short"
@@ -54,6 +56,7 @@ PURE_DOMSTRING_TO_NULLABLE_INTERFACE = "Pure operation DOMString -> nullable int
 # emitters honour and rejects the rest, as `generate.py` does for its own members.
 READONLY_BOOLEAN_EXTENDED_ATTRIBUTES = frozenset()
 WRITABLE_LEGACY_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"CEReactions"})
+WRITABLE_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"CEReactions"})
 # `[Constant]` is a SpiderMonkey JIT alias-set hint with no bearing on the value
 # produced, and the V8 accessor is already installed with `kHasNoSideEffect`, so
 # honouring it costs nothing. It is allowed rather than required so that dropping
@@ -101,6 +104,7 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
         READONLY_ENUM,
         expected_enum_values=DOCUMENT_READY_STATE_VALUES,
     ),
+    DocumentHostMember(DOCUMENT_TITLE, WRITABLE_DOMSTRING),
     # Document inherits from Node, so this lands on the existing document
     # facade: no second host, no second native pointer, no second vtable.
     DocumentHostMember(NODE_NODE_TYPE, READONLY_UNSIGNED_SHORT),
@@ -193,6 +197,35 @@ def select_writable_legacy_domstring_attribute(
         raise WebIDLSelectionError(f"`{qualified_name}` must carry `[CEReactions]`")
     if not member.type.getExtendedAttribute("LegacyNullToEmptyString"):
         raise WebIDLSelectionError(f"`{qualified_name}` must carry `[LegacyNullToEmptyString]` on its type")
+
+    return member
+
+
+def select_writable_domstring_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLAttribute:
+    """Select one ordinary CEReactions writable, non-nullable DOMString."""
+
+    member = _select_instance_attribute(
+        parser_results,
+        qualified_name,
+        WRITABLE_DOMSTRING_EXTENDED_ATTRIBUTES,
+    )
+    if member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be writable")
+    if member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be non-nullable")
+    if not member.type.isDOMString():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must use `DOMString`, got `{member.type.prettyName()}`"
+        )
+    if not member.getExtendedAttribute("CEReactions"):
+        raise WebIDLSelectionError(f"`{qualified_name}` must carry `[CEReactions]`")
+    if member.type.getExtendedAttribute("LegacyNullToEmptyString"):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must not carry `[LegacyNullToEmptyString]` on its type"
+        )
 
     return member
 
@@ -431,6 +464,7 @@ def select_document_hidden(
 _SHAPE_SELECTORS = {
     READONLY_BOOLEAN: select_readonly_boolean_attribute,
     WRITABLE_LEGACY_DOMSTRING: select_writable_legacy_domstring_attribute,
+    WRITABLE_DOMSTRING: select_writable_domstring_attribute,
     READONLY_USVSTRING: select_readonly_usvstring_attribute,
     READONLY_UNSIGNED_SHORT: select_readonly_unsigned_short_attribute,
 }

@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 17u
+#define SERVO_V8_ABI_VERSION 18u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;

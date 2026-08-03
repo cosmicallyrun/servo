@@ -40,6 +40,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_bg_color)(void* native, ServoV8OwnedUtf8* output);",
             "uint8_t (*set_bg_color)(void* native, void* host_context,",
             "uint8_t (*get_ready_state)(void* native, ServoV8OwnedUtf8* output);",
+            "uint8_t (*get_title)(void* native, ServoV8OwnedUtf8* output);",
+            "uint8_t (*set_title)(void* native, void* host_context,",
             "uint8_t (*get_head)(void* native, ServoV8InterfaceValue* output);",
             "uint8_t (*get_element_by_id)(void* native, void* host_context,",
             "const uint8_t* element_id,",
@@ -55,6 +57,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "fn hidden(&self) -> bool;",
             "fn bg_color(&self) -> String;",
             "fn ready_state(&self) -> String;",
+            "fn title(&self) -> String;",
+            "unsafe fn set_title(",
             "unsafe fn set_bg_color(",
             "pub struct OwnedUtf8 {",
             "Box::new(native.bg_color().into_bytes())",
@@ -64,6 +68,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "unsafe fn get_element_by_id(",
             "std::slice::from_raw_parts(element_id, element_id_length)",
             "set_bg_color: Some(document_host_set_bg_color::<T>)",
+            "set_title: Some(document_host_set_title::<T>)",
             "get_element_by_id: Some(document_host_get_element_by_id::<T>)",
         )
         for fragment in expected_fragments:
@@ -79,6 +84,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "DocumentHostGetHidden(",
             "DocumentHostGetBgColor(",
             "DocumentHostSetBgColor(",
+            "DocumentHostGetTitle(",
+            "DocumentHostSetTitle(",
             "DocumentHostGetDocumentElement(",
             "DocumentHostGetHead(",
             "DocumentHostCallGetElementById(",
@@ -97,6 +104,20 @@ class DocumentHostGenerationTests(unittest.TestCase):
                 self.assertIn(fragment, output)
         self.assertNotIn("CallDocumentHostGet", output)
         self.assertNotIn("CallDocumentHostSet", output)
+
+    def test_generates_distinct_ordinary_and_legacy_null_conversion(self) -> None:
+        output = self.outputs[generate_document_host.CPP_NAME]
+        bg_color_setter = output.split("void DocumentHostSetBgColor(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        title_setter = output.split("void DocumentHostSetTitle(", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn("info[0]->IsNull()", bg_color_setter)
+        self.assertIn("info[0]->ToString(context)", bg_color_setter)
+        self.assertNotIn("info[0]->IsNull()", title_setter)
+        self.assertIn("info[0]->ToString(context)", title_setter)
 
     def test_rejects_a_selection_that_does_not_match_the_manifest(self) -> None:
         incomplete = {

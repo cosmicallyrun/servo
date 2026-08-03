@@ -297,6 +297,10 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         self.document.root().ReadyState().as_str().to_owned()
     }
 
+    fn title(&self) -> String {
+        self.document.root().Title().into()
+    }
+
     fn node_type(&self) -> u16 {
         // Document inherits from Node, so this is served by the same facade.
         self.document.root().upcast::<Node>().NodeType()
@@ -379,6 +383,21 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             &local_name!("bgcolor"),
             DOMString::from(value),
         );
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    unsafe fn set_title(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative run API supplies its synchronously
+        // borrowed JSContext wrapper and clears the pointer before returning.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // As with bgColor, the outer Servo entry owns CEReactions scheduling;
+        // invoking a SpiderMonkey reaction beneath this V8 callback would
+        // violate the sidecar borrow and callback-depth invariants.
+        self.document.root().SetTitle(cx, DOMString::from(value));
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         !unsafe { JS_IsExceptionPending(cx) }
     }

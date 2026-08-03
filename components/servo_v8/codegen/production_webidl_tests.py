@@ -43,6 +43,21 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertTrue(attribute.getExtendedAttribute("CEReactions"))
         self.assertTrue(attribute.type.getExtendedAttribute("LegacyNullToEmptyString"))
 
+    def test_selects_real_document_title_with_ordinary_domstring_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        attribute = attributes[production_webidl.DOCUMENT_TITLE]
+        self.assertEqual(attribute.identifier.name, "title")
+        self.assertFalse(attribute.readonly)
+        self.assertFalse(attribute.type.nullable())
+        self.assertTrue(attribute.type.isDOMString())
+        self.assertTrue(attribute.getExtendedAttribute("CEReactions"))
+        self.assertFalse(attribute.type.getExtendedAttribute("LegacyNullToEmptyString"))
+
     def test_selects_the_slice_keyed_in_manifest_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             attributes = production_webidl.select_document_host_members(
@@ -261,6 +276,49 @@ class SyntheticSelectionTests(unittest.TestCase):
         self.assert_bg_color_rejected(
             "[CEReactions] attribute DOMString bgColor;",
             "`Document.bgColor` must carry `[LegacyNullToEmptyString]` on its type",
+        )
+
+    def assert_title_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": f"interface Document {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_writable_domstring_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_TITLE,
+            )
+
+    def test_rejects_title_without_ce_reactions(self) -> None:
+        self.assert_title_rejected(
+            "attribute DOMString title;",
+            "`Document.title` must carry `[CEReactions]`",
+        )
+
+    def test_rejects_readonly_title(self) -> None:
+        self.assert_title_rejected(
+            "readonly attribute DOMString title;",
+            "`Document.title` must be writable",
+        )
+
+    def test_rejects_nullable_title(self) -> None:
+        self.assert_title_rejected(
+            "[CEReactions] attribute DOMString? title;",
+            "`Document.title` must be non-nullable",
+        )
+
+    def test_rejects_non_domstring_title(self) -> None:
+        self.assert_title_rejected(
+            "[CEReactions] attribute USVString title;",
+            "`Document.title` must use `DOMString`, got `USVString`",
+        )
+
+    def test_rejects_title_with_legacy_null_conversion(self) -> None:
+        self.assert_title_rejected(
+            "[CEReactions] attribute [LegacyNullToEmptyString] DOMString title;",
+            "`Document.title` must not carry `[LegacyNullToEmptyString]` on its type",
         )
 
     def test_rejects_bg_color_with_extended_attribute_beyond_ce_reactions(self) -> None:

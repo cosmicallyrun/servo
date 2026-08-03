@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 17;
+const ABI_VERSION: u32 = 18;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -1233,6 +1233,7 @@ mod tests {
     struct DocumentHostProbe {
         hidden: Rc<Cell<bool>>,
         bg_color: Rc<RefCell<String>>,
+        title: Rc<RefCell<String>>,
         getter_calls: Rc<Cell<usize>>,
         bg_color_getter_calls: Rc<Cell<usize>>,
         bg_color_setter_calls: Rc<Cell<usize>>,
@@ -1258,6 +1259,7 @@ mod tests {
             Self {
                 hidden,
                 bg_color: Rc::new(RefCell::new("red".to_owned())),
+                title: Rc::new(RefCell::new("probe title".to_owned())),
                 getter_calls,
                 bg_color_getter_calls: Rc::new(Cell::new(0)),
                 bg_color_setter_calls: Rc::new(Cell::new(0)),
@@ -1312,6 +1314,10 @@ mod tests {
 
         fn ready_state(&self) -> String {
             "complete".to_owned()
+        }
+
+        fn title(&self) -> String {
+            self.title.borrow().clone()
         }
 
         fn node_type(&self) -> u16 {
@@ -1386,6 +1392,12 @@ mod tests {
             self.bg_color_setter_calls
                 .set(self.bg_color_setter_calls.get() + 1);
             *self.bg_color.borrow_mut() = value.to_owned();
+            true
+        }
+
+        unsafe fn set_title(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            *self.title.borrow_mut() = value.to_owned();
             true
         }
     }
@@ -1474,6 +1486,7 @@ mod tests {
                 .eval_bool("!Object.hasOwn(globalThis, 'shadowCompileMustNotExecute')")
                 .unwrap()
         );
+
         assert!(
             runtime
                 .compile("function syntax error {", "invalid.js", 7)
@@ -2313,6 +2326,29 @@ mod tests {
                 .unwrap()
         );
 
+        let missing_title_context = compiled(runtime.compile_script_in_realm(
+            first,
+            "document.title = 'must-not-set';",
+            "missing-title-host-context.js",
+            1,
+        ));
+        let ScriptRunOutcome::Thrown(missing_title_context_error) = runtime
+            .run_script_in_realm(first, missing_title_context)
+            .unwrap()
+        else {
+            panic!("Document.title setter ran without a host context");
+        };
+        assert!(
+            missing_title_context_error
+                .message
+                .contains("Document.title host callback failed")
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "document.title === 'probe title'")
+                .unwrap()
+        );
+
         // Document.URL is the first read-only member added through the shape
         // manifest. It shares the owned-UTF-8 transfer with bgColor's getter
         // but has no setter, so the descriptor must expose a getter alone, and
@@ -2381,7 +2417,10 @@ mod tests {
             "(() => {\n\
                const descriptor = Object.getOwnPropertyDescriptor(\n\
                  Object.getPrototypeOf(document), 'bgColor');\n\
+               const titleDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 Object.getPrototypeOf(document), 'title');\n\
                globalThis.bgColorBrandStringified = false;\n\
+               globalThis.titleBrandStringified = false;\n\
                let rejectsWrongBrand = false;\n\
                try {\n\
                  descriptor.set.call({}, { toString() {\n\
@@ -2396,6 +2435,38 @@ mod tests {
                let rejectsSymbol = false;\n\
                try { document.bgColor = Symbol('color'); }\n\
                catch (error) { rejectsSymbol = error instanceof TypeError; }\n\
+               let titleRejectsWrongBrand = false;\n\
+               try {\n\
+                 titleDescriptor.set.call({}, { toString() {\n\
+                   titleBrandStringified = true; return 'bad';\n\
+                 }});\n\
+               } catch (error) { titleRejectsWrongBrand = error instanceof TypeError; }\n\
+               let titlePreservesConversionError = false;\n\
+               try {\n\
+                 titleDescriptor.set.call(document, {\n\
+                   toString() { throw conversionError; }\n\
+                 });\n\
+               } catch (error) {\n\
+                 titlePreservesConversionError = error === conversionError;\n\
+               }\n\
+               let titleRejectsSymbol = false;\n\
+               try { document.title = Symbol('title'); }\n\
+               catch (error) { titleRejectsSymbol = error instanceof TypeError; }\n\
+               document.title = null;\n\
+               const titleNullBecameString = document.title === 'null';\n\
+               let titleConversions = 0;\n\
+               document.title = { toString() {\n\
+                 titleConversions++; return 'V8 title ✓';\n\
+               }};\n\
+               globalThis.titleBindingProof =\n\
+                 !Object.hasOwn(document, 'title') && titleDescriptor &&\n\
+                 titleDescriptor.enumerable && titleDescriptor.configurable &&\n\
+                 titleDescriptor.get.length === 0 && titleDescriptor.set.length === 1 &&\n\
+                 titleDescriptor.get.name === 'get title' &&\n\
+                 titleDescriptor.set.name === 'set title' && titleRejectsWrongBrand &&\n\
+                 !titleBrandStringified && titlePreservesConversionError &&\n\
+                 titleRejectsSymbol &&\n\
+                 titleNullBecameString && titleConversions === 1;\n\
                document.bgColor = null;\n\
                const nullBecameEmpty = document.bgColor === '';\n\
                document.bgColor = 'grü\\0n';\n\
@@ -2427,7 +2498,8 @@ mod tests {
             runtime
                 .eval_bool_in_realm(
                     first,
-                    "bgColorBindingProof && document.bgColor === 'grü\\0n'",
+                    "bgColorBindingProof && titleBindingProof && \
+                     document.bgColor === 'grü\\0n' && document.title === 'V8 title ✓'",
                 )
                 .unwrap()
         );

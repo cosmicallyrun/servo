@@ -494,7 +494,7 @@ def _readonly_boolean_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_getter_name(member.attribute)}"]
 
 
-def _legacy_domstring_header_slots(member: Member) -> Block:
+def _writable_domstring_header_slots(member: Member) -> Block:
     return [
         f"  uint8_t (*{_getter_name(member.attribute)})(void* native, ServoV8OwnedUtf8* output);",
         f"  uint8_t (*{_setter_name(member.attribute)})(void* native, void* host_context,",
@@ -502,7 +502,7 @@ def _legacy_domstring_header_slots(member: Member) -> Block:
     ]
 
 
-def _legacy_domstring_rust_trait_members(member: Member) -> Block:
+def _writable_domstring_rust_trait_members(member: Member) -> Block:
     name = _rust_member_name(member.attribute)
     return [
         f"    fn {name}(&self) -> String;",
@@ -518,7 +518,7 @@ def _legacy_domstring_rust_trait_members(member: Member) -> Block:
     ]
 
 
-def _legacy_domstring_rust_vtable_fields(member: Member) -> Block:
+def _writable_domstring_rust_vtable_fields(member: Member) -> Block:
     return [
         f'    pub {_getter_name(member.attribute)}: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,',
         f"    pub {_setter_name(member.attribute)}: Option<",
@@ -527,7 +527,7 @@ def _legacy_domstring_rust_vtable_fields(member: Member) -> Block:
     ]
 
 
-def _legacy_domstring_rust_thunks(member: Member) -> tuple[Block, ...]:
+def _writable_domstring_rust_thunks(member: Member) -> tuple[Block, ...]:
     name = _rust_member_name(member.attribute)
     getter = _getter_name(member.attribute)
     setter = _setter_name(member.attribute)
@@ -583,7 +583,7 @@ def _legacy_domstring_rust_thunks(member: Member) -> tuple[Block, ...]:
     )
 
 
-def _legacy_domstring_rust_vtable_init(member: Member) -> Block:
+def _writable_domstring_rust_vtable_init(member: Member) -> Block:
     getter = _getter_name(member.attribute)
     setter = _setter_name(member.attribute)
     return [
@@ -592,11 +592,32 @@ def _legacy_domstring_rust_vtable_init(member: Member) -> Block:
     ]
 
 
-def _legacy_domstring_cpp_bodies(member: Member) -> tuple[Block, ...]:
+def _domstring_cpp_bodies(
+    member: Member,
+    *,
+    legacy_null_to_empty: bool,
+) -> tuple[Block, ...]:
     getter = _getter_name(member.attribute)
     setter = _setter_name(member.attribute)
     accessor = _cpp_member_name(member.attribute)
     qualified_name = member.qualified_name
+    if legacy_null_to_empty:
+        # [LegacyNullToEmptyString] replaces only null before the ordinary
+        # WebIDL ToString conversion. Undefined and every other value still use
+        # ToString exactly once.
+        setter_conversion = [
+            "  if (info[0]->IsNull()) {",
+            "    value = v8::String::Empty(isolate);",
+            "  } else if (!info[0]->ToString(context).ToLocal(&value)) {",
+            "    return;",
+            "  }",
+        ]
+    else:
+        setter_conversion = [
+            "  if (!info[0]->ToString(context).ToLocal(&value)) {",
+            "    return;",
+            "  }",
+        ]
     return (
         [
             f"void DocumentHostGet{accessor}(",
@@ -650,13 +671,7 @@ def _legacy_domstring_cpp_bodies(member: Member) -> tuple[Block, ...]:
             "  }",
             "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
             "  v8::Local<v8::String> value;",
-            # [LegacyNullToEmptyString] is why null becomes the empty string here
-            # instead of the string "null" that ToString() would produce.
-            "  if (info[0]->IsNull()) {",
-            "    value = v8::String::Empty(isolate);",
-            "  } else if (!info[0]->ToString(context).ToLocal(&value)) {",
-            "    return;",
-            "  }",
+            *setter_conversion,
             "  v8::String::Utf8Value utf8(isolate, value);",
             "  if (!*utf8) {",
             f'    ThrowTypeError(isolate, "could not encode {qualified_name} as UTF-8");',
@@ -683,7 +698,15 @@ def _legacy_domstring_cpp_bodies(member: Member) -> tuple[Block, ...]:
     )
 
 
-def _legacy_domstring_cpp_vtable_terms(member: Member) -> list[str]:
+def _legacy_domstring_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    return _domstring_cpp_bodies(member, legacy_null_to_empty=True)
+
+
+def _writable_domstring_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    return _domstring_cpp_bodies(member, legacy_null_to_empty=False)
+
+
+def _writable_domstring_cpp_vtable_terms(member: Member) -> list[str]:
     return [
         f"vtable.{_getter_name(member.attribute)}",
         f"vtable.{_setter_name(member.attribute)}",
@@ -1283,16 +1306,29 @@ SHAPE_EMITTERS = {
     ),
     production_webidl.WRITABLE_LEGACY_DOMSTRING: ShapeEmitter(
         header_type_blocks=(_OWNED_UTF8_C_TYPE,),
-        header_slots=_legacy_domstring_header_slots,
+        header_slots=_writable_domstring_header_slots,
         rust_type_blocks=(_OWNED_UTF8_RUST_TYPE,),
-        rust_trait_members=_legacy_domstring_rust_trait_members,
-        rust_vtable_fields=_legacy_domstring_rust_vtable_fields,
+        rust_trait_members=_writable_domstring_rust_trait_members,
+        rust_vtable_fields=_writable_domstring_rust_vtable_fields,
         rust_thunk_blocks=(_OWNED_UTF8_RUST_DROP,),
-        rust_thunks=_legacy_domstring_rust_thunks,
-        rust_vtable_init=_legacy_domstring_rust_vtable_init,
+        rust_thunks=_writable_domstring_rust_thunks,
+        rust_vtable_init=_writable_domstring_rust_vtable_init,
         cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
         cpp_bodies=_legacy_domstring_cpp_bodies,
-        cpp_vtable_terms=_legacy_domstring_cpp_vtable_terms,
+        cpp_vtable_terms=_writable_domstring_cpp_vtable_terms,
+    ),
+    production_webidl.WRITABLE_DOMSTRING: ShapeEmitter(
+        header_type_blocks=(_OWNED_UTF8_C_TYPE,),
+        header_slots=_writable_domstring_header_slots,
+        rust_type_blocks=(_OWNED_UTF8_RUST_TYPE,),
+        rust_trait_members=_writable_domstring_rust_trait_members,
+        rust_vtable_fields=_writable_domstring_rust_vtable_fields,
+        rust_thunk_blocks=(_OWNED_UTF8_RUST_DROP,),
+        rust_thunks=_writable_domstring_rust_thunks,
+        rust_vtable_init=_writable_domstring_rust_vtable_init,
+        cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
+        cpp_bodies=_writable_domstring_cpp_bodies,
+        cpp_vtable_terms=_writable_domstring_cpp_vtable_terms,
     ),
     production_webidl.READONLY_USVSTRING: ShapeEmitter(
         header_type_blocks=(_OWNED_UTF8_C_TYPE,),

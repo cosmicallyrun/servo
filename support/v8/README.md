@@ -69,7 +69,7 @@ inside marking and sweeping, and must be rejected before V8 is touched.
 
 The production binding slice is generated from the enabled `Document.hidden`,
 `Document.bgColor`, `Document.URL`, `Document.visibilityState`,
-`Document.readyState`,
+`Document.readyState`, `Document.title`,
 `Node.nodeType`, `Document.documentElement`, `Document.head`, and
 `Document.getElementById` declarations in Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
@@ -230,9 +230,9 @@ than cached.
 The current visible host
 surface is deliberately limited to `window`, `document.hidden`,
 `document.bgColor`, `document.URL`, `document.visibilityState`,
-`document.readyState`, `document.nodeType`, `document.documentElement`,
-`document.head`, and `document.getElementById()`, plus `Element.tagName` on the
-elements that return.
+`document.readyState`, `document.title`, `document.nodeType`,
+`document.documentElement`, `document.head`, and `document.getElementById()`,
+plus `Element.tagName` on the elements that return.
 
 V8 installs its own `console` on every context, and with no inspector attached
 its methods silently discard everything. An authoritative script therefore
@@ -311,6 +311,7 @@ The proof suite uses that same counting argument:
 | `authoritative_url_proof.html` | `Document.URL` is served by the V8 host, getter-only |
 | `authoritative_visibility_nodetype_proof.html` | the enum and numeric shapes, the latter inherited from `Node` |
 | `authoritative_ready_state_proof.html` | a second enum shape is independently value-pinned and live at parser time |
+| `authoritative_title_proof.html` | ordinary DOMString setter conversion and live title mutation use the generated host |
 | `authoritative_timer_proof.html` | a string timer handler runs on V8, handed off across a task boundary |
 | `authoritative_realm_surface_proof.html` | the realm exposes no API it cannot implement |
 | `authoritative_document_open_proof.html` | the realm survives `document.open()` |
@@ -340,7 +341,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 17 and remains experimental. The original
+The current exported C ABI is version 18 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume
