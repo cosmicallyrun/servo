@@ -287,6 +287,38 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         self.document.root().URL().0
     }
 
+    fn document_uri(&self) -> String {
+        self.document.root().DocumentURI().0
+    }
+
+    fn compat_mode(&self) -> String {
+        self.document.root().CompatMode().into()
+    }
+
+    fn character_set(&self) -> String {
+        self.document.root().CharacterSet().into()
+    }
+
+    fn charset(&self) -> String {
+        self.document.root().Charset().into()
+    }
+
+    fn input_encoding(&self) -> String {
+        self.document.root().InputEncoding().into()
+    }
+
+    fn content_type(&self) -> String {
+        self.document.root().ContentType().into()
+    }
+
+    fn referrer(&self) -> String {
+        self.document.root().Referrer().into()
+    }
+
+    fn last_modified(&self) -> String {
+        self.document.root().LastModified().into()
+    }
+
     fn visibility_state(&self) -> String {
         // The generator pinned this enum's value set, so `as_str` can only
         // produce a value the V8 side was generated against.

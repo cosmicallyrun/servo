@@ -58,6 +58,30 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertTrue(attribute.getExtendedAttribute("CEReactions"))
         self.assertFalse(attribute.type.getExtendedAttribute("LegacyNullToEmptyString"))
 
+    def test_selects_real_document_string_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertTrue(attributes[production_webidl.DOCUMENT_URI].type.isUSVString())
+        domstring_members = (
+            production_webidl.DOCUMENT_COMPAT_MODE,
+            production_webidl.DOCUMENT_CHARACTER_SET,
+            production_webidl.DOCUMENT_CHARSET,
+            production_webidl.DOCUMENT_INPUT_ENCODING,
+            production_webidl.DOCUMENT_CONTENT_TYPE,
+            production_webidl.DOCUMENT_REFERRER,
+            production_webidl.DOCUMENT_LAST_MODIFIED,
+        )
+        for qualified_name in domstring_members:
+            with self.subTest(member=qualified_name):
+                attribute = attributes[qualified_name]
+                self.assertTrue(attribute.readonly)
+                self.assertFalse(attribute.type.nullable())
+                self.assertTrue(attribute.type.isDOMString())
+
     def test_selects_the_slice_keyed_in_manifest_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             attributes = production_webidl.select_document_host_members(
@@ -319,6 +343,43 @@ class SyntheticSelectionTests(unittest.TestCase):
         self.assert_title_rejected(
             "[CEReactions] attribute [LegacyNullToEmptyString] DOMString title;",
             "`Document.title` must not carry `[LegacyNullToEmptyString]` on its type",
+        )
+
+    def assert_compat_mode_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": f"interface Document {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_readonly_domstring_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_COMPAT_MODE,
+            )
+
+    def test_rejects_writable_readonly_domstring(self) -> None:
+        self.assert_compat_mode_rejected(
+            "attribute DOMString compatMode;",
+            "`Document.compatMode` must be readonly",
+        )
+
+    def test_rejects_nullable_readonly_domstring(self) -> None:
+        self.assert_compat_mode_rejected(
+            "readonly attribute DOMString? compatMode;",
+            "`Document.compatMode` must be non-nullable",
+        )
+
+    def test_rejects_usvstring_for_readonly_domstring(self) -> None:
+        self.assert_compat_mode_rejected(
+            "readonly attribute USVString compatMode;",
+            "`Document.compatMode` must use `DOMString`, got `USVString`",
+        )
+
+    def test_rejects_unimplemented_readonly_domstring_attribute(self) -> None:
+        self.assert_compat_mode_rejected(
+            "[Throws] readonly attribute DOMString compatMode;",
+            "`Document.compatMode` carries extended attributes that are not implemented: Throws",
         )
 
     def test_rejects_bg_color_with_extended_attribute_beyond_ce_reactions(self) -> None:

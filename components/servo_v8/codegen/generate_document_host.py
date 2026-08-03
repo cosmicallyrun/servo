@@ -818,6 +818,18 @@ def _readonly_usvstring_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_getter_name(member.attribute)}"]
 
 
+# Both readonly string types use the same outbound UTF-8 transfer. Their
+# semantic distinction is enforced by the WebIDL selector; unlike an argument,
+# a getter result needs no JS-side surrogate conversion.
+_readonly_domstring_header_slots = _readonly_usvstring_header_slots
+_readonly_domstring_rust_trait_members = _readonly_usvstring_rust_trait_members
+_readonly_domstring_rust_vtable_fields = _readonly_usvstring_rust_vtable_fields
+_readonly_domstring_rust_thunks = _readonly_usvstring_rust_thunks
+_readonly_domstring_rust_vtable_init = _readonly_usvstring_rust_vtable_init
+_readonly_domstring_cpp_bodies = _readonly_usvstring_cpp_bodies
+_readonly_domstring_cpp_vtable_terms = _readonly_usvstring_cpp_vtable_terms
+
+
 # An enum crosses the ABI as its string value, so it reuses the owned-UTF-8
 # getter wholesale; the selector pins the value set, which is what keeps the
 # untyped string honest.
@@ -1342,6 +1354,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
         cpp_bodies=_readonly_usvstring_cpp_bodies,
         cpp_vtable_terms=_readonly_usvstring_cpp_vtable_terms,
+    ),
+    production_webidl.READONLY_DOMSTRING: ShapeEmitter(
+        header_type_blocks=(_OWNED_UTF8_C_TYPE,),
+        header_slots=_readonly_domstring_header_slots,
+        rust_type_blocks=(_OWNED_UTF8_RUST_TYPE,),
+        rust_trait_members=_readonly_domstring_rust_trait_members,
+        rust_vtable_fields=_readonly_domstring_rust_vtable_fields,
+        rust_thunk_blocks=(_OWNED_UTF8_RUST_DROP,),
+        rust_thunks=_readonly_domstring_rust_thunks,
+        rust_vtable_init=_readonly_domstring_rust_vtable_init,
+        cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
+        cpp_bodies=_readonly_domstring_cpp_bodies,
+        cpp_vtable_terms=_readonly_domstring_cpp_vtable_terms,
     ),
     production_webidl.READONLY_ENUM: ShapeEmitter(
         header_type_blocks=(_OWNED_UTF8_C_TYPE,),

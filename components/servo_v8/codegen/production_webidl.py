@@ -30,6 +30,14 @@ SKIP_UNLESS_PATTERN = re.compile(r"// skip-unless ([A-Z_]+)\n")
 DOCUMENT_HIDDEN = "Document.hidden"
 DOCUMENT_BG_COLOR = "Document.bgColor"
 DOCUMENT_URL = "Document.URL"
+DOCUMENT_URI = "Document.documentURI"
+DOCUMENT_COMPAT_MODE = "Document.compatMode"
+DOCUMENT_CHARACTER_SET = "Document.characterSet"
+DOCUMENT_CHARSET = "Document.charset"
+DOCUMENT_INPUT_ENCODING = "Document.inputEncoding"
+DOCUMENT_CONTENT_TYPE = "Document.contentType"
+DOCUMENT_REFERRER = "Document.referrer"
+DOCUMENT_LAST_MODIFIED = "Document.lastModified"
 DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
 DOCUMENT_READY_STATE = "Document.readyState"
 DOCUMENT_TITLE = "Document.title"
@@ -44,6 +52,7 @@ DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
 READONLY_BOOLEAN = "readonly boolean"
 WRITABLE_LEGACY_DOMSTRING = "CEReactions writable LegacyNullToEmptyString DOMString"
 WRITABLE_DOMSTRING = "CEReactions writable DOMString"
+READONLY_DOMSTRING = "readonly DOMString"
 READONLY_USVSTRING = "readonly USVString"
 READONLY_ENUM = "readonly enum"
 READONLY_UNSIGNED_SHORT = "readonly unsigned short"
@@ -62,6 +71,7 @@ WRITABLE_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"CEReactions"})
 # honouring it costs nothing. It is allowed rather than required so that dropping
 # it upstream does not break the build.
 READONLY_USVSTRING_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
+READONLY_DOMSTRING_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
 READONLY_ENUM_EXTENDED_ATTRIBUTES = frozenset()
 READONLY_UNSIGNED_SHORT_EXTENDED_ATTRIBUTES = frozenset({"Constant"})
 # `[Pure]` is a SpiderMonkey alias-set hint, like `[Constant]` but weaker, and
@@ -94,6 +104,14 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     DocumentHostMember(DOCUMENT_HIDDEN, READONLY_BOOLEAN),
     DocumentHostMember(DOCUMENT_BG_COLOR, WRITABLE_LEGACY_DOMSTRING),
     DocumentHostMember(DOCUMENT_URL, READONLY_USVSTRING),
+    DocumentHostMember(DOCUMENT_URI, READONLY_USVSTRING),
+    DocumentHostMember(DOCUMENT_COMPAT_MODE, READONLY_DOMSTRING),
+    DocumentHostMember(DOCUMENT_CHARACTER_SET, READONLY_DOMSTRING),
+    DocumentHostMember(DOCUMENT_CHARSET, READONLY_DOMSTRING),
+    DocumentHostMember(DOCUMENT_INPUT_ENCODING, READONLY_DOMSTRING),
+    DocumentHostMember(DOCUMENT_CONTENT_TYPE, READONLY_DOMSTRING),
+    DocumentHostMember(DOCUMENT_REFERRER, READONLY_DOMSTRING),
+    DocumentHostMember(DOCUMENT_LAST_MODIFIED, READONLY_DOMSTRING),
     DocumentHostMember(
         DOCUMENT_VISIBILITY_STATE,
         READONLY_ENUM,
@@ -285,6 +303,29 @@ def select_readonly_usvstring_attribute(
     return member
 
 
+def select_readonly_domstring_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLAttribute:
+    """Select one ordinary readonly, non-nullable DOMString attribute."""
+
+    member = _select_instance_attribute(
+        parser_results,
+        qualified_name,
+        READONLY_DOMSTRING_EXTENDED_ATTRIBUTES,
+    )
+    if not member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be readonly")
+    if member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be non-nullable")
+    if not member.type.isDOMString():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must use `DOMString`, got `{member.type.prettyName()}`"
+        )
+
+    return member
+
+
 def select_readonly_enum_attribute(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
     qualified_name: str,
@@ -465,6 +506,7 @@ _SHAPE_SELECTORS = {
     READONLY_BOOLEAN: select_readonly_boolean_attribute,
     WRITABLE_LEGACY_DOMSTRING: select_writable_legacy_domstring_attribute,
     WRITABLE_DOMSTRING: select_writable_domstring_attribute,
+    READONLY_DOMSTRING: select_readonly_domstring_attribute,
     READONLY_USVSTRING: select_readonly_usvstring_attribute,
     READONLY_UNSIGNED_SHORT: select_readonly_unsigned_short_attribute,
 }

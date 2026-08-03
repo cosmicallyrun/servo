@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 18;
+const ABI_VERSION: u32 = 19;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -1302,6 +1302,38 @@ mod tests {
             "https://example.com/probe?q=\u{2713}".to_owned()
         }
 
+        fn document_uri(&self) -> String {
+            "https://example.com/probe?q=\u{2713}".to_owned()
+        }
+
+        fn compat_mode(&self) -> String {
+            "CSS1Compat".to_owned()
+        }
+
+        fn character_set(&self) -> String {
+            "UTF-8".to_owned()
+        }
+
+        fn charset(&self) -> String {
+            "UTF-8".to_owned()
+        }
+
+        fn input_encoding(&self) -> String {
+            "UTF-8".to_owned()
+        }
+
+        fn content_type(&self) -> String {
+            "text/html".to_owned()
+        }
+
+        fn referrer(&self) -> String {
+            String::new()
+        }
+
+        fn last_modified(&self) -> String {
+            "01/02/2026 03:04:05".to_owned()
+        }
+
         fn visibility_state(&self) -> String {
             // Mirrors Servo's enum-to-string, which is what crosses the ABI.
             if self.hidden.get() {
@@ -2358,6 +2390,21 @@ mod tests {
                 .eval_bool_in_realm(
                     first,
                     "document.URL === 'https://example.com/probe?q=\u{2713}'"
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.documentURI === document.URL && \
+                     document.compatMode === 'CSS1Compat' && \
+                     document.characterSet === 'UTF-8' && \
+                     document.charset === document.characterSet && \
+                     document.inputEncoding === document.characterSet && \
+                     document.contentType === 'text/html' && \
+                     document.referrer === '' && \
+                     document.lastModified === '01/02/2026 03:04:05'",
                 )
                 .unwrap()
         );
