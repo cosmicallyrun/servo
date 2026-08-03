@@ -52,6 +52,7 @@ DOCUMENT_FIRST_ELEMENT_CHILD = "Document.firstElementChild"
 DOCUMENT_LAST_ELEMENT_CHILD = "Document.lastElementChild"
 DOCUMENT_CHILD_ELEMENT_COUNT = "Document.childElementCount"
 DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
+DOCUMENT_QUERY_SELECTOR = "Document.querySelector"
 WINDOW_OR_WORKER_SET_TIMEOUT = "WindowOrWorkerGlobalScope.setTimeout"
 WINDOW_OR_WORKER_CLEAR_TIMEOUT = "WindowOrWorkerGlobalScope.clearTimeout"
 WINDOW_OR_WORKER_SET_INTERVAL = "WindowOrWorkerGlobalScope.setInterval"
@@ -72,6 +73,7 @@ ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
 ELEMENT_FIRST_ELEMENT_CHILD = "Element.firstElementChild"
 ELEMENT_LAST_ELEMENT_CHILD = "Element.lastElementChild"
 ELEMENT_CHILD_ELEMENT_COUNT = "Element.childElementCount"
+ELEMENT_QUERY_SELECTOR = "Element.querySelector"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -87,6 +89,9 @@ READONLY_UNSIGNED_LONG = "readonly unsigned long"
 READONLY_NULLABLE_INTERFACE = "readonly nullable interface"
 PURE_READONLY_NULLABLE_INTERFACE = "Pure readonly nullable interface"
 PURE_DOMSTRING_TO_NULLABLE_INTERFACE = "Pure operation DOMString -> nullable interface"
+PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE = (
+    "Pure Throws operation DOMString -> nullable interface"
+)
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
@@ -110,6 +115,9 @@ READONLY_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 # This operation requires `[Pure]` and maps it to V8's no-side-effect callback
 # classification; accepting it is therefore part of the generated semantics.
 PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
+PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset(
+    {"Pure", "Throws"}
+)
 
 # An enum crosses the ABI as its string value, so the generated glue is only
 # correct for the exact value set it was written against. Pinning the set makes
@@ -187,6 +195,14 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
         PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
         "Element",
     ),
+    # ParentNode.querySelector is the first throwing operation. Its native ABI
+    # distinguishes a null match from Servo's selector SyntaxError so V8 can
+    # create the exception without leaving SpiderMonkey exception state set.
+    DocumentHostMember(
+        DOCUMENT_QUERY_SELECTOR,
+        PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
+        "Element",
+    ),
 )
 
 # These operations are installed by a separate per-realm timer host rather
@@ -226,6 +242,7 @@ ELEMENT_HOST = (
     ELEMENT_FIRST_ELEMENT_CHILD,
     ELEMENT_LAST_ELEMENT_CHILD,
     ELEMENT_CHILD_ELEMENT_COUNT,
+    ELEMENT_QUERY_SELECTOR,
 )
 
 # Inherited scalar behavior installed on the Node prototype shared by Element
@@ -547,6 +564,66 @@ def select_pure_domstring_to_nullable_interface_operation(
 ) -> WebIDL.IDLMethod:
     """Select one pure instance operation with the exact generated signature."""
 
+    # Preserve the older non-throwing shape's diagnostics: callers use these
+    # to distinguish an omitted `[Pure]` hint from newly unsupported behavior.
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) == 1:
+        members = [
+            member
+            for member in interfaces[0].members
+            if member.identifier.name == member_name
+        ]
+        if len(members) == 1 and members[0].isMethod():
+            attributes = set(members[0]._extendedAttrDict)
+            unsupported = (
+                attributes - PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES
+            )
+            if unsupported:
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` carries extended attributes that are not implemented: "
+                    + ", ".join(sorted(unsupported))
+                )
+            if "Pure" not in attributes:
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must carry `[Pure]`"
+                )
+
+    return _select_domstring_to_nullable_interface_operation(
+        parser_results,
+        qualified_name,
+        expected_interface,
+        PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES,
+    )
+
+
+def select_pure_throws_domstring_to_nullable_interface_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_interface: str,
+) -> WebIDL.IDLMethod:
+    """Select the exact throwing ParentNode selector-operation shape."""
+
+    return _select_domstring_to_nullable_interface_operation(
+        parser_results,
+        qualified_name,
+        expected_interface,
+        PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES,
+    )
+
+
+def _select_domstring_to_nullable_interface_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_interface: str,
+    expected_attributes: frozenset[str],
+) -> WebIDL.IDLMethod:
+    """Select one instance operation with the shared DOMString/result shape."""
+
     interface_name, member_name = _split_qualified_name(qualified_name)
     interfaces = [
         result
@@ -576,17 +653,12 @@ def select_pure_domstring_to_nullable_interface_operation(
     if member.isSpecial():
         raise WebIDLSelectionError(f"`{qualified_name}` must be an ordinary operation")
 
-    unsupported = (
-        set(member._extendedAttrDict)
-        - PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES
-    )
-    if unsupported:
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != expected_attributes:
         raise WebIDLSelectionError(
-            f"`{qualified_name}` carries extended attributes that are not implemented: "
-            + ", ".join(sorted(unsupported))
+            f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+            f"got {sorted(actual_attributes)}"
         )
-    if not member.getExtendedAttribute("Pure"):
-        raise WebIDLSelectionError(f"`{qualified_name}` must carry `[Pure]`")
 
     signatures = member.signatures()
     if len(signatures) != 1:
@@ -915,6 +987,13 @@ def _select_element_host_member(
         raise WebIDLSelectionError(
             f"`{qualified_name}` must be an ordinary instance operation"
         )
+    if member_name == "querySelector":
+        # The parser resolves ParentNode's included members onto Element. Reuse
+        # the same exact operation selector as Document so the mixin cannot
+        # drift independently across the two native hosts.
+        return select_pure_throws_domstring_to_nullable_interface_operation(
+            parser_results, qualified_name, "Element"
+        )
     expected_attributes = (
         {"Pure"} if member_name in {"hasAttributes", "getAttribute"} else set()
     )
@@ -1121,6 +1200,7 @@ def _select_document_host_member(
         READONLY_NULLABLE_INTERFACE,
         PURE_READONLY_NULLABLE_INTERFACE,
         PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
+        PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
     }:
         if member.expected_interface is None:
             raise WebIDLSelectionError(
@@ -1138,10 +1218,13 @@ def _select_document_host_member(
                 member.qualified_name,
                 member.expected_interface,
             )
-        return select_pure_domstring_to_nullable_interface_operation(
-            parser_results,
-            member.qualified_name,
-            member.expected_interface,
+        selector = (
+            select_pure_throws_domstring_to_nullable_interface_operation
+            if member.shape == PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE
+            else select_pure_domstring_to_nullable_interface_operation
+        )
+        return selector(
+            parser_results, member.qualified_name, member.expected_interface
         )
     if member.expected_interface is not None:
         raise WebIDLSelectionError(

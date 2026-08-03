@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 24;
+const ABI_VERSION: u32 = 25;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -183,6 +183,17 @@ impl InterfaceHandle {
     }
 }
 
+/// The complete native result space for ParentNode.querySelector.
+///
+/// Servo's scope-match algorithm reports selector parse failure as a
+/// `SyntaxError` DOMException. Keeping that as a typed status prevents a
+/// SpiderMonkey exception object or pending exception from crossing into V8.
+pub enum QuerySelectorResult {
+    Match(Option<InterfaceHandle>),
+    SyntaxError,
+    HostFailure,
+}
+
 /// A host for one Servo `Element` reachable from V8.
 ///
 /// # Safety
@@ -214,6 +225,11 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     fn first_element_child(&self) -> Option<InterfaceHandle>;
     fn last_element_child(&self) -> Option<InterfaceHandle>;
     fn child_element_count(&self) -> u32;
+    unsafe fn query_selector(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> QuerySelectorResult;
 }
 
 #[repr(C)]
@@ -255,6 +271,15 @@ pub struct ElementHostVTable {
     pub get_last_element_child:
         Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub get_child_element_count: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
+    pub query_selector: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut RawQuerySelectorOutcome,
+        ) -> u8,
+    >,
     pub drop: Option<DropCallback>,
 }
 
@@ -563,6 +588,27 @@ unsafe fn element_host_write_interface_value(
     1
 }
 
+fn raw_query_selector_outcome(result: QuerySelectorResult) -> RawQuerySelectorOutcome {
+    let (status, handle) = match result {
+        QuerySelectorResult::Match(handle) => (QUERY_SELECTOR_RETURNED, handle),
+        QuerySelectorResult::SyntaxError => (QUERY_SELECTOR_SYNTAX_ERROR, None),
+        QuerySelectorResult::HostFailure => (QUERY_SELECTOR_HOST_FAILURE, None),
+    };
+    let value = match handle {
+        Some(handle) => RawInterfaceValue {
+            is_null: 0,
+            key: handle.key,
+            native: handle.native,
+        },
+        None => RawInterfaceValue {
+            is_null: 1,
+            key: std::ptr::null(),
+            native: std::ptr::null_mut(),
+        },
+    };
+    RawQuerySelectorOutcome { status, value }
+}
+
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -768,6 +814,31 @@ unsafe extern "C" fn element_host_get_child_element_count<T: ElementHostBinding>
     }
     // SAFETY: Both pointers satisfy the vtable contract.
     unsafe { *output = (&*native.cast::<T>()).child_element_count() };
+    1
+}
+
+unsafe extern "C" fn element_host_query_selector<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    selectors: *const u8,
+    selectors_length: usize,
+    output: *mut RawQuerySelectorOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || output.is_null()
+        || (selectors.is_null() && selectors_length != 0)
+    {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(selectors) = (unsafe { element_host_utf8(selectors, selectors_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).query_selector(host_context, selectors) };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = raw_query_selector_outcome(result) };
     1
 }
 
@@ -1410,6 +1481,7 @@ impl Runtime {
             get_first_element_child: Some(element_host_get_first_element_child::<T>),
             get_last_element_child: Some(element_host_get_last_element_child::<T>),
             get_child_element_count: Some(element_host_get_child_element_count::<T>),
+            query_selector: Some(element_host_query_selector::<T>),
             drop: Some(element_host_drop::<T>),
         };
         let mut storage = [0; ERROR_CAPACITY];
@@ -2142,6 +2214,26 @@ mod tests {
         fn child_element_count(&self) -> u32 {
             self.state.element_children.borrow().len() as u32
         }
+
+        unsafe fn query_selector(
+            &self,
+            host_context: *mut c_void,
+            selectors: &str,
+        ) -> QuerySelectorResult {
+            assert!(!host_context.is_null());
+            if selectors == "[" || selectors.is_empty() {
+                return QuerySelectorResult::SyntaxError;
+            }
+            let children = self.state.element_children.borrow();
+            let index = children.iter().position(|child| {
+                selectors.eq_ignore_ascii_case(&child.local_name)
+                    || selectors
+                        .strip_prefix('#')
+                        .is_some_and(|id| child.state.get("id").as_deref() == Some(id))
+            });
+            drop(children);
+            QuerySelectorResult::Match(index.and_then(|index| self.element_child(index)))
+        }
     }
 
     impl ElementHostProbe {
@@ -2534,6 +2626,25 @@ mod tests {
             })
         }
 
+        unsafe fn query_selector(
+            &self,
+            host_context: *mut c_void,
+            selectors: &str,
+        ) -> QuerySelectorResult {
+            assert!(!host_context.is_null());
+            match selectors {
+                "[" | "" => QuerySelectorResult::SyntaxError,
+                "#target" | "div" => QuerySelectorResult::Match(
+                    // SAFETY: The probe's host context and identity remain
+                    // live for the synchronous call.
+                    unsafe { self.get_element_by_id(host_context, "target") },
+                ),
+                "html" => QuerySelectorResult::Match(self.document_element()),
+                "head" => QuerySelectorResult::Match(self.head()),
+                _ => QuerySelectorResult::Match(None),
+            }
+        }
+
         unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
             assert!(!host_context.is_null());
             self.bg_color_setter_calls
@@ -2547,6 +2658,100 @@ mod tests {
             *self.title.borrow_mut() = value.to_owned();
             true
         }
+    }
+
+    unsafe extern "C" fn adversarial_document_query_selector(
+        native: *mut c_void,
+        host_context: *mut c_void,
+        selectors: *const u8,
+        selectors_length: usize,
+        output: *mut RawQuerySelectorOutcome,
+    ) -> u8 {
+        if native.is_null()
+            || host_context.is_null()
+            || output.is_null()
+            || (selectors.is_null() && selectors_length != 0)
+        {
+            return 0;
+        }
+        let selectors_bytes = if selectors_length == 0 {
+            &[]
+        } else {
+            // SAFETY: The ABI lends this byte range for the synchronous call.
+            unsafe { std::slice::from_raw_parts(selectors, selectors_length) }
+        };
+        let Ok(selectors) = std::str::from_utf8(selectors_bytes) else {
+            return 0;
+        };
+        if selectors == "callback-failure" {
+            return 0;
+        }
+
+        // SAFETY: The custom vtable is installed with a live
+        // Box<DocumentHostProbe> and the host context is non-null above.
+        let host = unsafe { &*native.cast::<DocumentHostProbe>() };
+        let target_value = || {
+            // SAFETY: The probe and its identity remain live for this
+            // synchronous callback.
+            let handle = unsafe { host.get_element_by_id(host_context, "target") }
+                .expect("the adversarial probe always has its target");
+            RawInterfaceValue {
+                is_null: 0,
+                key: handle.key,
+                native: handle.native,
+            }
+        };
+        let null_value = || RawInterfaceValue {
+            is_null: 1,
+            key: std::ptr::null(),
+            native: std::ptr::null_mut(),
+        };
+        let outcome = match selectors {
+            "host-failure" => raw_query_selector_outcome(QuerySelectorResult::HostFailure),
+            "invalid-status" => RawQuerySelectorOutcome {
+                status: u32::MAX,
+                value: target_value(),
+            },
+            "syntax-with-value" => RawQuerySelectorOutcome {
+                status: QUERY_SELECTOR_SYNTAX_ERROR,
+                value: target_value(),
+            },
+            "null-with-value" => {
+                let mut value = target_value();
+                value.is_null = 1;
+                RawQuerySelectorOutcome {
+                    status: QUERY_SELECTOR_RETURNED,
+                    value,
+                }
+            },
+            "native-without-key" => {
+                let mut value = target_value();
+                value.key = std::ptr::null();
+                RawQuerySelectorOutcome {
+                    status: QUERY_SELECTOR_RETURNED,
+                    value,
+                }
+            },
+            "key-without-native" => RawQuerySelectorOutcome {
+                status: QUERY_SELECTOR_RETURNED,
+                value: RawInterfaceValue {
+                    is_null: 0,
+                    key: (&*host.id_element_identity as *const u8).cast(),
+                    native: std::ptr::null_mut(),
+                },
+            },
+            "valid" => RawQuerySelectorOutcome {
+                status: QUERY_SELECTOR_RETURNED,
+                value: target_value(),
+            },
+            _ => RawQuerySelectorOutcome {
+                status: QUERY_SELECTOR_RETURNED,
+                value: null_value(),
+            },
+        };
+        // SAFETY: output is non-null and writable for this callback.
+        unsafe { *output = outcome };
+        1
     }
 
     impl Drop for NativeSmoke {
@@ -3523,6 +3728,145 @@ mod tests {
         });
         runtime.install_document_host(realm, host).unwrap();
 
+        let query_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               const documentDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 Object.getPrototypeOf(document), 'querySelector');\n\
+               globalThis.documentQueryWrongBrandStringified = false;\n\
+               let documentWrongBrand = false;\n\
+               try { documentDescriptor.value.call({}, { toString() {\n\
+                 documentQueryWrongBrandStringified = true; return '#target';\n\
+               }}); } catch (error) { documentWrongBrand = error instanceof TypeError; }\n\
+               const conversionError = new Error('query conversion sentinel');\n\
+               let documentConversion = false;\n\
+               try { document.querySelector({ toString() { throw conversionError; }}); }\n\
+               catch (error) { documentConversion = error === conversionError; }\n\
+               let documentSymbol = false;\n\
+               try { document.querySelector(Symbol('target')); }\n\
+               catch (error) { documentSymbol = error instanceof TypeError; }\n\
+               let documentMissing = false;\n\
+               try { document.querySelector(); }\n\
+               catch (error) { documentMissing = error instanceof TypeError; }\n\
+               const target = document.querySelector({\n\
+                 toString() { return '#target'; }\n\
+               });\n\
+               target.queryMarker = 47;\n\
+               const elementDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 Object.getPrototypeOf(target), 'querySelector');\n\
+               globalThis.elementQueryWrongBrandStringified = false;\n\
+               let elementWrongBrand = false;\n\
+               try { elementDescriptor.value.call({}, { toString() {\n\
+                 elementQueryWrongBrandStringified = true; return 'span';\n\
+               }}); } catch (error) { elementWrongBrand = error instanceof TypeError; }\n\
+               let elementConversion = false;\n\
+               try { target.querySelector({ toString() { throw conversionError; }}); }\n\
+               catch (error) { elementConversion = error === conversionError; }\n\
+               let elementSymbol = false;\n\
+               try { target.querySelector(Symbol('span')); }\n\
+               catch (error) { elementSymbol = error instanceof TypeError; }\n\
+               let elementMissing = false;\n\
+               try { target.querySelector(); }\n\
+               catch (error) { elementMissing = error instanceof TypeError; }\n\
+               const syntaxChecks = [];\n\
+               for (const callback of [\n\
+                 () => document.querySelector('['),\n\
+                 () => document.querySelector(''),\n\
+                 () => target.querySelector('['),\n\
+               ]) {\n\
+                 try { callback(); syntaxChecks.push(false); }\n\
+                 catch (error) {\n\
+                   syntaxChecks.push(\n\
+                     error instanceof DOMException && error instanceof Error &&\n\
+                     (typeof Error.isError !== 'function' || Error.isError(error)) &&\n\
+                     Object.getPrototypeOf(error) === DOMException.prototype &&\n\
+                     Object.prototype.toString.call(error) === '[object DOMException]' &&\n\
+                     String(error) ===\n\
+                       'SyntaxError: The string did not match the expected pattern.' &&\n\
+                     error.constructor === DOMException && error.name === 'SyntaxError' &&\n\
+                     error.message === 'The string did not match the expected pattern.' &&\n\
+                     error.code === 12 && DOMException.SYNTAX_ERR === 12 &&\n\
+                     !Object.hasOwn(error, 'name') && !Object.hasOwn(error, 'message') &&\n\
+                     !Object.hasOwn(error, 'code') && !Object.hasOwn(error, 'stack'));\n\
+                 }\n\
+               }\n\
+               let constructorRequiresNew = false;\n\
+               try { DOMException(); }\n\
+               catch (error) { constructorRequiresNew = error instanceof TypeError; }\n\
+               const defaultException = new DOMException(undefined, undefined);\n\
+               const namedException = new DOMException('custom', 'SyntaxError');\n\
+               const prototypeDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 DOMException, 'prototype');\n\
+               const syntaxConstantDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 DOMException, 'SYNTAX_ERR');\n\
+               const nameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 DOMException.prototype, 'name');\n\
+               let getterRejectsWrongBrand = false;\n\
+               try { nameDescriptor.get.call({}); }\n\
+               catch (error) { getterRejectsWrongBrand = error instanceof TypeError; }\n\
+               globalThis.querySelectorBindingProof =\n\
+                 documentDescriptor && documentDescriptor.value.name === 'querySelector' &&\n\
+                 documentDescriptor.value.length === 1 && documentDescriptor.writable &&\n\
+                 documentDescriptor.enumerable && documentDescriptor.configurable &&\n\
+                 elementDescriptor && elementDescriptor.value.name === 'querySelector' &&\n\
+                 elementDescriptor.value.length === 1 && elementDescriptor.writable &&\n\
+                 elementDescriptor.enumerable && elementDescriptor.configurable &&\n\
+                 !Object.hasOwn(document, 'querySelector') &&\n\
+                 !Object.hasOwn(target, 'querySelector') && documentWrongBrand &&\n\
+                 !documentQueryWrongBrandStringified && documentConversion &&\n\
+                 documentSymbol && documentMissing && elementWrongBrand &&\n\
+                 !elementQueryWrongBrandStringified && elementConversion &&\n\
+                 elementSymbol && elementMissing && syntaxChecks.every(Boolean) &&\n\
+                 document.querySelector('#target') === target &&\n\
+                 document.getElementById('target') === target && target.queryMarker === 47 &&\n\
+                 document.querySelector('missing') === null &&\n\
+                 document.querySelector(undefined) === null &&\n\
+                 document.querySelector(null) === null &&\n\
+                 target.querySelector('span') === target.firstElementChild &&\n\
+                 target.querySelector('#last-child') === target.lastElementChild &&\n\
+                 target.querySelector('missing') === null &&\n\
+                 typeof DOMException === 'function' && DOMException.name === 'DOMException' &&\n\
+                 DOMException.length === 0 && DOMException.prototype.constructor === DOMException &&\n\
+                 Object.getPrototypeOf(DOMException.prototype) === Error.prototype &&\n\
+                 prototypeDescriptor && !prototypeDescriptor.writable &&\n\
+                 !prototypeDescriptor.enumerable && !prototypeDescriptor.configurable &&\n\
+                 syntaxConstantDescriptor && !syntaxConstantDescriptor.writable &&\n\
+                 syntaxConstantDescriptor.enumerable && !syntaxConstantDescriptor.configurable &&\n\
+                 nameDescriptor && nameDescriptor.get.name === 'get name' &&\n\
+                 nameDescriptor.get.length === 0 && nameDescriptor.set === undefined &&\n\
+                 nameDescriptor.enumerable && nameDescriptor.configurable &&\n\
+                 getterRejectsWrongBrand && constructorRequiresNew &&\n\
+                 defaultException instanceof DOMException && defaultException instanceof Error &&\n\
+                 defaultException.name === 'Error' && defaultException.message === '' &&\n\
+                 defaultException.code === 0 && String(defaultException) === 'Error' &&\n\
+                 namedException.name === 'SyntaxError' && namedException.message === 'custom' &&\n\
+                 namedException.code === 12 && String(namedException) === 'SyntaxError: custom' &&\n\
+                 new DOMException('', 'DOMStringSizeError').code === 0 &&\n\
+                 new DOMException('', 'NoDataAllowedError').code === 0 &&\n\
+                 new DOMException('', 'ValidationError').code === 0 &&\n\
+                 DOMException.DOMSTRING_SIZE_ERR === 2 &&\n\
+                 DOMException.NO_DATA_ALLOWED_ERR === 6 && DOMException.VALIDATION_ERR === 16;\n\
+             })();",
+            "query-selector-binding.js",
+            1,
+        ));
+        let mut query_host_context_token = 0_u8;
+        // SAFETY: The token remains live for this synchronous probe.
+        let query_outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                query_script,
+                (&mut query_host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(query_outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "querySelectorBindingProof")
+                .unwrap()
+        );
+
         // The point of the wrapper cache: the same DOM object read twice must
         // be the same JavaScript object, not merely an equal one.
         assert!(
@@ -3775,7 +4119,8 @@ mod tests {
         assert_eq!(
             &*get_element_by_id_calls.borrow(),
             &[
-                "target", "target", "target", "missing", "", "a\0b", "\u{fffd}",
+                "target", "target", "target", "target", "target", "target", "missing", "", "a\0b",
+                "\u{fffd}",
             ]
         );
         assert!(
@@ -4217,6 +4562,7 @@ mod tests {
         let native = Box::into_raw(Box::new(host)).cast::<c_void>();
         let vtable = DocumentHostVTable::for_type::<DocumentHostProbe>();
         let callback = vtable.get_element_by_id.unwrap();
+        let query_callback = vtable.query_selector.unwrap();
         let mut host_context = 0_u8;
         let host_context = (&mut host_context as *mut u8).cast::<c_void>();
         let mut output = RawInterfaceValue {
@@ -4270,10 +4616,171 @@ mod tests {
                 1,
             );
             assert_eq!(output.is_null, 1);
+
+            let mut query_output = RawQuerySelectorOutcome {
+                status: u32::MAX,
+                value: RawInterfaceValue {
+                    is_null: 0,
+                    key: std::ptr::null(),
+                    native: std::ptr::null_mut(),
+                },
+            };
+            assert_eq!(
+                query_callback(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut query_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                query_callback(native, host_context, std::ptr::null(), 1, &mut query_output,),
+                0,
+            );
+            assert_eq!(
+                query_callback(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut query_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                query_callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                0,
+            );
+            let missing = b"missing";
+            assert_eq!(
+                query_callback(
+                    native,
+                    host_context,
+                    missing.as_ptr(),
+                    missing.len(),
+                    &mut query_output,
+                ),
+                1,
+            );
+            assert_eq!(query_output.status, QUERY_SELECTOR_RETURNED);
+            assert_eq!(query_output.value.is_null, 1);
+            assert_eq!(
+                query_callback(native, host_context, std::ptr::null(), 0, &mut query_output,),
+                1,
+            );
+            assert_eq!(query_output.status, QUERY_SELECTOR_SYNTAX_ERROR);
+            assert_eq!(query_output.value.is_null, 1);
             vtable.drop.unwrap()(native);
         }
         assert_eq!(&*calls.borrow(), &[""]);
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn query_selector_rejects_host_failures_and_malformed_owned_outcomes() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let element_drops = Rc::new(Cell::new(0));
+        let mut host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        host.element_drops = Rc::clone(&element_drops);
+
+        let mut vtable = DocumentHostVTable::for_type::<DocumentHostProbe>();
+        vtable.query_selector = Some(adversarial_document_query_selector);
+        let native = Box::into_raw(Box::new(host)).cast::<c_void>();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: native is one live Box<DocumentHostProbe>, the complete
+        // vtable uses that exact type, and C++ copies it on a successful
+        // ownership transfer.
+        let installed = unsafe {
+            servo_v8_realm_install_document_host(
+                runtime.raw.as_ptr(),
+                realm,
+                native,
+                &vtable,
+                &mut error,
+            )
+        };
+        if installed == 0 {
+            // SAFETY: A failed install does not consume native.
+            drop(unsafe { Box::from_raw(native.cast::<DocumentHostProbe>()) });
+            panic!(
+                "custom Document host install failed: {:?}",
+                error_from(&storage, &error)
+            );
+        }
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               const malformed = [\n\
+                 'invalid-status', 'syntax-with-value', 'null-with-value',\n\
+                 'native-without-key', 'key-without-native'\n\
+               ];\n\
+               const malformedRejected = malformed.every(selector => {\n\
+                 try { document.querySelector(selector); return false; }\n\
+                 catch (error) { return error instanceof TypeError; }\n\
+               });\n\
+               let hostFailureRejected = false;\n\
+               try { document.querySelector('host-failure'); }\n\
+               catch (error) { hostFailureRejected = error instanceof TypeError; }\n\
+               let callbackFailureRejected = false;\n\
+               try { document.querySelector('callback-failure'); }\n\
+               catch (error) { callbackFailureRejected = error instanceof TypeError; }\n\
+               const target = document.querySelector('valid');\n\
+               globalThis.adversarialQuerySelectorProof =\n\
+                 malformedRejected && hostFailureRejected && callbackFailureRejected &&\n\
+                 target && target.id === 'target' &&\n\
+                 document.querySelector('missing') === null;\n\
+             })();",
+            "query-selector-adversarial.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token remains live for this synchronous probe.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "adversarialQuerySelectorProof")
+                .unwrap()
+        );
+        // Four malformed outcomes carried speculative native hosts. The
+        // bridge must reject and drop all four without touching the one valid
+        // wrapper retained by the realm.
+        assert_eq!(element_drops.get(), 4);
+        assert_eq!(document_drops.get(), 0);
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(element_drops.get(), 5);
+        assert_eq!(document_drops.get(), 1);
     }
 
     #[test]

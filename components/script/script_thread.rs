@@ -64,9 +64,9 @@ use js::glue::GetWindowProxyClass;
 use js::jsapi::{GCReason, JSContext as UnsafeJSContext};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
-#[cfg(feature = "v8-shadow")]
-use js::rust::wrappers2::JS_IsExceptionPending;
 use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
+#[cfg(feature = "v8-shadow")]
+use js::rust::wrappers2::{JS_ClearPendingException, JS_IsExceptionPending};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
@@ -140,7 +140,7 @@ use crate::dom::bindings::conversions::{
 #[cfg(feature = "v8-classic-script-authoritative")]
 use crate::dom::bindings::error::ErrorInfo;
 #[cfg(feature = "v8-shadow")]
-use crate::dom::bindings::error::throw_dom_exception;
+use crate::dom::bindings::error::{Error, throw_dom_exception};
 use crate::dom::bindings::inheritance::Castable;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::refcounted::Trusted;
@@ -405,6 +405,39 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
     fn child_element_count(&self) -> u32 {
         self.element.root().ChildElementCount()
     }
+
+    unsafe fn query_selector(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> servo_v8::QuerySelectorResult {
+        if host_context.is_null() {
+            return servo_v8::QuerySelectorResult::HostFailure;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context
+        // only for this synchronous call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let result = self
+            .element
+            .root()
+            .QuerySelector(cx, DOMString::from(selectors));
+        // The current scope-match path never sets a SpiderMonkey exception,
+        // but future error branches must not poison the context while V8 owns
+        // page execution. Surface an internal V8-side failure and clear it.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::QuerySelectorResult::HostFailure;
+        }
+        match result {
+            Ok(element) => servo_v8::QuerySelectorResult::Match(
+                element.as_deref().map(v8_element_interface_handle),
+            ),
+            // Scope-match's only error branch is selector parse failure. Keep
+            // it as POD so V8, not SpiderMonkey, owns the thrown exception.
+            Err(Error::Syntax(_)) => servo_v8::QuerySelectorResult::SyntaxError,
+            Err(_) => servo_v8::QuerySelectorResult::HostFailure,
+        }
+    }
 }
 
 #[cfg(feature = "v8-shadow")]
@@ -569,6 +602,34 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             .root()
             .GetElementById(cx, DOMString::from(element_id))?;
         Some(v8_element_interface_handle(&element))
+    }
+
+    unsafe fn query_selector(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> servo_v8::QuerySelectorResult {
+        if host_context.is_null() {
+            return servo_v8::QuerySelectorResult::HostFailure;
+        }
+        // SAFETY: The authoritative run API lends its live owner-thread
+        // context for this synchronous production DOM call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let result = self
+            .document
+            .root()
+            .QuerySelector(cx, DOMString::from(selectors));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::QuerySelectorResult::HostFailure;
+        }
+        match result {
+            Ok(element) => servo_v8::QuerySelectorResult::Match(
+                element.as_deref().map(v8_element_interface_handle),
+            ),
+            Err(Error::Syntax(_)) => servo_v8::QuerySelectorResult::SyntaxError,
+            Err(_) => servo_v8::QuerySelectorResult::HostFailure,
+        }
     }
 
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {

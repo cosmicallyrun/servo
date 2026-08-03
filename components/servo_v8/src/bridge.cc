@@ -327,6 +327,8 @@ struct ServoV8RealmState {
   v8::Global<v8::ObjectTemplate> element_template;
   v8::Global<v8::Object> element_prototype;
   v8::Global<v8::Object> node_prototype;
+  v8::Global<v8::Function> dom_exception_constructor;
+  v8::Global<v8::Object> dom_exception_prototype;
   ServoV8DocumentHostState document_host;
   ServoV8TimerHostState timer_host;
   ServoV8ConsoleHostState console_host;
@@ -701,11 +703,349 @@ void DropUnownedElementHost(ServoV8Runtime* runtime,
   drop(native);
 }
 
+v8::Local<v8::Private> DomExceptionBrandKey(v8::Isolate* isolate) {
+  return v8::Private::ForApi(isolate, V8String(isolate, "Servo.DOMException.brand"));
+}
+
+v8::Local<v8::Private> DomExceptionMessageKey(v8::Isolate* isolate) {
+  return v8::Private::ForApi(isolate,
+                             V8String(isolate, "Servo.DOMException.message"));
+}
+
+v8::Local<v8::Private> DomExceptionNameKey(v8::Isolate* isolate) {
+  return v8::Private::ForApi(isolate, V8String(isolate, "Servo.DOMException.name"));
+}
+
+v8::Local<v8::Private> DomExceptionCodeKey(v8::Isolate* isolate) {
+  return v8::Private::ForApi(isolate, V8String(isolate, "Servo.DOMException.code"));
+}
+
+uint16_t DomExceptionCode(v8::Isolate* isolate,
+                          v8::Local<v8::String> name) {
+  struct LegacyCode {
+    const char* name;
+    uint16_t code;
+  };
+  const LegacyCode codes[] = {
+      {"IndexSizeError", 1},
+      {"HierarchyRequestError", 3},
+      {"WrongDocumentError", 4},
+      {"InvalidCharacterError", 5},
+      {"NoModificationAllowedError", 7},
+      {"NotFoundError", 8},
+      {"NotSupportedError", 9},
+      {"InUseAttributeError", 10},
+      {"InvalidStateError", 11},
+      {"SyntaxError", 12},
+      {"InvalidModificationError", 13},
+      {"NamespaceError", 14},
+      {"InvalidAccessError", 15},
+      {"TypeMismatchError", 17},
+      {"SecurityError", 18},
+      {"NetworkError", 19},
+      {"AbortError", 20},
+      {"URLMismatchError", 21},
+      {"QuotaExceededError", 22},
+      {"TimeoutError", 23},
+      {"InvalidNodeTypeError", 24},
+      {"DataCloneError", 25},
+  };
+  for (const auto& entry : codes) {
+    if (name->StrictEquals(V8String(isolate, entry.name))) return entry.code;
+  }
+  return 0;
+}
+
+bool InitializeDomException(v8::Isolate* isolate,
+                            v8::Local<v8::Context> context,
+                            v8::Local<v8::Object> object,
+                            v8::Local<v8::String> message,
+                            v8::Local<v8::String> name) {
+  return object
+             ->SetPrivate(context, DomExceptionBrandKey(isolate),
+                          v8::True(isolate))
+             .FromMaybe(false) &&
+         object
+             ->SetPrivate(context, DomExceptionMessageKey(isolate), message)
+             .FromMaybe(false) &&
+         object->SetPrivate(context, DomExceptionNameKey(isolate), name)
+             .FromMaybe(false) &&
+         object
+             ->SetPrivate(context, DomExceptionCodeKey(isolate),
+                          v8::Integer::NewFromUnsigned(
+                              isolate, DomExceptionCode(isolate, name)))
+             .FromMaybe(false);
+}
+
+bool IsDomException(v8::Isolate* isolate,
+                    v8::Local<v8::Context> context,
+                    v8::Local<v8::Object> object) {
+  v8::Local<v8::Value> brand;
+  return object->GetPrivate(context, DomExceptionBrandKey(isolate))
+             .ToLocal(&brand) &&
+         brand->IsTrue();
+}
+
+using DomExceptionKey = v8::Local<v8::Private> (*)(v8::Isolate* isolate);
+
+void DomExceptionGet(const v8::FunctionCallbackInfo<v8::Value>& info,
+                     DomExceptionKey key) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  if (!IsDomException(isolate, context, info.This())) {
+    ThrowTypeError(isolate, "invalid DOMException host state");
+    return;
+  }
+  v8::Local<v8::Value> value;
+  if (info.This()->GetPrivate(context, key(isolate)).ToLocal(&value)) {
+    info.GetReturnValue().Set(value);
+  }
+}
+
+void DomExceptionGetCode(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DomExceptionGet(info, &DomExceptionCodeKey);
+}
+
+void DomExceptionGetName(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DomExceptionGet(info, &DomExceptionNameKey);
+}
+
+void DomExceptionGetMessage(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DomExceptionGet(info, &DomExceptionMessageKey);
+}
+
+void DomExceptionConstructor(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  if (!info.IsConstructCall()) {
+    ThrowTypeError(isolate, "DOMException constructor: 'new' is required");
+    return;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::String> message = V8String(isolate, "");
+  v8::Local<v8::String> name = V8String(isolate, "Error");
+  if (info.Length() > 0 && !info[0]->IsUndefined() &&
+      !info[0]->ToString(context).ToLocal(&message)) {
+    return;
+  }
+  if (info.Length() > 1 && !info[1]->IsUndefined() &&
+      !info[1]->ToString(context).ToLocal(&name)) {
+    return;
+  }
+  v8::Local<v8::Object> exception;
+  if (!v8::Exception::Error(message)->ToObject(context).ToLocal(&exception) ||
+      !exception->Delete(context, V8String(isolate, "message")).FromMaybe(false) ||
+      !exception->Delete(context, V8String(isolate, "stack")).FromMaybe(false) ||
+      !exception->SetPrototype(context, info.This()->GetPrototype())
+           .FromMaybe(false) ||
+      !InitializeDomException(isolate, context, exception, message, name)) {
+    return;
+  }
+  info.GetReturnValue().Set(exception);
+}
+
+bool InstallDomException(ServoV8RealmState* realm,
+                         v8::Local<v8::Context> context,
+                         v8::Local<v8::Object> global) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::Local<v8::Function> constructor;
+  if (!v8::Function::New(context, DomExceptionConstructor, {}, 0,
+                         v8::ConstructorBehavior::kAllow)
+           .ToLocal(&constructor)) {
+    return false;
+  }
+  constructor->SetName(V8String(isolate, "DOMException"));
+  v8::Local<v8::Value> prototype_value;
+  if (!constructor->Get(context, V8String(isolate, "prototype"))
+           .ToLocal(&prototype_value) ||
+      !prototype_value->IsObject()) {
+    return false;
+  }
+  v8::Local<v8::Object> prototype = prototype_value.As<v8::Object>();
+  const v8::PropertyAttribute immutable_prototype =
+      static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontEnum |
+                                         v8::DontDelete);
+  if (!constructor
+           ->DefineOwnProperty(context, V8String(isolate, "prototype"),
+                               prototype, immutable_prototype)
+           .FromMaybe(false)) {
+    return false;
+  }
+
+  v8::Local<v8::Value> error_value;
+  v8::Local<v8::Value> error_prototype;
+  if (!global->Get(context, V8String(isolate, "Error")).ToLocal(&error_value) ||
+      !error_value->IsFunction() ||
+      !error_value.As<v8::Function>()
+           ->Get(context, V8String(isolate, "prototype"))
+           .ToLocal(&error_prototype) ||
+      !prototype->SetPrototype(context, error_prototype).FromMaybe(false)) {
+    return false;
+  }
+
+  struct DomExceptionAccessor {
+    const char* name;
+    v8::FunctionCallback callback;
+  };
+  const DomExceptionAccessor accessors[] = {
+      {"code", &DomExceptionGetCode},
+      {"name", &DomExceptionGetName},
+      {"message", &DomExceptionGetMessage},
+  };
+  for (const auto& accessor : accessors) {
+    v8::Local<v8::Function> getter;
+    if (!v8::Function::New(context, accessor.callback, {}, 0,
+                           v8::ConstructorBehavior::kThrow,
+                           v8::SideEffectType::kHasNoSideEffect)
+             .ToLocal(&getter)) {
+      return false;
+    }
+    getter->SetName(
+        V8String(isolate, (std::string("get ") + accessor.name).c_str()));
+    prototype->SetAccessorProperty(V8String(isolate, accessor.name), getter,
+                                   {}, v8::None);
+  }
+
+  struct DomExceptionConstant {
+    const char* name;
+    uint16_t code;
+  };
+  const DomExceptionConstant constants[] = {
+      {"INDEX_SIZE_ERR", 1},
+      {"DOMSTRING_SIZE_ERR", 2},
+      {"HIERARCHY_REQUEST_ERR", 3},
+      {"WRONG_DOCUMENT_ERR", 4},
+      {"INVALID_CHARACTER_ERR", 5},
+      {"NO_DATA_ALLOWED_ERR", 6},
+      {"NO_MODIFICATION_ALLOWED_ERR", 7},
+      {"NOT_FOUND_ERR", 8},
+      {"NOT_SUPPORTED_ERR", 9},
+      {"INUSE_ATTRIBUTE_ERR", 10},
+      {"INVALID_STATE_ERR", 11},
+      {"SYNTAX_ERR", 12},
+      {"INVALID_MODIFICATION_ERR", 13},
+      {"NAMESPACE_ERR", 14},
+      {"INVALID_ACCESS_ERR", 15},
+      {"VALIDATION_ERR", 16},
+      {"TYPE_MISMATCH_ERR", 17},
+      {"SECURITY_ERR", 18},
+      {"NETWORK_ERR", 19},
+      {"ABORT_ERR", 20},
+      {"URL_MISMATCH_ERR", 21},
+      {"QUOTA_EXCEEDED_ERR", 22},
+      {"TIMEOUT_ERR", 23},
+      {"INVALID_NODE_TYPE_ERR", 24},
+      {"DATA_CLONE_ERR", 25},
+  };
+  const v8::PropertyAttribute constant_attributes =
+      static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontDelete);
+  for (const auto& constant : constants) {
+    v8::Local<v8::String> name = V8String(isolate, constant.name);
+    v8::Local<v8::Integer> value =
+        v8::Integer::NewFromUnsigned(isolate, constant.code);
+    if (!constructor
+             ->DefineOwnProperty(context, name, value, constant_attributes)
+             .FromMaybe(false) ||
+        !prototype
+             ->DefineOwnProperty(context, name, value, constant_attributes)
+             .FromMaybe(false)) {
+      return false;
+    }
+  }
+  const v8::PropertyAttribute tag_attributes =
+      static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontEnum);
+  if (!prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "DOMException"),
+                               tag_attributes)
+           .FromMaybe(false) ||
+      !global
+           ->DefineOwnProperty(context, V8String(isolate, "DOMException"),
+                               constructor, v8::DontEnum)
+           .FromMaybe(false)) {
+    return false;
+  }
+  realm->dom_exception_constructor.Reset(isolate, constructor);
+  realm->dom_exception_prototype.Reset(isolate, prototype);
+  return true;
+}
+
+void ThrowSyntaxErrorDomException(ServoV8RealmState* realm,
+                                  v8::Local<v8::Context> context) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  if (realm->dom_exception_prototype.IsEmpty()) {
+    ThrowTypeError(isolate, "DOMException is not installed in this realm");
+    return;
+  }
+  v8::Local<v8::String> message =
+      V8String(isolate, "The string did not match the expected pattern.");
+  v8::Local<v8::Object> exception;
+  if (!v8::Exception::Error(message)->ToObject(context).ToLocal(&exception) ||
+      !exception->Delete(context, V8String(isolate, "message")).FromMaybe(false) ||
+      !exception->Delete(context, V8String(isolate, "stack")).FromMaybe(false) ||
+      !exception
+           ->SetPrototype(context,
+                          realm->dom_exception_prototype.Get(isolate))
+           .FromMaybe(false) ||
+      !InitializeDomException(
+          isolate, context, exception, message,
+          V8String(isolate, "SyntaxError"))) {
+    return;
+  }
+  isolate->ThrowException(exception);
+}
+
 v8::Local<v8::Object> WrapperForInterfaceValue(
     ServoV8RealmState* realm,
     v8::Isolate* isolate,
     v8::Local<v8::Context> context,
     const ServoV8InterfaceValue& value);
+
+void ReturnQuerySelectorOutcome(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    const ServoV8QuerySelectorOutcome& outcome,
+    const char* member_name,
+    v8::ReturnValue<v8::Value> return_value) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  const ServoV8InterfaceValue& value = outcome.value;
+  const bool malformed_value =
+      value.is_null > 1 ||
+      (value.is_null != 0 && (value.key || value.native)) ||
+      (value.is_null == 0 && (!value.key || !value.native));
+  const bool error_has_value =
+      outcome.status != SERVO_V8_QUERY_SELECTOR_RETURNED &&
+      (value.is_null != 1 || value.key || value.native);
+  if (outcome.status > SERVO_V8_QUERY_SELECTOR_HOST_FAILURE ||
+      malformed_value || error_has_value) {
+    DropUnownedElementHost(realm->runtime, value.native,
+                           realm->runtime->element_host_vtable.drop);
+    ThrowTypeError(isolate, "invalid querySelector outcome");
+    return;
+  }
+  if (outcome.status == SERVO_V8_QUERY_SELECTOR_SYNTAX_ERROR) {
+    ThrowSyntaxErrorDomException(realm, context);
+    return;
+  }
+  if (outcome.status == SERVO_V8_QUERY_SELECTOR_HOST_FAILURE) {
+    ThrowTypeError(isolate, member_name);
+    return;
+  }
+  if (value.is_null != 0) {
+    return_value.SetNull();
+    return;
+  }
+  v8::Local<v8::Object> wrapper =
+      WrapperForInterfaceValue(realm, isolate, context, value);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(isolate, "querySelector wrapper could not be created");
+    return;
+  }
+  return_value.Set(wrapper);
+}
 
 #include "servo_v8_generated.inc"
 #include "servo_v8_document_host_generated.inc"
@@ -1014,6 +1354,37 @@ void ElementHostHasAttribute(
     }
   }
   info.GetReturnValue().Set(result != 0);
+}
+
+void ElementHostQuerySelector(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  v8::Local<v8::String> selectors_string;
+  if (!ElementHostOperationName(
+          info, "Element.querySelector requires 1 argument", &realm, &native,
+          &selectors_string)) {
+    return;
+  }
+  v8::String::Utf8Value selectors(isolate, selectors_string);
+  if (!*selectors && selectors.length() != 0) return;
+  ServoV8QuerySelectorOutcome outcome{};
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.query_selector(
+            native, realm->document_host.active_host_context,
+            reinterpret_cast<const uint8_t*>(*selectors), selectors.length(),
+            &outcome)) {
+      DropUnownedElementHost(realm->runtime, outcome.value.native,
+                             realm->runtime->element_host_vtable.drop);
+      ThrowTypeError(isolate, "Element.querySelector host callback failed");
+      return;
+    }
+  }
+  ReturnQuerySelectorOutcome(realm, isolate->GetCurrentContext(), outcome,
+                             "Element.querySelector host callback failed",
+                             info.GetReturnValue());
 }
 
 using ElementInterfaceGetter =
@@ -1343,6 +1714,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
        v8::SideEffectType::kHasNoSideEffect},
       {"hasAttribute", &ElementHostHasAttribute, 1,
        v8::SideEffectType::kHasSideEffect},
+      {"querySelector", &ElementHostQuerySelector, 1,
+       v8::SideEffectType::kHasNoSideEffect},
   };
   for (const auto& operation : operations) {
     v8::Local<v8::String> name = V8String(isolate, operation.name);
@@ -1814,6 +2187,8 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->element_template.Reset();
   realm->element_prototype.Reset();
   realm->node_prototype.Reset();
+  realm->dom_exception_constructor.Reset();
+  realm->dom_exception_prototype.Reset();
   realm->document.Reset();
   realm->context.Reset();
   ResetConsoleHost(&realm->console_host);
@@ -2088,6 +2463,13 @@ extern "C" int32_t servo_v8_realm_create(
     return 0;
   }
   if (!InstallConsoleGlobal(realm.get(), context, global)) {
+    context->SetAlignedPointerInEmbedderData(
+        kServoRealmStateEmbedderSlot, nullptr,
+        kServoRealmStateEmbedderTag);
+    WriteError(error, TryCatchMessage(isolate, try_catch));
+    return 0;
+  }
+  if (!InstallDomException(realm.get(), context, global)) {
     context->SetAlignedPointerInEmbedderData(
         kServoRealmStateEmbedderSlot, nullptr,
         kServoRealmStateEmbedderTag);
@@ -2654,7 +3036,8 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->has_child_nodes ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
-      !vtable->get_child_element_count || !vtable->drop) {
+      !vtable->get_child_element_count || !vtable->query_selector ||
+      !vtable->drop) {
     WriteError(error, "Element host vtable is incomplete");
     return 0;
   }

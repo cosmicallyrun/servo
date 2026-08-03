@@ -680,6 +680,58 @@ class SyntheticSelectionTests(unittest.TestCase):
             "`Document.getElementById` argument `elementId` must use non-nullable `DOMString`, got `USVString`",
         )
 
+    def assert_query_selector_rejected(
+        self, declaration: str, expected: str
+    ) -> None:
+        parser_results = self.parse(
+            {
+                "ParentNode.webidl": f"""
+                    interface Element {{}};
+                    interface Document {{ {declaration} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_pure_throws_domstring_to_nullable_interface_operation(
+                parser_results,
+                production_webidl.DOCUMENT_QUERY_SELECTOR,
+                "Element",
+            )
+
+    def test_selects_exact_throwing_query_selector(self) -> None:
+        parser_results = self.parse(
+            {
+                "ParentNode.webidl": """
+                    interface Element {};
+                    interface Document {
+                      [Pure, Throws] Element? querySelector(DOMString selectors);
+                    };
+                """,
+            }
+        )
+        method = production_webidl.select_pure_throws_domstring_to_nullable_interface_operation(
+            parser_results,
+            production_webidl.DOCUMENT_QUERY_SELECTOR,
+            "Element",
+        )
+        self.assertTrue(method.getExtendedAttribute("Pure"))
+        self.assertTrue(method.getExtendedAttribute("Throws"))
+
+    def test_rejects_query_selector_without_throws(self) -> None:
+        self.assert_query_selector_rejected(
+            "[Pure] Element? querySelector(DOMString selectors);",
+            "`Document.querySelector` must carry exactly ['Pure', 'Throws'], got ['Pure']",
+        )
+
+    def test_rejects_query_selector_argument_drift(self) -> None:
+        self.assert_query_selector_rejected(
+            "[Pure, Throws] Element? querySelector(optional DOMString selectors);",
+            "`Document.querySelector` argument `selectors` must be required and non-variadic",
+        )
+
     def test_rejects_changed_ready_state_enum_values(self) -> None:
         parser_results = self.parse(
             {

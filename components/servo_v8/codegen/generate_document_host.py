@@ -1340,6 +1340,212 @@ def _pure_domstring_to_nullable_interface_cpp_vtable_terms(
     return [f"vtable.{_rust_member_name(member.attribute)}"]
 
 
+# A `[Throws]` selector cannot reuse the ordinary nullable-interface outcome:
+# JavaScript null and a DOMException are distinct results. The status is POD
+# and the only specified Servo failure for scope-match is SyntaxError, so no
+# SpiderMonkey exception object or pending-exception state crosses the ABI.
+_QUERY_SELECTOR_C_TYPE: Block = [
+    "enum ServoV8QuerySelectorStatus {",
+    "  SERVO_V8_QUERY_SELECTOR_RETURNED = 0,",
+    "  SERVO_V8_QUERY_SELECTOR_SYNTAX_ERROR = 1,",
+    "  SERVO_V8_QUERY_SELECTOR_HOST_FAILURE = 2,",
+    "};",
+    "",
+    "typedef struct ServoV8QuerySelectorOutcome {",
+    "  uint32_t status;",
+    "  ServoV8InterfaceValue value;",
+    "} ServoV8QuerySelectorOutcome;",
+]
+
+_QUERY_SELECTOR_RUST_TYPE: Block = [
+    "const QUERY_SELECTOR_RETURNED: u32 = 0;",
+    "const QUERY_SELECTOR_SYNTAX_ERROR: u32 = 1;",
+    "const QUERY_SELECTOR_HOST_FAILURE: u32 = 2;",
+    "",
+    "#[repr(C)]",
+    "pub struct RawQuerySelectorOutcome {",
+    "    pub status: u32,",
+    "    pub value: RawInterfaceValue,",
+    "}",
+]
+
+
+def _pure_throws_domstring_to_nullable_interface_header_slots(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    return [
+        f"  uint8_t (*{name})(void* native, void* host_context,",
+        f"{C_SIGNATURE_INDENT}const uint8_t* {argument},",
+        f"{C_SIGNATURE_INDENT}size_t {argument}_length,",
+        f"{C_SIGNATURE_INDENT}ServoV8QuerySelectorOutcome* output);",
+    ]
+
+
+def _pure_throws_domstring_to_nullable_interface_rust_trait_members(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    return [
+        "    /// Returns a match, Servo's selector SyntaxError, or an internal failure.",
+        "    /// `host_context` is borrowed only for this synchronous call.",
+        f"    unsafe fn {name}(",
+        "        &self,",
+        "        host_context: *mut c_void,",
+        f"        {argument}: &str,",
+        "    ) -> QuerySelectorResult;",
+    ]
+
+
+def _pure_throws_domstring_to_nullable_interface_rust_vtable_fields(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"    pub {name}: Option<",
+        "        unsafe extern \"C\" fn(",
+        "            *mut c_void,",
+        "            *mut c_void,",
+        "            *const u8,",
+        "            usize,",
+        "            *mut RawQuerySelectorOutcome,",
+        "        ) -> u8,",
+        "    >,",
+    ]
+
+
+def _pure_throws_domstring_to_nullable_interface_rust_thunks(
+    member: Member,
+) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{name}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    host_context: *mut c_void,",
+            f"    {argument}: *const u8,",
+            f"    {argument}_length: usize,",
+            "    output: *mut RawQuerySelectorOutcome,",
+            ") -> u8 {",
+            "    if native.is_null() || host_context.is_null() || output.is_null() ||",
+            f"        ({argument}.is_null() && {argument}_length != 0)",
+            "    {",
+            "        return 0;",
+            "    }",
+            f"    let {argument}_bytes = if {argument}_length == 0 {{",
+            "        &[]",
+            "    } else {",
+            "        // SAFETY: The ABI contract lends this byte range for the callback.",
+            f"        unsafe {{ std::slice::from_raw_parts({argument}, {argument}_length) }}",
+            "    };",
+            f"    let Ok({argument}) = std::str::from_utf8({argument}_bytes) else {{",
+            "        return 0;",
+            "    };",
+            "    // SAFETY: The vtable contract supplies a live Box<T> and lends the",
+            "    // non-null host context only for this callback.",
+            "    let result = unsafe {",
+            f"        (&*native.cast::<T>()).{name}(host_context, {argument})",
+            "    };",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe { *output = raw_query_selector_outcome(result) };",
+            "    1",
+            "}",
+        ],
+    )
+
+
+def _pure_throws_domstring_to_nullable_interface_rust_vtable_init(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [f"            {name}: Some(document_host_{name}::<T>),"]
+
+
+def _pure_throws_domstring_to_nullable_interface_cpp_bodies(
+    member: Member,
+) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    callback = _cpp_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostCall{callback}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->active_host_context ||",
+            f"      !state->vtable.{name}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->element_template.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "Element host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  if (info.Length() < 1) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} requires one argument");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            f"  v8::Local<v8::String> {argument}_value;",
+            f"  if (!info[0]->ToString(context).ToLocal(&{argument}_value)) {{",
+            "    return;",
+            "  }",
+            f"  v8::String::Utf8Value {argument}_utf8(isolate, {argument}_value);",
+            f"  if (!*{argument}_utf8 && {argument}_utf8.length() != 0) {{",
+            f'    ThrowTypeError(isolate, "{qualified_name} argument conversion failed");',
+            "    return;",
+            "  }",
+            "  ServoV8QuerySelectorOutcome outcome{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{name}(",
+            "                    state->native, state->active_host_context,",
+            f"                    reinterpret_cast<const uint8_t*>(*{argument}_utf8),",
+            f"                    static_cast<size_t>({argument}_utf8.length()),",
+            "                    &outcome) != 0;",
+            "  }",
+            "  if (!succeeded) {",
+            "    DropUnownedElementHost(state->runtime, outcome.value.native,",
+            "                           state->runtime->element_host_vtable.drop);",
+            f'    ThrowTypeError(isolate, "{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            f'  ReturnQuerySelectorOutcome(realm, context, outcome, "{qualified_name}",',
+            "                             info.GetReturnValue());",
+            "}",
+        ],
+    )
+
+
+def _pure_throws_domstring_to_nullable_interface_cpp_vtable_terms(
+    member: Member,
+) -> list[str]:
+    return [f"vtable.{_rust_member_name(member.attribute)}"]
+
+
 # The owned UTF-8 transfer is shared by every DOMString member: one C type, one
 # Rust type, one Rust owner drop, and one C++ scope guard, emitted once.
 _OWNED_UTF8_C_TYPE: Block = [
@@ -1518,6 +1724,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(),
         cpp_bodies=_pure_domstring_to_nullable_interface_cpp_bodies,
         cpp_vtable_terms=_pure_domstring_to_nullable_interface_cpp_vtable_terms,
+    ),
+    production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE: ShapeEmitter(
+        header_type_blocks=(_QUERY_SELECTOR_C_TYPE,),
+        header_slots=_pure_throws_domstring_to_nullable_interface_header_slots,
+        rust_type_blocks=(_QUERY_SELECTOR_RUST_TYPE,),
+        rust_trait_members=_pure_throws_domstring_to_nullable_interface_rust_trait_members,
+        rust_vtable_fields=_pure_throws_domstring_to_nullable_interface_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_pure_throws_domstring_to_nullable_interface_rust_thunks,
+        rust_vtable_init=_pure_throws_domstring_to_nullable_interface_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_pure_throws_domstring_to_nullable_interface_cpp_bodies,
+        cpp_vtable_terms=_pure_throws_domstring_to_nullable_interface_cpp_vtable_terms,
     ),
 }
 

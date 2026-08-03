@@ -50,6 +50,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_last_element_child)(void* native, ServoV8InterfaceValue* output);",
             "uint32_t (*get_child_element_count)(void* native);",
             "uint8_t (*get_element_by_id)(void* native, void* host_context,",
+            "typedef struct ServoV8QuerySelectorOutcome {",
+            "uint8_t (*query_selector)(void* native, void* host_context,",
             "const uint8_t* element_id,",
             "ServoV8DropCallback drop;",
         )
@@ -78,10 +80,13 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "fn last_element_child(&self) -> Option<InterfaceHandle>;",
             "fn child_element_count(&self) -> u32;",
             "unsafe fn get_element_by_id(",
+            "unsafe fn query_selector(",
+            "pub struct RawQuerySelectorOutcome {",
             "std::slice::from_raw_parts(element_id, element_id_length)",
             "set_bg_color: Some(document_host_set_bg_color::<T>)",
             "set_title: Some(document_host_set_title::<T>)",
             "get_element_by_id: Some(document_host_get_element_by_id::<T>)",
+            "query_selector: Some(document_host_query_selector::<T>)",
         )
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
@@ -107,6 +112,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "DocumentHostGetLastElementChild(",
             "DocumentHostGetChildElementCount(",
             "DocumentHostCallGetElementById(",
+            "DocumentHostCallQuerySelector(",
             "auto* state = UnwrapDocumentHostState(info);",
             "if (info[0]->IsNull()) {",
             "info[0]->ToString(context)",
@@ -152,7 +158,11 @@ class DocumentHostGenerationTests(unittest.TestCase):
             member_name = member.qualified_name.split(".")[1]
             with self.subTest(member=member.qualified_name):
                 slot = generate.snake_case(member_name)
-                if member.shape != production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE:
+                operation_shapes = {
+                    production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
+                }
+                if member.shape not in operation_shapes:
                     slot = f"get_{slot}"
                 self.assertIn(f"(*{slot})", header)
 
@@ -164,7 +174,10 @@ class DocumentHostGenerationTests(unittest.TestCase):
             callback = generate.upper_camel_case(member_name)
             local = generate.snake_case(member_name)
             with self.subTest(member=member.qualified_name):
-                if member.shape == production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE:
+                if member.shape in {
+                    production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
+                }:
                     self.assertIn(f"DocumentHostCall{callback}", output)
                     self.assertIn(f"{local}_method, v8::None", output)
                 else:

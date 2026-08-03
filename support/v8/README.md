@@ -74,7 +74,8 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.visibilityState`, `Document.readyState`, `Document.title`,
 `Node.nodeType`, `Document.documentElement`, `Document.head`, and
 `Document.firstElementChild`, `Document.lastElementChild`,
-`Document.childElementCount`, and `Document.getElementById` declarations in
+`Document.childElementCount`, `Document.getElementById`, and
+`Document.querySelector` declarations in
 Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
 shape, exact returned interface)` records, with the interface field absent for
@@ -94,7 +95,8 @@ its selector pins the exact value set the glue was generated against; a new
 state appearing upstream becomes a build failure rather than an unvalidated
 string.
 
-`Document.documentElement`, `Document.head`, `Document.getElementById`, the
+`Document.documentElement`, `Document.head`, `Document.getElementById`,
+`Document.querySelector`, the
 ParentNode traversal getters, and the Element slice are the members whose value
 or receiver is another DOM object, and they rest on the per-realm wrapper cache
 described in `wrapper-identity-design.md`. Independent Document, id, and child
@@ -125,6 +127,17 @@ after the V8 callback and sidecar borrow unwind;
 C++/Rust reentry barrier turns accidental recursive entry into a deterministic
 failure. Failed installation leaves ownership with Rust, so every host
 transfer is transactional.
+
+`Document.querySelector` and `Element.querySelector` route the production
+ParentNode operation through Servo's actual selector parser. Their typed ABI
+outcome keeps a successful null match distinct from the parser's SyntaxError;
+it never transports a SpiderMonkey exception object or leaves a pending
+SpiderMonkey exception while V8 is executing. Each realm instead retains its
+own V8-native `DOMException` constructor and prototype. Invalid selectors
+throw a V8-owned native error with the production name, message and legacy
+code, while successful interface results reuse the same weak wrapper cache as
+the other Element-returning paths. ABI v25 introduces this outcome and the
+Element host callback.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -393,7 +406,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 24 and remains experimental. The original
+The current exported C ABI is version 25 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume
