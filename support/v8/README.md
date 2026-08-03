@@ -184,6 +184,25 @@ and dynamically inserted, inline or external. Servo still performs the normal
 HTML fetch, CSP, ordering, and settings-stack work, but V8 alone compiles and
 executes that script.
 
+For testing existing HTML without editing every script element, a stricter
+feature selects every classic `<script>` element, whether or not it carries the
+attribute:
+
+```sh
+cargo build -p servoshell --features v8-all-html-classic-scripts-authoritative
+support/v8/run_all_html_classic_scripts_proof.sh
+```
+
+This remains an experiment rather than a default backend. It affects HTML
+classic script elements only; module scripts, event handlers, `javascript:`
+URLs, and worker scripts keep their existing engine paths. Timer source strings
+also retain the explicit directive described below. The focused proof contains
+no selection attribute and covers inline, parser-blocking external, deferred,
+async, and promise-reaction execution with exact V8 host-call counts.
+Its `disabled` second mode is the negative control: after building only
+`v8-classic-script-authoritative`, the same unmarked page must execute on
+SpiderMonkey and report zero V8 host calls.
+
 String timer handlers opt in too, but through a prologue directive rather than
 an attribute, because a timer handler is a bare source string with no element
 to carry one:

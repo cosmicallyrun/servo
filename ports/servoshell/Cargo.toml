@@ -59,6 +59,10 @@ tracing-hitrace = ["tracing", "dep:hitrace"]
 tracing-perfetto = ["tracing", "dep:tracing-perfetto"]
 v8-shadow = ["dep:servo-v8", "servo/v8-shadow"]
 v8-classic-script-authoritative = ["v8-shadow", "servo/v8-classic-script-authoritative"]
+v8-all-html-classic-scripts-authoritative = [
+    "v8-classic-script-authoritative",
+    "servo/v8-all-html-classic-scripts-authoritative",
+]
 v8-document-hidden-diagnostic = ["v8-shadow", "servo/v8-document-hidden-diagnostic"]
 v8-document-hidden-authoritative = [
     "v8-document-hidden-diagnostic",

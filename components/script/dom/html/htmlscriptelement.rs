@@ -786,10 +786,13 @@ impl HTMLScriptElement {
         // Module scripts stay on SpiderMonkey: they are a different creation
         // path entirely, not a kind of classic script.
         #[cfg(feature = "v8-classic-script-authoritative")]
-        let classic_script_engine = if script_type == ScriptType::Classic &&
-            element
-                .get_attribute_string_value(&LocalName::from("data-servo-v8"))
-                .is_some_and(|value| value == "authoritative")
+        let explicitly_v8_authoritative = element
+            .get_attribute_string_value(&LocalName::from("data-servo-v8"))
+            .is_some_and(|value| value == "authoritative");
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        let classic_script_engine = if script_type == ScriptType::Classic
+            && (cfg!(feature = "v8-all-html-classic-scripts-authoritative")
+                || explicitly_v8_authoritative)
         {
             ClassicScriptEngine::V8Authoritative
         } else {
