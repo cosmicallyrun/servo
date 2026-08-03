@@ -261,21 +261,23 @@ reads through a live `Trusted<Document>` so the new URL is picked up rather
 than cached.
 
 The current visible host
-surface is deliberately limited to `window`, `document.hidden`,
+surface is deliberately limited to `window`, the `console` logging slice,
+`document.hidden`,
 `document.bgColor`, `document.URL`, `document.documentURI`, document metadata
 string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
 `document.head`, and `document.getElementById()`, plus `Element.tagName` on the
 elements that return.
 
-V8 installs its own `console` on every context, and with no inspector attached
-its methods silently discard everything. An authoritative script therefore
-logged nothing while the identical script on SpiderMonkey logged normally —
-a silent divergence rather than a visible gap, which is the one failure mode
-this experiment is meant not to have. The realm now deletes it, so
-`console.log` is a `ReferenceError` until a real host binding exists. Anything
-else V8 puts on the global that the web platform also defines deserves the same
-treatment.
+V8's inspector-oriented `console` silently discards output when no inspector
+delegate is attached. The realm replaces it with a native, production-WebIDL-
+pinned slice: `debug`, `error`, `info`, `log`, `trace`, and `warn`. Values are
+rendered with V8's side-effect-free debugging representation while they are
+still local handles; only a level and validated UTF-8 cross the C ABI into a
+realm-owned Servo sink. The sink forwards to the same embedder console channel
+as SpiderMonkey. Other console methods remain absent rather than silently
+doing nothing. Structured DevTools object previews and the remaining console
+state machines (groups, counters, and timers) are future surface.
 
 Servo performs a V8 microtask checkpoint at HTML's "clean up after running
 script" boundary, in `ScriptThread::perform_a_microtask_checkpoint`, before its
@@ -350,6 +352,7 @@ The proof suite uses that same counting argument:
 | `authoritative_timer_proof.html` | a string timer handler runs on V8, handed off across a task boundary |
 | `authoritative_native_timers_proof.html` | V8-native functions, strings, arguments, intervals, cancellation, jobs, and errors use Servo scheduling |
 | `authoritative_cross_engine_timer_clear_proof.html` | SpiderMonkey can cancel and release a V8-owned callable through the shared Servo handle map |
+| `authoritative_console_proof.html` | all six supported console levels reach Servoshell with side-effect-free V8 value formatting |
 | `authoritative_realm_surface_proof.html` | the realm exposes no API it cannot implement |
 | `authoritative_document_open_proof.html` | the realm survives `document.open()` |
 | `authoritative_job_error_proof.html` | a page sees its own failing V8 promise via `onerror` |
@@ -378,7 +381,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 20 and remains experimental. The original
+The current exported C ABI is version 21 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

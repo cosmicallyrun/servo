@@ -49,6 +49,12 @@ WINDOW_OR_WORKER_SET_TIMEOUT = "WindowOrWorkerGlobalScope.setTimeout"
 WINDOW_OR_WORKER_CLEAR_TIMEOUT = "WindowOrWorkerGlobalScope.clearTimeout"
 WINDOW_OR_WORKER_SET_INTERVAL = "WindowOrWorkerGlobalScope.setInterval"
 WINDOW_OR_WORKER_CLEAR_INTERVAL = "WindowOrWorkerGlobalScope.clearInterval"
+CONSOLE_DEBUG = "console.debug"
+CONSOLE_ERROR = "console.error"
+CONSOLE_INFO = "console.info"
+CONSOLE_LOG = "console.log"
+CONSOLE_TRACE = "console.trace"
+CONSOLE_WARN = "console.warn"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -158,6 +164,18 @@ TIMER_HOST = (
     WINDOW_OR_WORKER_CLEAR_TIMEOUT,
     WINDOW_OR_WORKER_SET_INTERVAL,
     WINDOW_OR_WORKER_CLEAR_INTERVAL,
+)
+
+# These namespace operations share one exact WebIDL shape. The V8 facade
+# deliberately exposes only this logging slice: every other console method is
+# absent rather than silently using V8's no-op delegate.
+CONSOLE_HOST = (
+    CONSOLE_DEBUG,
+    CONSOLE_ERROR,
+    CONSOLE_INFO,
+    CONSOLE_LOG,
+    CONSOLE_TRACE,
+    CONSOLE_WARN,
 )
 
 
@@ -630,6 +648,82 @@ def _require_optional_long_default_zero(
     _require_plain_timer_argument(qualified_name, argument)
 
 
+def _select_console_log_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLMethod:
+    """Select one exact variadic logging operation from the console namespace."""
+
+    namespace_name, member_name = _split_qualified_name(qualified_name)
+    namespaces = [
+        result
+        for result in parser_results
+        if result.isNamespace() and result.identifier.name == namespace_name
+    ]
+    if len(namespaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one namespace `{namespace_name}`, found {len(namespaces)}"
+        )
+    members = [
+        member
+        for member in namespaces[0].members
+        if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+    member = members[0]
+    if not member.isMethod() or member.isSpecial():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must be an ordinary namespace operation"
+        )
+    attributes = set(member._extendedAttrDict)
+    if attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` carries extended attributes that are not implemented: "
+            + ", ".join(sorted(attributes))
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if return_type.nullable() or return_type.tag() != WebIDL.IDLType.Tags.undefined:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `undefined`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if len(arguments) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly one variadic argument, "
+            f"found {len(arguments)}"
+        )
+    argument = arguments[0]
+    expected_name = "data" if member_name == "trace" else "messages"
+    if (
+        argument.identifier.name != expected_name
+        or not argument.optional
+        or not argument.variadic
+        or argument.defaultValue is not None
+        or argument.type.nullable()
+        or not argument.type.isAny()
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take variadic `any... {expected_name}`"
+        )
+    argument_attributes = set(argument._extendedAttrDict) | set(
+        argument.type._extendedAttrDict
+    )
+    if argument_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{expected_name}` carries extended attributes "
+            "that are not implemented: " + ", ".join(sorted(argument_attributes))
+        )
+    return member
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -728,6 +822,22 @@ def select_timer_host_members(
     return {
         qualified_name: _select_timer_operation(parser_results, qualified_name)
         for qualified_name in TIMER_HOST
+    }
+
+
+def select_console_host_members(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> dict[str, WebIDL.IDLMethod]:
+    """Load the production corpus and pin the supported console logging slice."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return {
+        qualified_name: _select_console_log_operation(
+            parser_results, qualified_name
+        )
+        for qualified_name in CONSOLE_HOST
     }
 
 

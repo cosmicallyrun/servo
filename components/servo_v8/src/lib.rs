@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 20;
+const ABI_VERSION: u32 = 21;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -228,6 +228,29 @@ pub unsafe trait TimerHostBinding: Sized + 'static {
     fn clear(&self, handle: i32);
 }
 
+/// A console logging level pinned to the experimental C ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ConsoleLevel {
+    Debug = 0,
+    Error = 1,
+    Info = 2,
+    Log = 3,
+    Trace = 4,
+    Warn = 5,
+}
+
+/// A realm-owned sink for the supported V8 console logging operations.
+///
+/// # Safety
+///
+/// Implementations and `Drop` must remain on the owning script thread, must
+/// not unwind, re-enter V8, or pump an event loop. JavaScript values never
+/// cross this trait: C++ formats them first and supplies only valid UTF-8.
+pub unsafe trait ConsoleHostBinding: Sized + 'static {
+    fn write(&self, level: ConsoleLevel, message: &str);
+}
+
 #[repr(C)]
 struct TimerHostVTable {
     schedule_function: Option<
@@ -319,6 +342,58 @@ impl TimerHostVTable {
             schedule_string: Some(timer_host_schedule_string::<T>),
             clear: Some(timer_host_clear::<T>),
             drop: Some(timer_host_drop::<T>),
+        }
+    }
+}
+
+#[repr(C)]
+struct ConsoleHostVTable {
+    write: Option<unsafe extern "C" fn(*mut c_void, u32, *const u8, usize)>,
+    drop: Option<DropCallback>,
+}
+
+unsafe extern "C" fn console_host_write<T: ConsoleHostBinding>(
+    native: *mut c_void,
+    level: u32,
+    message: *const u8,
+    message_length: usize,
+) {
+    if native.is_null() || (message.is_null() && message_length != 0) {
+        return;
+    }
+    let level = match level {
+        0 => ConsoleLevel::Debug,
+        1 => ConsoleLevel::Error,
+        2 => ConsoleLevel::Info,
+        3 => ConsoleLevel::Log,
+        4 => ConsoleLevel::Trace,
+        5 => ConsoleLevel::Warn,
+        _ => return,
+    };
+    let bytes = if message_length == 0 {
+        &[]
+    } else {
+        // SAFETY: C++ keeps the message allocation live for this synchronous
+        // callback and supplies its exact byte length.
+        unsafe { std::slice::from_raw_parts(message, message_length) }
+    };
+    let Ok(message) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    // SAFETY: The console-host vtable contract supplies this exact live Box<T>.
+    unsafe { &*native.cast::<T>() }.write(level, message);
+}
+
+unsafe extern "C" fn console_host_drop<T: ConsoleHostBinding>(native: *mut c_void) {
+    // SAFETY: The bridge hands back exactly the Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+impl ConsoleHostVTable {
+    fn for_type<T: ConsoleHostBinding>() -> Self {
+        Self {
+            write: Some(console_host_write::<T>),
+            drop: Some(console_host_drop::<T>),
         }
     }
 }
@@ -438,6 +513,13 @@ unsafe extern "C" {
         realm_id: RealmId,
         native: *mut c_void,
         vtable: *const TimerHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_realm_install_console_host(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        native: *mut c_void,
+        vtable: *const ConsoleHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_realm_timer_callback_run(
@@ -1052,6 +1134,35 @@ impl Runtime {
         Ok(())
     }
 
+    /// Installs one realm-owned sink for the supported console namespace
+    /// logging operations. Failed installation leaves ownership in Rust.
+    pub fn install_console_host<T: ConsoleHostBinding>(
+        &mut self,
+        realm_id: RealmId,
+        host: T,
+    ) -> Result<(), Error> {
+        let vtable = ConsoleHostVTable::for_type::<T>();
+        let native = Box::into_raw(Box::new(host)).cast();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: native is one live Box<T>; C++ consumes it only on success.
+        let succeeded = unsafe {
+            servo_v8_realm_install_console_host(
+                self.raw.as_ptr(),
+                realm_id,
+                native,
+                &vtable,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            // SAFETY: Every C++ failure path leaves native untouched.
+            drop(unsafe { Box::from_raw(native.cast::<T>()) });
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
     /// Invokes a retained timer function with no embedding host context.
     pub fn run_timer_callback_in_realm(
         &mut self,
@@ -1607,6 +1718,33 @@ mod tests {
         fn clear(&self, handle: i32) {
             attempt_callback_reentry("timer clear");
             self.clears.borrow_mut().push(handle);
+        }
+    }
+
+    struct ConsoleHostProbe {
+        messages: Rc<RefCell<Vec<(ConsoleLevel, String)>>>,
+        drops: Rc<Cell<usize>>,
+        attempt_reentry: bool,
+    }
+
+    impl Drop for ConsoleHostProbe {
+        fn drop(&mut self) {
+            if self.attempt_reentry {
+                attempt_callback_reentry("console host drop");
+            }
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    // SAFETY: The probe is owner-thread confined, copies only POD and UTF-8,
+    // and its deliberately hostile re-entry attempts must be rejected by the
+    // surrounding C++ RustCallbackScope.
+    unsafe impl ConsoleHostBinding for ConsoleHostProbe {
+        fn write(&self, level: ConsoleLevel, message: &str) {
+            if self.attempt_reentry {
+                attempt_callback_reentry("console write");
+            }
+            self.messages.borrow_mut().push((level, message.to_owned()));
         }
     }
 
@@ -2618,10 +2756,140 @@ mod tests {
         );
         CALLBACK_REENTRY_ATTEMPTS.with(|attempts| {
             let attempts = attempts.borrow();
-            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer schedule function"));
-            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer schedule string"));
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "timer schedule function")
+            );
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "timer schedule string")
+            );
             assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer clear"));
-            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer host drop"));
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "timer host drop")
+            );
+            assert!(attempts.iter().all(|(_, status, error)| {
+                *status == 0 && error.contains("re-entered from a Rust host callback")
+            }));
+        });
+    }
+
+    #[test]
+    fn console_host_formats_routes_guards_and_drops_messages() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let _reentry = CallbackReentryConfig::new(runtime.raw.as_ptr());
+        let realm = runtime.create_realm().unwrap();
+
+        // The facade exists as soon as the realm does, but cannot silently
+        // discard output before an embedder host is installed.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { console.log('lost'); } catch (error) { \
+                       return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap()
+        );
+
+        let messages = Rc::new(RefCell::new(Vec::new()));
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .install_console_host(
+                realm,
+                ConsoleHostProbe {
+                    messages: Rc::clone(&messages),
+                    drops: Rc::clone(&drops),
+                    attempt_reentry: true,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => {\n\
+                       const globalDescriptor = Object.getOwnPropertyDescriptor(\n\
+                         globalThis, 'console');\n\
+                       const names = ['debug', 'error', 'info', 'log', 'trace', 'warn'];\n\
+                       if (!globalDescriptor || globalDescriptor.enumerable ||\n\
+                           !globalDescriptor.writable || !globalDescriptor.configurable ||\n\
+                           Object.prototype.toString.call(console) !== '[object Console]' ||\n\
+                           Object.keys(console).join(',') !== names.join(',') ||\n\
+                           typeof console.assert !== 'undefined' ||\n\
+                           !names.every(name => {\n\
+                             const descriptor = Object.getOwnPropertyDescriptor(console, name);\n\
+                             return descriptor && descriptor.enumerable && descriptor.writable &&\n\
+                               descriptor.configurable && descriptor.value.name === name &&\n\
+                               descriptor.value.length === 0;\n\
+                           })) return false;\n\
+                       console.debug('debug', 1);\n\
+                       console.error('error', false);\n\
+                       console.info();\n\
+                       let touched = false;\n\
+                       console.log('log', null, undefined, 7n, Symbol('s'), {\n\
+                         toString() { touched = true; throw new Error('must not run'); }\n\
+                       });\n\
+                       console.trace('trace');\n\
+                       console.warn('warn', '✓');\n\
+                       Promise.resolve().then(() => console.log('microtask'));\n\
+                       return !touched;\n\
+                     })()",
+                )
+                .unwrap()
+        );
+
+        let messages = messages.borrow();
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[0], (ConsoleLevel::Debug, "debug 1".to_owned()));
+        assert_eq!(messages[1], (ConsoleLevel::Error, "error false".to_owned()));
+        assert_eq!(messages[2], (ConsoleLevel::Info, String::new()));
+        assert_eq!(messages[3].0, ConsoleLevel::Log);
+        assert!(messages[3].1.starts_with("log null undefined 7 Symbol(s) "));
+        assert_eq!(messages[4].0, ConsoleLevel::Trace);
+        assert!(messages[4].1.starts_with("trace\n    at "));
+        assert_eq!(messages[5], (ConsoleLevel::Warn, "warn ✓".to_owned()));
+        assert_eq!(messages[6], (ConsoleLevel::Log, "microtask".to_owned()));
+        drop(messages);
+
+        // A rejected second transfer stays Rust-owned and is dropped here.
+        assert!(
+            runtime
+                .install_console_host(
+                    realm,
+                    ConsoleHostProbe {
+                        messages: Rc::new(RefCell::new(Vec::new())),
+                        drops: Rc::clone(&drops),
+                        attempt_reentry: false,
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(drops.get(), 1);
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(drops.get(), 2);
+        CALLBACK_REENTRY_ATTEMPTS.with(|attempts| {
+            let attempts = attempts.borrow();
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "console write")
+            );
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "console host drop")
+            );
             assert!(attempts.iter().all(|(_, status, error)| {
                 *status == 0 && error.contains("re-entered from a Rust host callback")
             }));

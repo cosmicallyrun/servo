@@ -41,6 +41,7 @@ proofs=(
   "authoritative_native_timers_proof.html:(0, 255, 0):1:1"
   # The final colour is set by SpiderMonkey after it clears the V8 timer.
   "authoritative_cross_engine_timer_clear_proof.html:(0, 255, 0):0:0"
+  "authoritative_console_proof.html:(0, 255, 0):1:1"
   "authoritative_realm_surface_proof.html:(0, 255, 0):1:1"
   "authoritative_document_open_proof.html:(0, 255, 0):1:1"
   "authoritative_wrapper_identity_proof.html:(0, 255, 0):1:1"
@@ -80,9 +81,26 @@ print(colours.most_common(1)[0][0] if len(colours) == 1 else f"mixed: {colours.m
 PY
 )"
 
+  extra_ok=1
+  if [ "$page" = "authoritative_console_proof.html" ]; then
+    for marker in \
+      "SERVO_V8_CONSOLE_DEBUG 1" \
+      "SERVO_V8_CONSOLE_ERROR false" \
+      "SERVO_V8_CONSOLE_INFO null" \
+      "SERVO_V8_CONSOLE_LOG 42 true" \
+      "SERVO_V8_CONSOLE_TRACE" \
+      "SERVO_V8_CONSOLE_WARN ✓"; do
+      if ! grep -Fq "$marker" "$log"; then
+        echo "        missing console output: $marker"
+        extra_ok=0
+      fi
+    done
+  fi
+
   if [ "$actual_rgb" = "$expected_rgb" ] &&
      [ "$actual_get" = "$expected_get" ] &&
-     [ "$actual_set" = "$expected_set" ]; then
+     [ "$actual_set" = "$expected_set" ] &&
+     [ "$extra_ok" -eq 1 ]; then
     echo "ok    $page  rgb=$actual_rgb bgColor get=$actual_get set=$actual_set"
   else
     echo "FAIL  $page"

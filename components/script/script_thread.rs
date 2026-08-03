@@ -43,6 +43,8 @@ use devtools_traits::{
     CSSError, DevtoolScriptControlMsg, DevtoolsPageInfo, NavigationState,
     ScriptToDevtoolsControlMsg, WorkerId,
 };
+#[cfg(feature = "v8-shadow")]
+use embedder_traits::ConsoleLogLevel;
 use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScript};
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
@@ -255,6 +257,36 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
 struct V8DocumentHost {
     document: Trusted<Document>,
     stats: Rc<V8DocumentHiddenStats>,
+}
+
+#[cfg(feature = "v8-shadow")]
+struct V8ConsoleHost {
+    document: Trusted<Document>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: The host is confined to the Document's script thread. It receives
+// only owned UTF-8/POD data, synchronously sends one embedder message, and its
+// Drop only releases a Trusted<Document>; it never retains or re-enters V8.
+unsafe impl servo_v8::ConsoleHostBinding for V8ConsoleHost {
+    fn write(&self, level: servo_v8::ConsoleLevel, message: &str) {
+        let level = match level {
+            servo_v8::ConsoleLevel::Debug => ConsoleLogLevel::Debug,
+            servo_v8::ConsoleLevel::Error => ConsoleLogLevel::Error,
+            servo_v8::ConsoleLevel::Info => ConsoleLogLevel::Info,
+            servo_v8::ConsoleLevel::Log => ConsoleLogLevel::Log,
+            servo_v8::ConsoleLevel::Trace => ConsoleLogLevel::Trace,
+            servo_v8::ConsoleLevel::Warn => ConsoleLogLevel::Warn,
+        };
+        let document = self.document.root();
+        let global = document.window().as_global_scope();
+        global.send_to_embedder(EmbedderMsg::ShowConsoleApiMessage(
+            global.webview_id(),
+            level,
+            message.to_owned(),
+        ));
+    }
 }
 
 #[cfg(feature = "v8-shadow")]
@@ -1371,6 +1403,22 @@ impl ScriptThread {
                     return Err(format!("Document host installation failed: {error}"));
                 }
 
+                if let Err(error) = shadow.runtime.install_console_host(
+                    realm_id,
+                    V8ConsoleHost {
+                        document: Trusted::new(document),
+                    },
+                ) {
+                    if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                        reset_entire_state = true;
+                        return Err(format!(
+                            "console host installation failed: {error}; fresh realm cleanup \
+                             also failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(format!("console host installation failed: {error}"));
+                }
+
                 #[cfg(feature = "v8-classic-script-authoritative")]
                 if let Err(error) = shadow.runtime.install_timer_host(
                     realm_id,
@@ -1433,7 +1481,9 @@ impl ScriptThread {
         }
 
         match result {
-            Ok(()) => debug!("V8 shadow created realm and Document host for {pipeline_id}"),
+            Ok(()) => {
+                debug!("V8 shadow created realm with Document and console hosts for {pipeline_id}")
+            },
             Err(error) => {
                 #[cfg(any(
                     feature = "v8-classic-script-authoritative",

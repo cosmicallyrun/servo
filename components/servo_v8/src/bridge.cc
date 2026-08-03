@@ -295,6 +295,12 @@ struct ServoV8TimerHostState {
   ServoV8TimerHostVTable vtable{};
 };
 
+struct ServoV8ConsoleHostState {
+  ServoV8Runtime* runtime = nullptr;
+  void* native = nullptr;
+  ServoV8ConsoleHostVTable vtable{};
+};
+
 struct ServoV8TimerCallback {
   v8::Global<v8::Function> function;
   std::vector<v8::Global<v8::Value>> arguments;
@@ -321,6 +327,7 @@ struct ServoV8RealmState {
   v8::Global<v8::ObjectTemplate> element_template;
   ServoV8DocumentHostState document_host;
   ServoV8TimerHostState timer_host;
+  ServoV8ConsoleHostState console_host;
   bool tearing_down = false;
 };
 
@@ -793,7 +800,7 @@ void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(result);
 }
 
-ServoV8RealmState* TimerCallbackRealm(
+ServoV8RealmState* CallbackRealm(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   auto* runtime =
@@ -835,7 +842,7 @@ bool TimerHandle(v8::Local<v8::Context> context,
 void ScheduleTimer(const v8::FunctionCallbackInfo<v8::Value>& info,
                    bool is_interval) {
   v8::Isolate* isolate = info.GetIsolate();
-  ServoV8RealmState* realm = TimerCallbackRealm(info);
+  ServoV8RealmState* realm = CallbackRealm(info);
   if (!realm || !realm->timer_host.native ||
       realm->runtime->rust_callback_depth != 0) {
     ThrowTypeError(isolate, "invalid timer host state");
@@ -940,7 +947,7 @@ void SetInterval(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 void ClearTimer(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
-  ServoV8RealmState* realm = TimerCallbackRealm(info);
+  ServoV8RealmState* realm = CallbackRealm(info);
   if (!realm || !realm->timer_host.native || !realm->timer_host.vtable.clear ||
       realm->runtime->rust_callback_depth != 0) {
     ThrowTypeError(isolate, "invalid timer host state");
@@ -994,6 +1001,169 @@ bool InstallTimerGlobals(ServoV8RealmState* realm,
   return true;
 }
 
+bool AppendConsoleValue(v8::Isolate* isolate,
+                        v8::Local<v8::Context> context,
+                        v8::Local<v8::Value> value,
+                        std::string* output) {
+  v8::Local<v8::String> rendered;
+  // ToDetailString is explicitly side-effect free. Console inspection must
+  // not run a page-defined toString getter merely to produce embedder output.
+  if (!value->ToDetailString(context).ToLocal(&rendered)) return false;
+  v8::String::Utf8Value utf8(isolate, rendered);
+  if (!*utf8) return false;
+  output->append(*utf8, utf8.length());
+  return true;
+}
+
+bool FormatConsoleArguments(v8::Isolate* isolate,
+                            v8::Local<v8::Context> context,
+                            const v8::FunctionCallbackInfo<v8::Value>& info,
+                            std::string* output) {
+  for (int index = 0; index < info.Length(); ++index) {
+    if (index != 0) output->push_back(' ');
+    if (!AppendConsoleValue(isolate, context, info[index], output)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void AppendTraceStack(v8::Isolate* isolate, std::string* output) {
+  v8::Local<v8::StackTrace> stack = v8::StackTrace::CurrentStackTrace(
+      isolate, 32, v8::StackTrace::kDetailed);
+  if (stack.IsEmpty()) return;
+  for (int index = 0; index < stack->GetFrameCount(); ++index) {
+    v8::Local<v8::StackFrame> frame = stack->GetFrame(isolate, index);
+    if (frame.IsEmpty()) continue;
+    output->append("\n    at ");
+
+    v8::Local<v8::String> function = frame->GetFunctionName();
+    if (function.IsEmpty() || function->Length() == 0) {
+      output->append("<anonymous>");
+    } else {
+      v8::String::Utf8Value function_utf8(isolate, function);
+      if (*function_utf8) output->append(*function_utf8, function_utf8.length());
+    }
+
+    v8::Local<v8::String> resource = frame->GetScriptNameOrSourceURL();
+    output->append(" (");
+    if (resource.IsEmpty() || resource->Length() == 0) {
+      output->append("<anonymous>");
+    } else {
+      v8::String::Utf8Value resource_utf8(isolate, resource);
+      if (*resource_utf8) output->append(*resource_utf8, resource_utf8.length());
+    }
+    output->push_back(':');
+    output->append(std::to_string(frame->GetLineNumber()));
+    output->push_back(':');
+    output->append(std::to_string(frame->GetColumn()));
+    output->push_back(')');
+  }
+}
+
+void ConsoleWrite(const v8::FunctionCallbackInfo<v8::Value>& info,
+                  uint32_t level) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = CallbackRealm(info);
+  if (!realm || !realm->console_host.native ||
+      !realm->console_host.vtable.write) {
+    ThrowTypeError(isolate, "invalid or uninstalled console host state");
+    return;
+  }
+  if (realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "re-entrant console host callback");
+    return;
+  }
+
+  std::string message;
+  if (!FormatConsoleArguments(isolate, isolate->GetCurrentContext(), info,
+                              &message)) {
+    return;
+  }
+  if (level == SERVO_V8_CONSOLE_TRACE) AppendTraceStack(isolate, &message);
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    realm->console_host.vtable.write(
+        realm->console_host.native, level,
+        reinterpret_cast<const uint8_t*>(message.data()), message.size());
+  }
+}
+
+void ConsoleDebug(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ConsoleWrite(info, SERVO_V8_CONSOLE_DEBUG);
+}
+
+void ConsoleError(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ConsoleWrite(info, SERVO_V8_CONSOLE_ERROR);
+}
+
+void ConsoleInfo(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ConsoleWrite(info, SERVO_V8_CONSOLE_INFO);
+}
+
+void ConsoleLog(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ConsoleWrite(info, SERVO_V8_CONSOLE_LOG);
+}
+
+void ConsoleTrace(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ConsoleWrite(info, SERVO_V8_CONSOLE_TRACE);
+}
+
+void ConsoleWarn(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ConsoleWrite(info, SERVO_V8_CONSOLE_WARN);
+}
+
+bool InstallConsoleGlobal(ServoV8RealmState* realm,
+                          v8::Local<v8::Context> context,
+                          v8::Local<v8::Object> global) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::Local<v8::BigInt> data = v8::BigInt::NewFromUnsigned(isolate, realm->id);
+  v8::Local<v8::Object> console = v8::Object::New(isolate);
+  const v8::PropertyAttribute method_attributes = v8::None;
+  struct ConsoleOperation {
+    const char* name;
+    v8::FunctionCallback callback;
+  };
+  const ConsoleOperation operations[] = {
+      {"debug", &ConsoleDebug}, {"error", &ConsoleError},
+      {"info", &ConsoleInfo},   {"log", &ConsoleLog},
+      {"trace", &ConsoleTrace}, {"warn", &ConsoleWarn},
+  };
+  for (const auto& operation : operations) {
+    v8::Local<v8::String> name = V8String(isolate, operation.name);
+    v8::Local<v8::Function> function;
+    if (!v8::Function::New(context, operation.callback, data, 0,
+                           v8::ConstructorBehavior::kThrow)
+             .ToLocal(&function)) {
+      return false;
+    }
+    function->SetName(name);
+    if (!console->DefineOwnProperty(context, name, function, method_attributes)
+             .FromMaybe(false)) {
+      return false;
+    }
+  }
+
+  const v8::PropertyAttribute tag_attributes =
+      static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontEnum);
+  if (!console
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "Console"), tag_attributes)
+           .FromMaybe(false)) {
+    return false;
+  }
+
+  // Replace V8's inspector-oriented console. With no inspector delegate its
+  // methods silently discard output, which is worse than an explicit gap.
+  if (!global->Delete(context, V8String(isolate, "console")).FromMaybe(false)) {
+    return false;
+  }
+  return global
+      ->DefineOwnProperty(context, V8String(isolate, "console"), console,
+                          v8::DontEnum)
+      .FromMaybe(false);
+}
+
 void ResetDocumentHost(ServoV8DocumentHostState* state) {
   void* native = std::exchange(state->native, nullptr);
   const ServoV8DropCallback drop = state->vtable.drop;
@@ -1005,6 +1175,16 @@ void ResetDocumentHost(ServoV8DocumentHostState* state) {
 }
 
 void ResetTimerHost(ServoV8TimerHostState* state) {
+  void* native = std::exchange(state->native, nullptr);
+  const ServoV8DropCallback drop = state->vtable.drop;
+  state->vtable = {};
+  if (native && drop) {
+    RustCallbackScope callback_scope(state->runtime);
+    drop(native);
+  }
+}
+
+void ResetConsoleHost(ServoV8ConsoleHostState* state) {
   void* native = std::exchange(state->native, nullptr);
   const ServoV8DropCallback drop = state->vtable.drop;
   state->vtable = {};
@@ -1072,6 +1252,7 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->element_template.Reset();
   realm->document.Reset();
   realm->context.Reset();
+  ResetConsoleHost(&realm->console_host);
   ResetTimerHost(&realm->timer_host);
   ResetDocumentHost(&realm->document_host);
   runtime->isolate->ContextDisposedNotification(
@@ -1318,6 +1499,7 @@ extern "C" int32_t servo_v8_realm_create(
   realm->id = id;
   realm->document_host.runtime = runtime;
   realm->timer_host.runtime = runtime;
+  realm->console_host.runtime = runtime;
   v8::Local<v8::Context> context = v8::Context::New(isolate);
   if (context.IsEmpty()) {
     WriteError(error, "V8 failed to allocate a realm context");
@@ -1341,16 +1523,11 @@ extern "C" int32_t servo_v8_realm_create(
     WriteError(error, TryCatchMessage(isolate, try_catch));
     return 0;
   }
-  // V8 installs its own `console` on every context. With no inspector attached
-  // its methods silently discard everything, so an authoritative script would
-  // log nothing while the identical script on SpiderMonkey logs normally --
-  // a silent divergence rather than a visible gap. Removing it makes
-  // `console.log` a ReferenceError until a real host binding exists.
-  if (!global->Delete(context, V8String(isolate, "console")).FromMaybe(false)) {
+  if (!InstallConsoleGlobal(realm.get(), context, global)) {
     context->SetAlignedPointerInEmbedderData(
         kServoRealmStateEmbedderSlot, nullptr,
         kServoRealmStateEmbedderTag);
-    WriteError(error, "V8 realm could not remove the built-in console");
+    WriteError(error, TryCatchMessage(isolate, try_catch));
     return 0;
   }
   if (!InstallTimerGlobals(realm.get(), context, global)) {
@@ -1747,6 +1924,38 @@ extern "C" int32_t servo_v8_realm_install_timer_host(
 
   realm->timer_host.native = native;
   realm->timer_host.vtable = *vtable;
+  return 1;
+}
+
+extern "C" int32_t servo_v8_realm_install_console_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8ConsoleHostVTable* vtable,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!native) {
+    WriteError(error, "console host native pointer is null");
+    return 0;
+  }
+  if (!vtable || !vtable->write || !vtable->drop) {
+    WriteError(error, "console host vtable is incomplete");
+    return 0;
+  }
+  ServoV8RealmState* realm = FindRealm(runtime, realm_id, error);
+  if (!realm) return 0;
+  if (realm->tearing_down) {
+    WriteError(error, "cannot install a console host while its realm tears down");
+    return 0;
+  }
+  if (realm->console_host.native) {
+    WriteError(error, "console host is already installed in this realm");
+    return 0;
+  }
+
+  realm->console_host.native = native;
+  realm->console_host.vtable = *vtable;
   return 1;
 }
 

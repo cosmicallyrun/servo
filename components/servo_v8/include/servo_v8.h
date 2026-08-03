@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 20u
+#define SERVO_V8_ABI_VERSION 21u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -117,6 +117,29 @@ typedef struct ServoV8TimerHostVTable {
   ServoV8DropCallback drop;
 } ServoV8TimerHostVTable;
 
+/* The supported console namespace logging levels. Values are stable ABI. */
+enum ServoV8ConsoleLevel {
+  SERVO_V8_CONSOLE_DEBUG = 0,
+  SERVO_V8_CONSOLE_ERROR = 1,
+  SERVO_V8_CONSOLE_INFO = 2,
+  SERVO_V8_CONSOLE_LOG = 3,
+  SERVO_V8_CONSOLE_TRACE = 4,
+  SERVO_V8_CONSOLE_WARN = 5,
+};
+
+/* A realm-owned sink for V8 console output.
+ *
+ * V8 values are formatted while they are still local handles in C++. Only
+ * validated UTF-8 and a POD level cross into Rust, so no V8 handle, traced
+ * pointer, or cross-heap ownership edge enters Servo. */
+typedef struct ServoV8ConsoleHostVTable {
+  void (*write)(void* native,
+                uint32_t level,
+                const uint8_t* message,
+                size_t message_length);
+  ServoV8DropCallback drop;
+} ServoV8ConsoleHostVTable;
+
 uint32_t servo_v8_abi_version(void);
 
 ServoV8Runtime* servo_v8_runtime_new(const ServoV8Options* options,
@@ -218,6 +241,14 @@ int32_t servo_v8_realm_install_timer_host(
     ServoV8RealmId realm_id,
     void* native,
     const ServoV8TimerHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_console_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8ConsoleHostVTable* vtable,
     ServoV8ErrorBuffer* error);
 
 /* Invokes one V8 function handler retained by setTimeout/setInterval. */

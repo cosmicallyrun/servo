@@ -173,6 +173,30 @@ class ProductionTimerTests(unittest.TestCase):
             self.assertEqual(arguments[0].defaultValue.value, 0)
 
 
+class ProductionConsoleTests(unittest.TestCase):
+    def test_pins_the_real_console_logging_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_console_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.CONSOLE_HOST))
+        for qualified_name, method in members.items():
+            with self.subTest(member=qualified_name):
+                return_type, arguments = method.signatures()[0]
+                self.assertEqual(return_type.prettyName(), "undefined")
+                self.assertEqual(len(arguments), 1)
+                self.assertTrue(arguments[0].variadic)
+                self.assertTrue(arguments[0].type.isAny())
+                expected_name = (
+                    "data"
+                    if qualified_name == production_webidl.CONSOLE_TRACE
+                    else "messages"
+                )
+                self.assertEqual(arguments[0].identifier.name, expected_name)
+
+
 class SyntheticSelectionTests(unittest.TestCase):
     def parse(self, sources: dict[str, str], environment: dict[str, str] | None = None):
         temporary_directory = tempfile.TemporaryDirectory()
@@ -642,6 +666,68 @@ class SyntheticSelectionTests(unittest.TestCase):
             "clearTimeout",
             "`WindowOrWorkerGlobalScope.clearTimeout` argument `handle` must be optional "
             "non-nullable `long` with default 0",
+        )
+
+    def assert_console_rejected(
+        self,
+        declaration: str,
+        member: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse(
+            {
+                "Console.webidl": f'''[ClassString="Console", Exposed=*]
+                    namespace console {{ {declaration} }};''',
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_console_log_operation(
+                parser_results,
+                f"console.{member}",
+            )
+
+    def test_selects_console_log_from_namespace(self) -> None:
+        parser_results = self.parse(
+            {
+                "Console.webidl": '''[ClassString="Console", Exposed=*]
+                    namespace console { undefined log(any... messages); };''',
+            }
+        )
+        method = production_webidl._select_console_log_operation(
+            parser_results,
+            production_webidl.CONSOLE_LOG,
+        )
+        self.assertEqual(method.identifier.name, "log")
+
+    def test_rejects_console_logging_return_type_drift(self) -> None:
+        self.assert_console_rejected(
+            "boolean log(any... messages);",
+            "log",
+            "`console.log` must return non-nullable `undefined`, got `boolean`",
+        )
+
+    def test_rejects_nonvariadic_console_logging_arguments(self) -> None:
+        self.assert_console_rejected(
+            "undefined warn(any messages);",
+            "warn",
+            "`console.warn` must take variadic `any... messages`",
+        )
+
+    def test_rejects_console_trace_argument_name_drift(self) -> None:
+        self.assert_console_rejected(
+            "undefined trace(any... messages);",
+            "trace",
+            "`console.trace` must take variadic `any... data`",
+        )
+
+    def test_rejects_console_logging_extended_attributes(self) -> None:
+        self.assert_console_rejected(
+            "[Throws] undefined error(any... messages);",
+            "error",
+            "`console.error` carries extended attributes that are not implemented: Throws",
         )
 
 

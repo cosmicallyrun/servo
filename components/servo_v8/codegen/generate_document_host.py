@@ -190,11 +190,22 @@ def generate_outputs(
 
 
 def write_outputs(webidls_dir: Path, out_dir: Path) -> None:
-    """Select the production Document slice and write its three artifacts."""
+    """Validate every production host surface and generate the Document host."""
 
     with tempfile.TemporaryDirectory(prefix="servo-v8-document-host-webidl-") as cache_dir:
         selected_members = production_webidl.select_document_host_members(
-            Path(cache_dir),
+            Path(cache_dir) / "document",
+            webidls_dir=webidls_dir,
+        )
+        # Timers and console are hand-written native hosts, but their WebIDL
+        # gates must still run on every build. Otherwise a production signature
+        # could drift while only the dedicated Python tests notice.
+        production_webidl.select_timer_host_members(
+            Path(cache_dir) / "timers",
+            webidls_dir=webidls_dir,
+        )
+        production_webidl.select_console_host_members(
+            Path(cache_dir) / "console",
             webidls_dir=webidls_dir,
         )
     out_dir.mkdir(parents=True, exist_ok=True)
