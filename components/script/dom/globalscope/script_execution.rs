@@ -416,7 +416,7 @@ impl GlobalScope {
     }
 
     #[cfg(feature = "v8-classic-script-authoritative")]
-    fn report_v8_classic_script_error(
+    pub(crate) fn report_v8_classic_script_error(
         &self,
         cx: &mut JSContext,
         exception: servo_v8::ScriptException,

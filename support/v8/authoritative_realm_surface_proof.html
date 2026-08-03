@@ -35,7 +35,10 @@ Run via support/v8/run_proofs.sh.
       }
       // The surface that IS claimed must still be intact.
       if (globalThis !== window || window.window !== window ||
-          window.document !== document) {
+          window.document !== document || typeof setTimeout !== "function" ||
+          typeof clearTimeout !== "function" ||
+          typeof setInterval !== "function" ||
+          typeof clearInterval !== "function") {
         throw new Error("bad identity");
       }
       document.bgColor =

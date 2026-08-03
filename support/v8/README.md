@@ -195,17 +195,30 @@ support/v8/run_all_html_classic_scripts_proof.sh
 
 This remains an experiment rather than a default backend. It affects HTML
 classic script elements only; module scripts, event handlers, `javascript:`
-URLs, and worker scripts keep their existing engine paths. Timer source strings
-also retain the explicit directive described below. The focused proof contains
-no selection attribute and covers inline, parser-blocking external, deferred,
-async, and promise-reaction execution with exact V8 host-call counts.
+URLs, and worker scripts keep their existing engine paths. The focused proof
+contains no selection attribute and covers inline, parser-blocking external,
+deferred, async, and promise-reaction execution with exact V8 host-call counts.
+It also schedules unmarked function and source-string timers, which must return
+to the same V8 realm through Servo's timer queue.
 Its `disabled` second mode is the negative control: after building only
 `v8-classic-script-authoritative`, the same unmarked page must execute on
 SpiderMonkey and report zero V8 host calls.
 
-String timer handlers opt in too, but through a prologue directive rather than
-an attribute, because a timer handler is a bare source string with no element
-to carry one:
+The narrow V8 Window facade now exposes `setTimeout`, `clearTimeout`,
+`setInterval`, and `clearInterval`. Servo remains the source of truth for
+delays, nesting, numeric handles, cancellation, and task dispatch. V8 retains
+function handlers and their arbitrary argument values strongly only while the
+timer is active: one-shots release before invocation, intervals release on
+clear, and realm teardown releases everything synchronously. A timer callback
+re-enters only its originating realm with the current Servo JSContext installed
+for native DOM calls. This avoids copying JavaScript values across engines and
+keeps timing on Servo's existing event loop.
+
+A source-string handler scheduled by V8 stays V8-authoritative automatically.
+The string still passes through Servo's Trusted Types and CSP checks before it
+is scheduled. A source string scheduled by SpiderMonkey can independently opt
+into V8 through the older prologue directive, because that bare handler has no
+script element on which to carry an attribute:
 
 ```js
 setTimeout('"use servo-v8"; /* body */', 0);
@@ -214,9 +227,8 @@ setTimeout('"use servo-v8"; /* body */', 0);
 Like `"use strict"`, that evaluates to a harmless expression statement in an
 engine that does not recognise it, and only a genuine prologue directive counts
 — `"use servo-v8-nope"` does not opt in. The choice is deliberately not
-inherited from the scheduling script: the V8 host exposes no `setTimeout`, so
-an authoritative script cannot schedule a timer and inheritance could only ever
-select SpiderMonkey.
+inherited for SpiderMonkey-created timers; only calls crossing the V8 timer host
+select V8 without a marker.
 
 That completes classic-script coverage on the window script thread. Module
 scripts remain on SpiderMonkey because they are a different creation path, not
@@ -336,6 +348,8 @@ The proof suite uses that same counting argument:
 | `authoritative_title_proof.html` | ordinary DOMString setter conversion and live title mutation use the generated host |
 | `authoritative_metadata_proof.html` | URL/encoding/content/referrer/date metadata use generated readonly string getters |
 | `authoritative_timer_proof.html` | a string timer handler runs on V8, handed off across a task boundary |
+| `authoritative_native_timers_proof.html` | V8-native functions, strings, arguments, intervals, cancellation, jobs, and errors use Servo scheduling |
+| `authoritative_cross_engine_timer_clear_proof.html` | SpiderMonkey can cancel and release a V8-owned callable through the shared Servo handle map |
 | `authoritative_realm_surface_proof.html` | the realm exposes no API it cannot implement |
 | `authoritative_document_open_proof.html` | the realm survives `document.open()` |
 | `authoritative_job_error_proof.html` | a page sees its own failing V8 promise via `onerror` |
@@ -364,7 +378,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 19 and remains experimental. The original
+The current exported C ABI is version 20 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

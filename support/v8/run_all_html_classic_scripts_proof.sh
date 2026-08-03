@@ -21,7 +21,7 @@ if [ ! -x "$servoshell" ]; then
 fi
 
 case "$mode" in
-  enabled) expected_calls=7 ;;
+  enabled) expected_calls=9 ;;
   disabled) expected_calls=0 ;;
   *)
     echo "mode must be 'enabled' or 'disabled', got '$mode'" >&2

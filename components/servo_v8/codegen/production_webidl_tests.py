@@ -140,6 +140,39 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         )
 
 
+class ProductionTimerTests(unittest.TestCase):
+    def test_pins_all_four_real_timer_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_timer_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.TIMER_HOST))
+        for qualified_name in (
+            production_webidl.WINDOW_OR_WORKER_SET_TIMEOUT,
+            production_webidl.WINDOW_OR_WORKER_SET_INTERVAL,
+        ):
+            method = members[qualified_name]
+            return_type, arguments = method.signatures()[0]
+            self.assertEqual(return_type.prettyName(), "long")
+            self.assertEqual(
+                [part.prettyName() for part in arguments[0].type.memberTypes],
+                ["TrustedScript", "DOMString", "Function"],
+            )
+            self.assertEqual(arguments[1].defaultValue.value, 0)
+            self.assertTrue(arguments[2].variadic)
+            self.assertTrue(arguments[2].type.isAny())
+
+        for qualified_name in (
+            production_webidl.WINDOW_OR_WORKER_CLEAR_TIMEOUT,
+            production_webidl.WINDOW_OR_WORKER_CLEAR_INTERVAL,
+        ):
+            return_type, arguments = members[qualified_name].signatures()[0]
+            self.assertEqual(return_type.prettyName(), "undefined")
+            self.assertEqual(arguments[0].defaultValue.value, 0)
+
+
 class SyntheticSelectionTests(unittest.TestCase):
     def parse(self, sources: dict[str, str], environment: dict[str, str] | None = None):
         temporary_directory = tempfile.TemporaryDirectory()
@@ -532,6 +565,84 @@ class SyntheticSelectionTests(unittest.TestCase):
                 production_webidl.DOCUMENT_READY_STATE,
                 production_webidl.DOCUMENT_READY_STATE_VALUES,
             )
+
+    def assert_timer_rejected(self, declarations: str, member: str, expected: str) -> None:
+        parser_results = self.parse(
+            {
+                "Timers.webidl": f"""
+                    interface TrustedScript {{}};
+                    callback Function = any (any... arguments);
+                    typedef (TrustedScript or DOMString or Function) TimerHandler;
+                    interface mixin WindowOrWorkerGlobalScope {{ {declarations} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_timer_operation(
+                parser_results,
+                f"WindowOrWorkerGlobalScope.{member}",
+            )
+
+    def test_selects_timer_operation_from_interface_mixin(self) -> None:
+        parser_results = self.parse(
+            {
+                "Timers.webidl": """
+                    interface TrustedScript {};
+                    callback Function = any (any... arguments);
+                    typedef (TrustedScript or DOMString or Function) TimerHandler;
+                    interface mixin WindowOrWorkerGlobalScope {
+                      [Throws] long setTimeout(
+                        TimerHandler handler, optional long timeout = 0, any... arguments);
+                    };
+                """,
+            }
+        )
+        method = production_webidl._select_timer_operation(
+            parser_results,
+            production_webidl.WINDOW_OR_WORKER_SET_TIMEOUT,
+        )
+        self.assertEqual(method.identifier.name, "setTimeout")
+
+    def test_rejects_timer_without_throws(self) -> None:
+        self.assert_timer_rejected(
+            "long setTimeout(TimerHandler handler, optional long timeout = 0, any... arguments);",
+            "setTimeout",
+            "`WindowOrWorkerGlobalScope.setTimeout` must carry exactly ['Throws'], got []",
+        )
+
+    def test_rejects_changed_timer_handler_union(self) -> None:
+        self.assert_timer_rejected(
+            "[Throws] long setTimeout((DOMString or Function) handler, optional long timeout = 0, any... arguments);",
+            "setTimeout",
+            "`WindowOrWorkerGlobalScope.setTimeout` handler union must be "
+            "['TrustedScript', 'DOMString', 'Function'], got ['DOMString', 'Function']",
+        )
+
+    def test_rejects_changed_timer_default(self) -> None:
+        self.assert_timer_rejected(
+            "[Throws] long setInterval(TimerHandler handler, optional long timeout = 1, any... arguments);",
+            "setInterval",
+            "`WindowOrWorkerGlobalScope.setInterval` argument `timeout` must be optional "
+            "non-nullable `long` with default 0",
+        )
+
+    def test_rejects_nonvariadic_timer_arguments(self) -> None:
+        self.assert_timer_rejected(
+            "[Throws] long setTimeout(TimerHandler handler, optional long timeout = 0, any arguments);",
+            "setTimeout",
+            "`WindowOrWorkerGlobalScope.setTimeout` must end with variadic `any... arguments`",
+        )
+
+    def test_rejects_changed_clear_signature(self) -> None:
+        self.assert_timer_rejected(
+            "undefined clearTimeout(optional unsigned long handle = 0);",
+            "clearTimeout",
+            "`WindowOrWorkerGlobalScope.clearTimeout` argument `handle` must be optional "
+            "non-nullable `long` with default 0",
+        )
 
 
 if __name__ == "__main__":

@@ -130,6 +130,8 @@ use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+#[cfg(feature = "v8-classic-script-authoritative")]
+use crate::dom::bindings::codegen::UnionTypes::TrustedScriptOrString;
 use crate::dom::bindings::conversions::{
     ConversionResult, FromJSValConvertible, StringificationBehavior,
 };
@@ -178,6 +180,8 @@ use crate::script_runtime::{
 use crate::script_window_proxies::ScriptWindowProxies;
 use crate::svg_font::SvgFontResolver;
 use crate::task_queue::TaskQueue;
+#[cfg(feature = "v8-classic-script-authoritative")]
+use crate::timers::{IsInterval, TimerCallback};
 use crate::webdriver_handlers::jsval_to_webdriver;
 use crate::{devtools, webdriver_handlers};
 #[cfg(feature = "v8-classic-script-authoritative")]
@@ -432,6 +436,91 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         self.document.root().SetTitle(cx, DOMString::from(value));
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         !unsafe { JS_IsExceptionPending(cx) }
+    }
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+struct V8TimerHost {
+    document: Trusted<Document>,
+    realm_id: servo_v8::RealmId,
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+#[expect(unsafe_code)]
+// SAFETY: The host is confined to its Document's script thread, never touches
+// the V8 sidecar RefCell, and only schedules or cancels Servo tasks. It uses
+// host_context synchronously and never retains it.
+unsafe impl servo_v8::TimerHostBinding for V8TimerHost {
+    fn schedule_function(
+        &self,
+        host_context: *mut c_void,
+        callback_id: servo_v8::TimerCallbackId,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The bridge supplies the current live SpiderMonkey JSContext
+        // for this synchronous V8 entry and clears it before returning.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let document = self.document.root();
+        document
+            .window()
+            .as_global_scope()
+            .set_timeout_or_interval(
+                cx,
+                TimerCallback::V8FunctionTimerCallback(self.realm_id, callback_id),
+                Vec::new(),
+                Duration::from_millis(timeout_ms.max(0) as u64),
+                if is_interval {
+                    IsInterval::Interval
+                } else {
+                    IsInterval::NonInterval
+                },
+            )
+            .ok()
+    }
+
+    fn schedule_string(
+        &self,
+        host_context: *mut c_void,
+        source: &str,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The bridge supplies the current live SpiderMonkey JSContext
+        // for this synchronous V8 entry and clears it before returning.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let document = self.document.root();
+        document
+            .window()
+            .as_global_scope()
+            .set_timeout_or_interval(
+                cx,
+                TimerCallback::V8StringTimerCallback(TrustedScriptOrString::String(
+                    DOMString::from(source),
+                )),
+                Vec::new(),
+                Duration::from_millis(timeout_ms.max(0) as u64),
+                if is_interval {
+                    IsInterval::Interval
+                } else {
+                    IsInterval::NonInterval
+                },
+            )
+            .ok()
+    }
+
+    fn clear(&self, handle: i32) {
+        self.document
+            .root()
+            .window()
+            .as_global_scope()
+            .clear_timeout_or_interval(handle);
     }
 }
 
@@ -1050,6 +1139,80 @@ impl ScriptThread {
         })
     }
 
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn run_authoritative_v8_timer_callback(
+        pipeline_id: PipelineId,
+        expected_realm_id: servo_v8::RealmId,
+        callback_id: servo_v8::TimerCallbackId,
+        cx: &mut JSContext,
+    ) -> Result<servo_v8::ScriptRunOutcome, String> {
+        with_optional_script_thread(|script_thread| {
+            let script_thread = script_thread
+                .ok_or_else(|| "no current ScriptThread for authoritative V8 timer".to_owned())?;
+            let _guard =
+                V8AuthoritativeScriptGuard::enter(&script_thread.in_v8_authoritative_script)?;
+            let mut slot = script_thread.v8_shadow.borrow_mut();
+            let shadow = slot
+                .as_mut()
+                .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned())?;
+            let actual_realm_id = shadow
+                .realms
+                .get(&pipeline_id)
+                .map(|realm| realm.id)
+                .ok_or_else(|| format!("V8 shadow has no realm for {pipeline_id}"))?;
+            if actual_realm_id != expected_realm_id {
+                return Err(format!(
+                    "V8 realm changed for {pipeline_id}: timer belongs to \
+                     {expected_realm_id:?}, current realm is {actual_realm_id:?}"
+                ));
+            }
+            script_thread.v8_may_have_pending_jobs.set(true);
+            // SAFETY: cx is borrowed only for this synchronous invocation and
+            // the bridge clears it on every return path.
+            unsafe {
+                shadow
+                    .runtime
+                    .run_timer_callback_in_realm_with_host_context(
+                        actual_realm_id,
+                        callback_id,
+                        (cx as *mut JSContext).cast(),
+                    )
+            }
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    /// Releases a V8 callable when a non-V8 path cancels its Servo timer.
+    /// Clear calls made from V8 have already erased the callback in C++ and
+    /// cannot borrow the sidecar again beneath their live host callback.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn clear_authoritative_v8_timer_callback(
+        realm_id: servo_v8::RealmId,
+        callback_id: servo_v8::TimerCallbackId,
+    ) {
+        with_optional_script_thread(|script_thread| {
+            let Some(script_thread) = script_thread else {
+                return;
+            };
+            if script_thread.in_v8_authoritative_script.get() {
+                return;
+            }
+            let Ok(mut slot) = script_thread.v8_shadow.try_borrow_mut() else {
+                debug!("V8 sidecar is borrowed; timer callback will release at realm teardown");
+                return;
+            };
+            let Some(shadow) = slot.as_mut() else {
+                return;
+            };
+            if let Err(error) = shadow
+                .runtime
+                .clear_timer_callback_in_realm(realm_id, callback_id)
+            {
+                debug!("clearing V8 timer callback failed after Servo cancellation: {error}");
+            }
+        });
+    }
+
     /// Drains V8's microtask queue at HTML's "clean up after running script"
     /// boundary, immediately before Servo's own checkpoint.
     ///
@@ -1206,6 +1369,24 @@ impl ScriptThread {
                         ));
                     }
                     return Err(format!("Document host installation failed: {error}"));
+                }
+
+                #[cfg(feature = "v8-classic-script-authoritative")]
+                if let Err(error) = shadow.runtime.install_timer_host(
+                    realm_id,
+                    V8TimerHost {
+                        document: Trusted::new(document),
+                        realm_id,
+                    },
+                ) {
+                    if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                        reset_entire_state = true;
+                        return Err(format!(
+                            "timer host installation failed: {error}; fresh realm cleanup \
+                             also failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(format!("timer host installation failed: {error}"));
                 }
 
                 let native_hidden = document.hidden_state_for_v8();

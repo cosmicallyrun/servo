@@ -3,8 +3,9 @@
 Runtime proof for the v8-all-html-classic-scripts-authoritative feature.
 
 None of these classic script elements has data-servo-v8 markup. Six script
-elements plus one V8 promise reaction toggle the page seven times, so the page
-can end lime with seven host calls only if every route executes once on V8.
+elements, one promise reaction, one function timer, and one source-string timer
+toggle the page nine times, so the page can end lime with nine host calls only
+if every route executes once on V8.
 
 Run via support/v8/run_all_html_classic_scripts_proof.sh.
 -->
@@ -19,6 +20,12 @@ Run via support/v8/run_all_html_classic_scripts_proof.sh.
       Promise.resolve().then(() => {
         document.bgColor = document.bgColor === "lime" ? "red" : "lime";
       });
+      setTimeout(() => {
+        document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+      }, 0);
+      setTimeout(
+        'document.bgColor = document.bgColor === "lime" ? "red" : "lime";',
+        0);
     </script>
     <script src="all_html_classic_scripts_toggle.js"></script>
     <script defer src="all_html_classic_scripts_toggle.js"></script>

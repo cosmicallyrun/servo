@@ -289,6 +289,19 @@ struct ServoV8DocumentHostState {
   ServoV8DocumentHostVTable vtable{};
 };
 
+struct ServoV8TimerHostState {
+  ServoV8Runtime* runtime = nullptr;
+  void* native = nullptr;
+  ServoV8TimerHostVTable vtable{};
+};
+
+struct ServoV8TimerCallback {
+  v8::Global<v8::Function> function;
+  std::vector<v8::Global<v8::Value>> arguments;
+  int32_t handle = 0;
+  bool is_interval = false;
+};
+
 struct ServoV8RealmState {
   ServoV8Runtime* runtime = nullptr;
   // Needed so a microtask failure can name the realm that produced it; Servo
@@ -297,12 +310,17 @@ struct ServoV8RealmState {
   v8::Global<v8::Context> context;
   v8::Global<v8::Object> document;
   std::unordered_map<ServoV8ScriptId, v8::Global<v8::Script>> scripts;
+  std::unordered_map<ServoV8TimerCallbackId, ServoV8TimerCallback>
+      timer_callbacks;
+  std::unordered_map<int32_t, ServoV8TimerCallbackId> timer_handles;
+  ServoV8TimerCallbackId next_timer_callback_id = 1;
   // Weak, so a wrapper script can no longer reach is collected rather than
   // pinned for the life of the realm along with the element behind it.
   std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
       wrappers;
   v8::Global<v8::ObjectTemplate> element_template;
   ServoV8DocumentHostState document_host;
+  ServoV8TimerHostState timer_host;
   bool tearing_down = false;
 };
 
@@ -775,7 +793,218 @@ void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(result);
 }
 
+ServoV8RealmState* TimerCallbackRealm(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  auto* runtime =
+      static_cast<ServoV8Runtime*>(isolate->GetData(kServoRuntimeIsolateSlot));
+  if (!runtime || runtime->isolate != isolate || !info.Data()->IsBigInt()) {
+    return nullptr;
+  }
+  bool lossless = false;
+  const ServoV8RealmId realm_id =
+      info.Data().As<v8::BigInt>()->Uint64Value(&lossless);
+  if (!lossless) return nullptr;
+  const auto entry = runtime->realms.find(realm_id);
+  if (entry == runtime->realms.end()) return nullptr;
+  ServoV8RealmState* realm = entry->second.get();
+  if (realm->tearing_down || realm->runtime != runtime ||
+      realm->context.IsEmpty() ||
+      realm->context.Get(isolate) != isolate->GetCurrentContext()) {
+    return nullptr;
+  }
+  return realm;
+}
+
+bool TimerDelay(v8::Local<v8::Context> context,
+                const v8::FunctionCallbackInfo<v8::Value>& info,
+                int32_t* timeout_ms) {
+  *timeout_ms = 0;
+  return info.Length() < 2 || info[1]->IsUndefined() ||
+         info[1]->Int32Value(context).To(timeout_ms);
+}
+
+bool TimerHandle(v8::Local<v8::Context> context,
+                 const v8::FunctionCallbackInfo<v8::Value>& info,
+                 int32_t* handle) {
+  *handle = 0;
+  return info.Length() < 1 || info[0]->IsUndefined() ||
+         info[0]->Int32Value(context).To(handle);
+}
+
+void ScheduleTimer(const v8::FunctionCallbackInfo<v8::Value>& info,
+                   bool is_interval) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = TimerCallbackRealm(info);
+  if (!realm || !realm->timer_host.native ||
+      realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "invalid timer host state");
+    return;
+  }
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, "setTimeout/setInterval requires a handler");
+    return;
+  }
+
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  int32_t timeout_ms = 0;
+  if (!TimerDelay(context, info, &timeout_ms)) return;
+  int32_t handle = 0;
+  ServoV8TimerHostState& host = realm->timer_host;
+
+  if (info[0]->IsFunction()) {
+    if (!host.vtable.schedule_function) {
+      ThrowTypeError(isolate, "timer function host callback is unavailable");
+      return;
+    }
+    if (realm->next_timer_callback_id == 0) {
+      ThrowTypeError(isolate, "timer callback ID space is exhausted");
+      return;
+    }
+    const ServoV8TimerCallbackId callback_id =
+        realm->next_timer_callback_id++;
+
+    ServoV8TimerCallback callback;
+    callback.function.Reset(isolate, info[0].As<v8::Function>());
+    callback.arguments.reserve(
+        info.Length() > 2 ? static_cast<size_t>(info.Length() - 2) : 0);
+    for (int index = 2; index < info.Length(); ++index) {
+      callback.arguments.emplace_back(isolate, info[index]);
+    }
+    callback.is_interval = is_interval;
+    auto [entry, inserted] =
+        realm->timer_callbacks.try_emplace(callback_id, std::move(callback));
+    if (!inserted) {
+      ThrowTypeError(isolate, "timer callback ID collision");
+      return;
+    }
+
+    uint8_t scheduled = 0;
+    {
+      RustCallbackScope callback_scope(realm->runtime);
+      scheduled = host.vtable.schedule_function(
+          host.native, realm->document_host.active_host_context, callback_id,
+          timeout_ms, is_interval ? 1 : 0, &handle);
+    }
+    if (!scheduled || handle <= 0) {
+      realm->timer_callbacks.erase(entry);
+      ThrowTypeError(isolate, "timer function host callback failed");
+      return;
+    }
+    entry->second.handle = handle;
+    const bool handle_inserted =
+        realm->timer_handles.try_emplace(handle, callback_id).second;
+    if (!handle_inserted) {
+      {
+        RustCallbackScope callback_scope(realm->runtime);
+        host.vtable.clear(host.native, handle);
+      }
+      realm->timer_callbacks.erase(entry);
+      ThrowTypeError(isolate, "timer host returned a duplicate active handle");
+      return;
+    }
+  } else {
+    if (!host.vtable.schedule_string) {
+      ThrowTypeError(isolate, "timer string host callback is unavailable");
+      return;
+    }
+    v8::Local<v8::String> source;
+    if (!info[0]->ToString(context).ToLocal(&source)) return;
+    v8::String::Utf8Value utf8(isolate, source);
+    if (!*utf8 && utf8.length() != 0) return;
+    uint8_t scheduled = 0;
+    {
+      RustCallbackScope callback_scope(realm->runtime);
+      scheduled = host.vtable.schedule_string(
+          host.native, realm->document_host.active_host_context,
+          reinterpret_cast<const uint8_t*>(*utf8),
+          static_cast<size_t>(utf8.length()), timeout_ms,
+          is_interval ? 1 : 0, &handle);
+    }
+    if (!scheduled || handle < 0) {
+      ThrowTypeError(isolate, "timer string host callback failed");
+      return;
+    }
+  }
+
+  info.GetReturnValue().Set(handle);
+}
+
+void SetTimeout(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ScheduleTimer(info, false);
+}
+
+void SetInterval(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ScheduleTimer(info, true);
+}
+
+void ClearTimer(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = TimerCallbackRealm(info);
+  if (!realm || !realm->timer_host.native || !realm->timer_host.vtable.clear ||
+      realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "invalid timer host state");
+    return;
+  }
+  int32_t handle = 0;
+  if (!TimerHandle(isolate->GetCurrentContext(), info, &handle)) return;
+
+  const auto mapping = realm->timer_handles.find(handle);
+  if (mapping != realm->timer_handles.end()) {
+    realm->timer_callbacks.erase(mapping->second);
+    realm->timer_handles.erase(mapping);
+  }
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    realm->timer_host.vtable.clear(realm->timer_host.native, handle);
+  }
+}
+
+bool InstallTimerGlobals(ServoV8RealmState* realm,
+                         v8::Local<v8::Context> context,
+                         v8::Local<v8::Object> global) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::Local<v8::BigInt> data = v8::BigInt::NewFromUnsigned(isolate, realm->id);
+  const v8::PropertyAttribute attributes = v8::DontEnum;
+  struct TimerOperation {
+    const char* name;
+    v8::FunctionCallback callback;
+    int length;
+  };
+  const TimerOperation operations[] = {
+      {"setTimeout", &SetTimeout, 1},
+      {"clearTimeout", &ClearTimer, 0},
+      {"setInterval", &SetInterval, 1},
+      {"clearInterval", &ClearTimer, 0},
+  };
+  for (const auto& operation : operations) {
+    v8::Local<v8::String> name = V8String(isolate, operation.name);
+    v8::Local<v8::Function> function;
+    if (!v8::Function::New(context, operation.callback, data, operation.length,
+                           v8::ConstructorBehavior::kThrow)
+             .ToLocal(&function)) {
+      return false;
+    }
+    function->SetName(name);
+    if (!global->DefineOwnProperty(context, name, function, attributes)
+             .FromMaybe(false)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void ResetDocumentHost(ServoV8DocumentHostState* state) {
+  void* native = std::exchange(state->native, nullptr);
+  const ServoV8DropCallback drop = state->vtable.drop;
+  state->vtable = {};
+  if (native && drop) {
+    RustCallbackScope callback_scope(state->runtime);
+    drop(native);
+  }
+}
+
+void ResetTimerHost(ServoV8TimerHostState* state) {
   void* native = std::exchange(state->native, nullptr);
   const ServoV8DropCallback drop = state->vtable.drop;
   state->vtable = {};
@@ -830,6 +1059,8 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
         kServoRealmStateEmbedderSlot, nullptr, kServoRealmStateEmbedderTag);
   }
   realm->scripts.clear();
+  realm->timer_handles.clear();
+  realm->timer_callbacks.clear();
   // Release every host now. The cells stay cppgc-owned and die whenever the
   // next collection runs, but their Servo roots must not outlive the realm --
   // otherwise a torn-down pipeline's DOM stays pinned until the isolate
@@ -841,6 +1072,7 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->element_template.Reset();
   realm->document.Reset();
   realm->context.Reset();
+  ResetTimerHost(&realm->timer_host);
   ResetDocumentHost(&realm->document_host);
   runtime->isolate->ContextDisposedNotification(
       v8::ContextDependants::kSomeDependants);
@@ -1082,7 +1314,10 @@ extern "C" int32_t servo_v8_realm_create(
   v8::HandleScope handle_scope(isolate);
   auto realm = std::make_unique<ServoV8RealmState>();
   realm->runtime = runtime;
+  const ServoV8RealmId id = runtime->next_realm_id++;
+  realm->id = id;
   realm->document_host.runtime = runtime;
+  realm->timer_host.runtime = runtime;
   v8::Local<v8::Context> context = v8::Context::New(isolate);
   if (context.IsEmpty()) {
     WriteError(error, "V8 failed to allocate a realm context");
@@ -1118,6 +1353,13 @@ extern "C" int32_t servo_v8_realm_create(
     WriteError(error, "V8 realm could not remove the built-in console");
     return 0;
   }
+  if (!InstallTimerGlobals(realm.get(), context, global)) {
+    context->SetAlignedPointerInEmbedderData(
+        kServoRealmStateEmbedderSlot, nullptr,
+        kServoRealmStateEmbedderTag);
+    WriteError(error, TryCatchMessage(isolate, try_catch));
+    return 0;
+  }
 
   // Element instances are built from a FunctionTemplate instance template,
   // which is what makes them wrappable by v8::Object::Wrap.
@@ -1149,8 +1391,6 @@ extern "C" int32_t servo_v8_realm_create(
     return 0;
   }
 
-  const ServoV8RealmId id = runtime->next_realm_id++;
-  realm->id = id;
   realm->element_template.Reset(isolate, element_instance);
   realm->context.Reset(isolate, context);
   realm->document.Reset(isolate, document);
@@ -1474,6 +1714,125 @@ extern "C" int32_t servo_v8_realm_install_document_host(
   // no-fail ownership handoff after all validation has completed.
   realm->document_host.native = native;
   realm->document_host.vtable = *vtable;
+  return 1;
+}
+
+extern "C" int32_t servo_v8_realm_install_timer_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8TimerHostVTable* vtable,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!native) {
+    WriteError(error, "timer host native pointer is null");
+    return 0;
+  }
+  if (!vtable || !vtable->schedule_function || !vtable->schedule_string ||
+      !vtable->clear || !vtable->drop) {
+    WriteError(error, "timer host vtable is incomplete");
+    return 0;
+  }
+  ServoV8RealmState* realm = FindRealm(runtime, realm_id, error);
+  if (!realm) return 0;
+  if (realm->tearing_down) {
+    WriteError(error, "cannot install a timer host while its realm tears down");
+    return 0;
+  }
+  if (realm->timer_host.native) {
+    WriteError(error, "timer host is already installed in this realm");
+    return 0;
+  }
+
+  realm->timer_host.native = native;
+  realm->timer_host.vtable = *vtable;
+  return 1;
+}
+
+extern "C" int32_t servo_v8_realm_timer_callback_run(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!outcome) {
+    WriteError(error, "timer callback run outcome pointer is null");
+    return 0;
+  }
+  ClearScriptRunOutcome(outcome);
+  if (!CheckRuntime(runtime, error)) return 0;
+  ServoV8RealmState* realm = FindRealm(runtime, realm_id, error);
+  if (!realm) return 0;
+  if (realm->document_host.active_host_context) {
+    WriteError(error, "Document host context is already active");
+    return 0;
+  }
+  const auto entry = realm->timer_callbacks.find(callback_id);
+  if (entry == realm->timer_callbacks.end()) {
+    WriteError(error, "unknown or cleared Servo V8 timer callback " +
+                          std::to_string(callback_id) + " in realm " +
+                          std::to_string(realm_id));
+    return 0;
+  }
+
+  v8::Isolate* isolate = runtime->isolate;
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = realm->context.Get(isolate);
+  v8::Context::Scope context_scope(context);
+
+  // Root every value locally before a one-shot erases its strong registry
+  // entry. A callback may also clear its own interval while it is running; the
+  // locals make that safe without keeping the interval alive afterward.
+  v8::Local<v8::Function> function = entry->second.function.Get(isolate);
+  std::vector<v8::Local<v8::Value>> arguments;
+  arguments.reserve(entry->second.arguments.size());
+  for (const auto& argument : entry->second.arguments) {
+    arguments.push_back(argument.Get(isolate));
+  }
+  const bool is_interval = entry->second.is_interval;
+  const int32_t handle = entry->second.handle;
+  if (!is_interval) {
+    realm->timer_callbacks.erase(entry);
+    realm->timer_handles.erase(handle);
+  }
+
+  ActiveHostContextScope host_context_scope(&realm->document_host,
+                                            host_context);
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::Value> value;
+  if (!function
+           ->Call(context, context->Global(),
+                  static_cast<int>(arguments.size()), arguments.data())
+           .ToLocal(&value)) {
+    if (try_catch.HasTerminated()) {
+      outcome->status = SERVO_V8_SCRIPT_RUN_TERMINATED;
+      return 1;
+    }
+    outcome->status = SERVO_V8_SCRIPT_RUN_THROWN;
+    CaptureScriptException(isolate, context, try_catch,
+                           &outcome->exception);
+    return 1;
+  }
+  return 1;
+}
+
+extern "C" int32_t servo_v8_realm_timer_callback_clear(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  ServoV8RealmState* realm = FindRealm(runtime, realm_id, error);
+  if (!realm) return 0;
+  const auto entry = realm->timer_callbacks.find(callback_id);
+  if (entry == realm->timer_callbacks.end()) return 1;
+  realm->timer_handles.erase(entry->second.handle);
+  realm->timer_callbacks.erase(entry);
   return 1;
 }
 

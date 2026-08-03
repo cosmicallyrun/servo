@@ -38,6 +38,9 @@ proofs=(
   "authoritative_title_proof.html:(0, 255, 0):1:1"
   "authoritative_metadata_proof.html:(0, 255, 0):1:1"
   "authoritative_timer_proof.html:(0, 255, 0):1:1"
+  "authoritative_native_timers_proof.html:(0, 255, 0):1:1"
+  # The final colour is set by SpiderMonkey after it clears the V8 timer.
+  "authoritative_cross_engine_timer_clear_proof.html:(0, 255, 0):0:0"
   "authoritative_realm_surface_proof.html:(0, 255, 0):1:1"
   "authoritative_document_open_proof.html:(0, 255, 0):1:1"
   "authoritative_wrapper_identity_proof.html:(0, 255, 0):1:1"

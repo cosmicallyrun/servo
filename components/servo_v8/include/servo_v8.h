@@ -12,13 +12,14 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 19u
+#define SERVO_V8_ABI_VERSION 20u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
 typedef struct ServoV8TraceVisitor ServoV8TraceVisitor;
 typedef uint64_t ServoV8RealmId;
 typedef uint64_t ServoV8ScriptId;
+typedef uint64_t ServoV8TimerCallbackId;
 
 typedef struct ServoV8ErrorBuffer {
   char* data;
@@ -91,6 +92,30 @@ typedef struct ServoV8ElementHostVTable {
   uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
   ServoV8DropCallback drop;
 } ServoV8ElementHostVTable;
+
+/* A realm-owned host for HTML's timer scheduling algorithms.
+ *
+ * V8 owns callable handlers and their arbitrary JS arguments. Servo owns wall
+ * clock scheduling, nesting, cancellation, and the numeric handle exposed to
+ * the page. `host_context` is the live SpiderMonkey JSContext for the current
+ * V8 entry and may be used only synchronously. */
+typedef struct ServoV8TimerHostVTable {
+  uint8_t (*schedule_function)(void* native,
+                               void* host_context,
+                               ServoV8TimerCallbackId callback_id,
+                               int32_t timeout_ms,
+                               uint8_t is_interval,
+                               int32_t* handle);
+  uint8_t (*schedule_string)(void* native,
+                             void* host_context,
+                             const uint8_t* source,
+                             size_t source_length,
+                             int32_t timeout_ms,
+                             uint8_t is_interval,
+                             int32_t* handle);
+  void (*clear)(void* native, int32_t handle);
+  ServoV8DropCallback drop;
+} ServoV8TimerHostVTable;
 
 uint32_t servo_v8_abi_version(void);
 
@@ -185,6 +210,31 @@ int32_t servo_v8_realm_install_document_host(
     ServoV8RealmId realm_id,
     void* native,
     const ServoV8DocumentHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_timer_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8TimerHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Invokes one V8 function handler retained by setTimeout/setInterval. */
+int32_t servo_v8_realm_timer_callback_run(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error);
+
+/* Releases a retained timer function without invoking it. Missing callbacks
+ * are a successful no-op, matching clearTimeout/clearInterval semantics. */
+int32_t servo_v8_realm_timer_callback_clear(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
     ServoV8ErrorBuffer* error);
 
 int32_t servo_v8_realm_document_hidden(ServoV8Runtime* runtime,

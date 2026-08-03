@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 19;
+const ABI_VERSION: u32 = 20;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -48,6 +48,14 @@ pub struct RealmId(u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct ScriptId(u64);
+
+/// Identifies one V8 function and argument list retained for a Servo timer.
+///
+/// Callback IDs are realm-local, never reused, and stop being valid when the
+/// one-shot fires, the timer is cleared, or the realm is destroyed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct TimerCallbackId(u64);
 
 #[repr(C)]
 struct ErrorBuffer {
@@ -193,6 +201,128 @@ pub struct ElementHostVTable {
     pub drop: Option<DropCallback>,
 }
 
+/// A realm-owned bridge to Servo's timer scheduler.
+///
+/// # Safety
+///
+/// Implementations and `Drop` must stay on the owning script thread, must not
+/// unwind, re-enter V8, pump an event loop, or access the V8 sidecar `RefCell`.
+/// `host_context` is valid only during the synchronous call that supplies it.
+pub unsafe trait TimerHostBinding: Sized + 'static {
+    fn schedule_function(
+        &self,
+        host_context: *mut c_void,
+        callback_id: TimerCallbackId,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32>;
+
+    fn schedule_string(
+        &self,
+        host_context: *mut c_void,
+        source: &str,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32>;
+
+    fn clear(&self, handle: i32);
+}
+
+#[repr(C)]
+struct TimerHostVTable {
+    schedule_function: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, TimerCallbackId, i32, u8, *mut i32) -> u8,
+    >,
+    schedule_string: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, i32, u8, *mut i32) -> u8,
+    >,
+    clear: Option<unsafe extern "C" fn(*mut c_void, i32)>,
+    drop: Option<DropCallback>,
+}
+
+unsafe extern "C" fn timer_host_schedule_function<T: TimerHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    callback_id: TimerCallbackId,
+    timeout_ms: i32,
+    is_interval: u8,
+    handle: *mut i32,
+) -> u8 {
+    if native.is_null() || handle.is_null() || is_interval > 1 {
+        return 0;
+    }
+    // SAFETY: The timer-host vtable contract supplies this exact live Box<T>.
+    let native = unsafe { &*native.cast::<T>() };
+    let Some(value) =
+        native.schedule_function(host_context, callback_id, timeout_ms, is_interval != 0)
+    else {
+        return 0;
+    };
+    // SAFETY: handle is non-null and points to caller-owned writable storage.
+    unsafe { *handle = value };
+    1
+}
+
+unsafe extern "C" fn timer_host_schedule_string<T: TimerHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    source: *const u8,
+    source_length: usize,
+    timeout_ms: i32,
+    is_interval: u8,
+    handle: *mut i32,
+) -> u8 {
+    if native.is_null()
+        || handle.is_null()
+        || is_interval > 1
+        || (source.is_null() && source_length != 0)
+    {
+        return 0;
+    }
+    let bytes = if source_length == 0 {
+        &[]
+    } else {
+        // SAFETY: C++ keeps this UTF-8 allocation live for the synchronous call.
+        unsafe { std::slice::from_raw_parts(source, source_length) }
+    };
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    // SAFETY: The timer-host vtable contract supplies this exact live Box<T>.
+    let native = unsafe { &*native.cast::<T>() };
+    let Some(value) = native.schedule_string(host_context, source, timeout_ms, is_interval != 0)
+    else {
+        return 0;
+    };
+    // SAFETY: handle is non-null and points to caller-owned writable storage.
+    unsafe { *handle = value };
+    1
+}
+
+unsafe extern "C" fn timer_host_clear<T: TimerHostBinding>(native: *mut c_void, handle: i32) {
+    if native.is_null() {
+        return;
+    }
+    // SAFETY: The timer-host vtable contract supplies this exact live Box<T>.
+    unsafe { &*native.cast::<T>() }.clear(handle);
+}
+
+unsafe extern "C" fn timer_host_drop<T: TimerHostBinding>(native: *mut c_void) {
+    // SAFETY: The bridge hands back exactly the Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+impl TimerHostVTable {
+    fn for_type<T: TimerHostBinding>() -> Self {
+        Self {
+            schedule_function: Some(timer_host_schedule_function::<T>),
+            schedule_string: Some(timer_host_schedule_string::<T>),
+            clear: Some(timer_host_clear::<T>),
+            drop: Some(timer_host_drop::<T>),
+        }
+    }
+}
+
 unsafe extern "C" fn element_host_get_tag_name<T: ElementHostBinding>(
     native: *mut c_void,
     output: *mut OwnedUtf8,
@@ -301,6 +431,27 @@ unsafe extern "C" {
         realm_id: RealmId,
         native: *mut c_void,
         vtable: *const DocumentHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_realm_install_timer_host(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        native: *mut c_void,
+        vtable: *const TimerHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_realm_timer_callback_run(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+        host_context: *mut c_void,
+        outcome: *mut RawScriptRunOutcome,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_realm_timer_callback_clear(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_realm_document_hidden(
@@ -872,6 +1023,132 @@ impl Runtime {
         Ok(())
     }
 
+    /// Installs one realm-owned host that connects V8 timer operations to the
+    /// embedder's scheduler. Failed installation leaves ownership in Rust.
+    pub fn install_timer_host<T: TimerHostBinding>(
+        &mut self,
+        realm_id: RealmId,
+        host: T,
+    ) -> Result<(), Error> {
+        let vtable = TimerHostVTable::for_type::<T>();
+        let native = Box::into_raw(Box::new(host)).cast();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: native is one live Box<T>; C++ consumes it only on success.
+        let succeeded = unsafe {
+            servo_v8_realm_install_timer_host(
+                self.raw.as_ptr(),
+                realm_id,
+                native,
+                &vtable,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            // SAFETY: Every C++ failure path leaves native untouched.
+            drop(unsafe { Box::from_raw(native.cast::<T>()) });
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
+    /// Invokes a retained timer function with no embedding host context.
+    pub fn run_timer_callback_in_realm(
+        &mut self,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+    ) -> Result<ScriptRunOutcome, Error> {
+        // SAFETY: A null context disables embedding callbacks that need one.
+        unsafe {
+            self.run_timer_callback_in_realm_with_host_context(
+                realm_id,
+                callback_id,
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// Invokes a retained timer function with one ephemeral host context.
+    ///
+    /// # Safety
+    ///
+    /// `host_context` must remain valid for every synchronous native callback
+    /// made during this invocation and may not be retained by a host.
+    pub unsafe fn run_timer_callback_in_realm_with_host_context(
+        &mut self,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+        host_context: *mut c_void,
+    ) -> Result<ScriptRunOutcome, Error> {
+        let mut error_storage = [0; ERROR_CAPACITY];
+        let mut message_storage = [0; ERROR_CAPACITY];
+        let mut resource_storage = [0; ERROR_CAPACITY];
+        let mut stack_storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut error_storage);
+        let mut outcome = RawScriptRunOutcome {
+            status: SCRIPT_RUN_COMPLETED,
+            exception: RawScriptException {
+                message: error_buffer(&mut message_storage),
+                resource_name: error_buffer(&mut resource_storage),
+                stack: error_buffer(&mut stack_storage),
+                line_number: 0,
+                column_number: 0,
+            },
+        };
+        // SAFETY: The runtime and every independent output buffer stay live.
+        let succeeded = unsafe {
+            servo_v8_realm_timer_callback_run(
+                self.raw.as_ptr(),
+                realm_id,
+                callback_id,
+                host_context,
+                &mut outcome,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            return Err(error_from(&error_storage, &error));
+        }
+        match outcome.status {
+            SCRIPT_RUN_COMPLETED => Ok(ScriptRunOutcome::Completed),
+            SCRIPT_RUN_THROWN => Ok(ScriptRunOutcome::Thrown(ScriptException {
+                message: text_from(&message_storage, &outcome.exception.message),
+                resource_name: text_from(&resource_storage, &outcome.exception.resource_name),
+                stack: text_from(&stack_storage, &outcome.exception.stack),
+                line_number: outcome.exception.line_number,
+                column_number: outcome.exception.column_number,
+            })),
+            SCRIPT_RUN_TERMINATED => Ok(ScriptRunOutcome::Terminated),
+            status => Err(Error(format!(
+                "V8 returned unknown timer callback run status {status}"
+            ))),
+        }
+    }
+
+    /// Releases one retained timer function without invoking it. Clearing an
+    /// already-fired or already-cleared callback is a successful no-op.
+    pub fn clear_timer_callback_in_realm(
+        &mut self,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+    ) -> Result<(), Error> {
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The runtime is live and the error buffer remains valid.
+        let succeeded = unsafe {
+            servo_v8_realm_timer_callback_clear(
+                self.raw.as_ptr(),
+                realm_id,
+                callback_id,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
     /// Reads `document.hidden` through the installed V8 native accessor.
     pub fn document_hidden(&mut self, realm_id: RealmId) -> Result<bool, Error> {
         let mut storage = [0; ERROR_CAPACITY];
@@ -1227,6 +1504,109 @@ mod tests {
     unsafe impl ElementHostBinding for ElementHostProbe {
         fn tag_name(&self) -> String {
             self.tag_name.clone()
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ScheduledTimerFunction {
+        callback_id: TimerCallbackId,
+        timeout_ms: i32,
+        is_interval: bool,
+        host_context: usize,
+        handle: i32,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ScheduledTimerString {
+        source: String,
+        timeout_ms: i32,
+        is_interval: bool,
+        host_context: usize,
+        handle: i32,
+    }
+
+    struct TimerHostProbe {
+        functions: Rc<RefCell<Vec<ScheduledTimerFunction>>>,
+        strings: Rc<RefCell<Vec<ScheduledTimerString>>>,
+        clears: Rc<RefCell<Vec<i32>>>,
+        drops: Rc<Cell<usize>>,
+        next_handle: Cell<i32>,
+    }
+
+    impl TimerHostProbe {
+        fn new(
+            functions: Rc<RefCell<Vec<ScheduledTimerFunction>>>,
+            strings: Rc<RefCell<Vec<ScheduledTimerString>>>,
+            clears: Rc<RefCell<Vec<i32>>>,
+            drops: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                functions,
+                strings,
+                clears,
+                drops,
+                next_handle: Cell::new(1),
+            }
+        }
+
+        fn allocate_handle(&self) -> i32 {
+            let handle = self.next_handle.get();
+            self.next_handle.set(handle + 1);
+            handle
+        }
+    }
+
+    impl Drop for TimerHostProbe {
+        fn drop(&mut self) {
+            attempt_callback_reentry("timer host drop");
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    // SAFETY: The probe is thread-confined, only records POD/string copies,
+    // cannot unwind, and never re-enters V8 or retains host_context.
+    unsafe impl TimerHostBinding for TimerHostProbe {
+        fn schedule_function(
+            &self,
+            host_context: *mut c_void,
+            callback_id: TimerCallbackId,
+            timeout_ms: i32,
+            is_interval: bool,
+        ) -> Option<i32> {
+            attempt_callback_reentry("timer schedule function");
+            let handle = self.allocate_handle();
+            self.functions.borrow_mut().push(ScheduledTimerFunction {
+                callback_id,
+                timeout_ms,
+                is_interval,
+                host_context: host_context as usize,
+                handle,
+            });
+            Some(handle)
+        }
+
+        fn schedule_string(
+            &self,
+            host_context: *mut c_void,
+            source: &str,
+            timeout_ms: i32,
+            is_interval: bool,
+        ) -> Option<i32> {
+            attempt_callback_reentry("timer schedule string");
+            let handle = self.allocate_handle();
+            self.strings.borrow_mut().push(ScheduledTimerString {
+                source: source.to_owned(),
+                timeout_ms,
+                is_interval,
+                host_context: host_context as usize,
+                handle,
+            });
+            Some(handle)
+        }
+
+        fn clear(&self, handle: i32) {
+            attempt_callback_reentry("timer clear");
+            self.clears.borrow_mut().push(handle);
         }
     }
 
@@ -2031,6 +2411,221 @@ mod tests {
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(element_drops.get(), 2);
         assert!(runtime.wrapper_cache_size_for_testing(realm).is_err());
+    }
+
+    #[test]
+    fn timer_host_retains_invokes_clears_and_drops_callbacks() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let _reentry = CallbackReentryConfig::new(runtime.raw.as_ptr());
+        let realm = runtime.create_realm().unwrap();
+        let functions = Rc::new(RefCell::new(Vec::new()));
+        let strings = Rc::new(RefCell::new(Vec::new()));
+        let clears = Rc::new(RefCell::new(Vec::new()));
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .install_timer_host(
+                realm,
+                TimerHostProbe::new(
+                    Rc::clone(&functions),
+                    Rc::clone(&strings),
+                    Rc::clone(&clears),
+                    Rc::clone(&drops),
+                ),
+            )
+            .unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => {\n\
+                       const names = ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'];\n\
+                       const expectedLengths = [1, 0, 1, 0];\n\
+                       if (!names.every((name, index) => {\n\
+                         const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);\n\
+                         return descriptor && !descriptor.enumerable && descriptor.writable &&\n\
+                           descriptor.configurable && descriptor.value.name === name &&\n\
+                           descriptor.value.length === expectedLengths[index];\n\
+                       })) return false;\n\
+                       globalThis.timerHandle = setTimeout((left, right) => {\n\
+                         globalThis.timerResult = left + right;\n\
+                       }, 12, 40, 2);\n\
+                       return timerHandle === 1;\n\
+                     })()",
+                )
+                .unwrap()
+        );
+        let one_shot = functions.borrow()[0].clone();
+        assert_eq!(one_shot.timeout_ms, 12);
+        assert!(!one_shot.is_interval);
+        assert_eq!(one_shot.host_context, 0);
+
+        // The callback and arbitrary argument values are strong while active,
+        // so a major V8 collection cannot collect them before Servo fires it.
+        runtime.collect_garbage_for_testing();
+        assert_eq!(
+            runtime
+                .run_timer_callback_in_realm(realm, one_shot.callback_id)
+                .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "timerResult === 42")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, one_shot.callback_id)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown or cleared Servo V8 timer callback")
+        );
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.intervalCount = 0;\n\
+                     globalThis.intervalHandle = setInterval(\n\
+                       increment => intervalCount += increment, 7, 3);\n\
+                     intervalHandle === 2",
+                )
+                .unwrap()
+        );
+        let interval = functions.borrow()[1].clone();
+        assert!(interval.is_interval);
+        for _ in 0..2 {
+            assert_eq!(
+                runtime
+                    .run_timer_callback_in_realm(realm, interval.callback_id)
+                    .unwrap(),
+                ScriptRunOutcome::Completed
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "intervalCount === 6")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "clearTimeout(intervalHandle); true")
+                .unwrap()
+        );
+        assert_eq!(&*clears.borrow(), &[2]);
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, interval.callback_id)
+                .is_err()
+        );
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "setTimeout('globalThis.stringTimerRan = \"\u{2713}\"', -9) === 3",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            &*strings.borrow(),
+            &[ScheduledTimerString {
+                source: "globalThis.stringTimerRan = \"\u{2713}\"".to_owned(),
+                timeout_ms: -9,
+                is_interval: false,
+                host_context: 0,
+                handle: 3,
+            }]
+        );
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.externalClearHandle = setInterval(() => {}, 5);\n\
+                     externalClearHandle === 4",
+                )
+                .unwrap()
+        );
+        let external_clear = functions.borrow()[2].clone();
+        runtime
+            .clear_timer_callback_in_realm(realm, external_clear.callback_id)
+            .unwrap();
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, external_clear.callback_id)
+                .is_err()
+        );
+
+        let schedule_with_context = compiled(runtime.compile_script_in_realm(
+            realm,
+            "setTimeout(() => {}, 0);",
+            "timer-host-context.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token stays live for the synchronous run and the probe
+        // records its address but never dereferences or retains it for use.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    schedule_with_context,
+                    (&mut host_context_token as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        let with_context = functions.borrow()[3].clone();
+        assert_eq!(
+            with_context.host_context,
+            (&mut host_context_token as *mut u8) as usize
+        );
+        runtime
+            .clear_timer_callback_in_realm(realm, with_context.callback_id)
+            .unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => {\n\
+                       let missing = false, symbol = false, delay = false;\n\
+                       try { setTimeout(); } catch (error) { missing = error instanceof TypeError; }\n\
+                       try { setTimeout(Symbol('handler')); }\n\
+                       catch (error) { symbol = error instanceof TypeError; }\n\
+                       const sentinel = new Error('delay sentinel');\n\
+                       try { setTimeout(() => {}, { valueOf() { throw sentinel; } }); }\n\
+                       catch (error) { delay = error === sentinel; }\n\
+                       return missing && symbol && delay;\n\
+                     })()",
+                )
+                .unwrap()
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(drops.get(), 1);
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, interval.callback_id)
+                .is_err()
+        );
+        CALLBACK_REENTRY_ATTEMPTS.with(|attempts| {
+            let attempts = attempts.borrow();
+            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer schedule function"));
+            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer schedule string"));
+            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer clear"));
+            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer host drop"));
+            assert!(attempts.iter().all(|(_, status, error)| {
+                *status == 0 && error.contains("re-entered from a Rust host callback")
+            }));
+        });
     }
 
     #[test]

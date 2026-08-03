@@ -45,6 +45,10 @@ NODE_NODE_TYPE = "Node.nodeType"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_HEAD = "Document.head"
 DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
+WINDOW_OR_WORKER_SET_TIMEOUT = "WindowOrWorkerGlobalScope.setTimeout"
+WINDOW_OR_WORKER_CLEAR_TIMEOUT = "WindowOrWorkerGlobalScope.clearTimeout"
+WINDOW_OR_WORKER_SET_INTERVAL = "WindowOrWorkerGlobalScope.setInterval"
+WINDOW_OR_WORKER_CLEAR_INTERVAL = "WindowOrWorkerGlobalScope.clearInterval"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -143,6 +147,17 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
         PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
         "Element",
     ),
+)
+
+# These operations are installed by a separate per-realm timer host rather
+# than the Document host generator. Keeping the exact production declarations
+# here still gives the hand-written native bridge the same fail-closed WebIDL
+# gate as generated Document members.
+TIMER_HOST = (
+    WINDOW_OR_WORKER_SET_TIMEOUT,
+    WINDOW_OR_WORKER_CLEAR_TIMEOUT,
+    WINDOW_OR_WORKER_SET_INTERVAL,
+    WINDOW_OR_WORKER_CLEAR_INTERVAL,
 )
 
 
@@ -491,6 +506,130 @@ def select_pure_domstring_to_nullable_interface_operation(
     return member
 
 
+def _select_timer_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLMethod:
+    """Select one exact production timer operation from its interface mixin."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    mixins = [
+        result
+        for result in parser_results
+        if result.isInterfaceMixin() and result.identifier.name == interface_name
+    ]
+    if len(mixins) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface mixin `{interface_name}`, found {len(mixins)}"
+        )
+    members = [member for member in mixins[0].members if member.identifier.name == member_name]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+    member = members[0]
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an ordinary instance operation")
+
+    is_setter = member_name in {"setTimeout", "setInterval"}
+    expected_attributes = {"Throws"} if is_setter else set()
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != expected_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+            f"got {sorted(actual_attributes)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    expected_return_tag = WebIDL.IDLType.Tags.int32 if is_setter else WebIDL.IDLType.Tags.undefined
+    if return_type.nullable() or return_type.tag() != expected_return_tag:
+        expected_return = "long" if is_setter else "undefined"
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `{expected_return}`, "
+            f"got `{return_type.prettyName()}`"
+        )
+
+    if is_setter:
+        if len(arguments) != 3:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take exactly three arguments, found {len(arguments)}"
+            )
+        handler, timeout, trailing = arguments
+        if handler.identifier.name != "handler" or handler.optional or handler.variadic:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must begin with required `handler`"
+            )
+        if handler.type.nullable() or not handler.type.isUnion():
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` handler must use the non-nullable TimerHandler union"
+            )
+        handler_types = tuple(part.prettyName() for part in handler.type.memberTypes)
+        if handler_types != ("TrustedScript", "DOMString", "Function"):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` handler union must be "
+                "['TrustedScript', 'DOMString', 'Function'], "
+                f"got {list(handler_types)}"
+            )
+        _require_plain_timer_argument(qualified_name, handler)
+        _require_optional_long_default_zero(qualified_name, timeout, "timeout")
+        if (
+            trailing.identifier.name != "arguments"
+            or not trailing.optional
+            or not trailing.variadic
+            or trailing.defaultValue is not None
+            or trailing.type.nullable()
+            or not trailing.type.isAny()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must end with variadic `any... arguments`"
+            )
+        _require_plain_timer_argument(qualified_name, trailing)
+    else:
+        if len(arguments) != 1:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take exactly one argument, found {len(arguments)}"
+            )
+        _require_optional_long_default_zero(qualified_name, arguments[0], "handle")
+
+    return member
+
+
+def _require_plain_timer_argument(qualified_name: str, argument: WebIDL.IDLArgument) -> None:
+    attributes = set(argument._extendedAttrDict) | set(argument.type._extendedAttrDict)
+    if attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument.identifier.name}` carries extended "
+            "attributes that are not implemented: " + ", ".join(sorted(attributes))
+        )
+
+
+def _require_optional_long_default_zero(
+    qualified_name: str,
+    argument: WebIDL.IDLArgument,
+    expected_name: str,
+) -> None:
+    default = argument.defaultValue
+    if (
+        argument.identifier.name != expected_name
+        or not argument.optional
+        or argument.variadic
+        or argument.type.nullable()
+        or argument.type.tag() != WebIDL.IDLType.Tags.int32
+        or default is None
+        or default.value != 0
+        or default.type.tag() != WebIDL.IDLType.Tags.int32
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{expected_name}` must be optional non-nullable "
+            "`long` with default 0"
+        )
+    _require_plain_timer_argument(qualified_name, argument)
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -575,6 +714,20 @@ def select_document_host_members(
     return {
         member.qualified_name: _select_document_host_member(parser_results, member)
         for member in DOCUMENT_HOST
+    }
+
+
+def select_timer_host_members(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> dict[str, WebIDL.IDLMethod]:
+    """Load the production corpus and pin the four timer operations."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return {
+        qualified_name: _select_timer_operation(parser_results, qualified_name)
+        for qualified_name in TIMER_HOST
     }
 
 
