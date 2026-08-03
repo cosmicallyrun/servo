@@ -218,6 +218,28 @@ class ProductionElementTests(unittest.TestCase):
         self.assertEqual(arguments[0].identifier.name, "name")
 
 
+class ProductionNodeTests(unittest.TestCase):
+    def test_pins_the_real_scalar_node_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_node_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.NODE_HOST))
+        self.assertTrue(members[production_webidl.NODE_NODE_TYPE].readonly)
+        self.assertTrue(members[production_webidl.NODE_NODE_NAME].readonly)
+        self.assertTrue(members[production_webidl.NODE_IS_CONNECTED].readonly)
+        text_content = members[production_webidl.NODE_TEXT_CONTENT]
+        self.assertFalse(text_content.readonly)
+        self.assertTrue(text_content.type.nullable())
+        return_type, arguments = members[
+            production_webidl.NODE_HAS_CHILD_NODES
+        ].signatures()[0]
+        self.assertTrue(return_type.isBoolean())
+        self.assertEqual(arguments, [])
+
+
 class SyntheticSelectionTests(unittest.TestCase):
     def parse(self, sources: dict[str, str], environment: dict[str, str] | None = None):
         temporary_directory = tempfile.TemporaryDirectory()
@@ -802,6 +824,62 @@ class SyntheticSelectionTests(unittest.TestCase):
             "boolean hasAttribute(optional DOMString name);",
             "hasAttribute",
             "`Element.hasAttribute` must take required non-nullable `DOMString name`",
+        )
+
+    def assert_node_rejected(
+        self,
+        declaration: str,
+        member: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse(
+            {"Node.webidl": f"interface Node {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_node_host_member(
+                parser_results,
+                f"Node.{member}",
+            )
+
+    def test_selects_exact_nullable_node_text_content(self) -> None:
+        parser_results = self.parse(
+            {
+                "Node.webidl": """interface Node {
+                    [CEReactions, Pure, SetterThrows]
+                    attribute DOMString? textContent;
+                };""",
+            }
+        )
+        member = production_webidl._select_node_host_member(
+            parser_results,
+            production_webidl.NODE_TEXT_CONTENT,
+        )
+        self.assertFalse(member.readonly)
+        self.assertTrue(member.type.nullable())
+
+    def test_rejects_node_text_content_without_setter_throws(self) -> None:
+        self.assert_node_rejected(
+            "[CEReactions, Pure] attribute DOMString? textContent;",
+            "textContent",
+            "`Node.textContent` must carry exactly ['CEReactions', 'Pure', 'SetterThrows'], "
+            "got ['CEReactions', 'Pure']",
+        )
+
+    def test_rejects_nullable_node_name(self) -> None:
+        self.assert_node_rejected(
+            "[Pure] readonly attribute DOMString? nodeName;",
+            "nodeName",
+            "`Node.nodeName` must use non-nullable `DOMString`, got `DOMString?`",
+        )
+
+    def test_rejects_has_child_nodes_arguments(self) -> None:
+        self.assert_node_rejected(
+            "[Pure] boolean hasChildNodes(boolean unexpected);",
+            "hasChildNodes",
+            "`Node.hasChildNodes` must take no arguments, found 1",
         )
 
 

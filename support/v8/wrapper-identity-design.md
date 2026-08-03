@@ -1,14 +1,14 @@
 # Per-realm wrapper identity for DOM objects
 
 Status: implemented, initially at exported C ABI version 19 and extended with a
-shared Element prototype at ABI version 22. `Document.documentElement`,
-`Document.head`, `Document.getElementById()`, and the scalar Element slice are
-built on it.
+shared Element prototype at ABI version 22 and its inherited Node prototype at
+ABI version 23. `Document.documentElement`, `Document.head`,
+`Document.getElementById()`, and the scalar Element/Node slices are built on it.
 
 This is the subsystem every interface-typed binding waits on.
 `Document.documentElement`, `Document.head`, `Document.getElementById`,
-the scalar Element slice, and eventually anything that hands a DOM node to
-script all need the same thing: asking for the same DOM object twice must produce the
+the scalar Element and Node slices, and eventually anything that hands a DOM
+node to script all need the same thing: asking for the same DOM object twice must produce the
 *same* JavaScript object, while two different DOM objects must never share one
 wrapper.
 
@@ -222,7 +222,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 
 `authoritative_wrapper_identity_proof.html`,
 `authoritative_get_element_by_id_proof.html`, and
-`authoritative_element_scalar_proof.html` cover runtime behaviour against real
+`authoritative_element_scalar_proof.html`, and
+`authoritative_node_scalar_proof.html` cover runtime behaviour against real
 Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by

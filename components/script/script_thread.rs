@@ -139,6 +139,8 @@ use crate::dom::bindings::conversions::{
 };
 #[cfg(feature = "v8-classic-script-authoritative")]
 use crate::dom::bindings::error::ErrorInfo;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::error::throw_dom_exception;
 use crate::dom::bindings::inheritance::Castable;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::refcounted::Trusted;
@@ -328,6 +330,51 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         let value = self.element.root().HasAttribute(cx, DOMString::from(name));
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
+    }
+
+    fn node_type(&self) -> u16 {
+        self.element.root().upcast::<Node>().NodeType()
+    }
+
+    fn node_name(&self) -> String {
+        self.element.root().upcast::<Node>().NodeName().into()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.element.root().upcast::<Node>().IsConnected()
+    }
+
+    fn text_content(&self) -> Option<String> {
+        self.element
+            .root()
+            .upcast::<Node>()
+            .GetTextContent()
+            .map(Into::into)
+    }
+
+    unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let element = self.element.root();
+        let result = element
+            .upcast::<Node>()
+            .SetTextContent(cx, value.map(DOMString::from));
+        if let Err(error) = result {
+            throw_dom_exception(cx, &element.global(), error);
+            return false;
+        }
+        // `[CEReactions]` deliberately remains on Servo's outer or backup
+        // queue, so no disconnected callback can enter SpiderMonkey beneath
+        // the V8 setter or sidecar borrow.
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    fn has_child_nodes(&self) -> bool {
+        self.element.root().upcast::<Node>().HasChildNodes()
     }
 }
 

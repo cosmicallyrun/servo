@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 22;
+const ABI_VERSION: u32 = 23;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -205,6 +205,12 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
         name: &str,
     ) -> Result<Option<String>, ()>;
     unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool>;
+    fn node_type(&self) -> u16;
+    fn node_name(&self) -> String;
+    fn is_connected(&self) -> bool;
+    fn text_content(&self) -> Option<String>;
+    unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool;
+    fn has_child_nodes(&self) -> bool;
 }
 
 #[repr(C)]
@@ -234,6 +240,13 @@ pub struct ElementHostVTable {
     >,
     pub has_attribute:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, *mut u8) -> u8>,
+    pub get_node_type: Option<unsafe extern "C" fn(*mut c_void, *mut u16) -> u8>,
+    pub get_node_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub get_is_connected: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_text_content: Option<unsafe extern "C" fn(*mut c_void, *mut OptionalOwnedUtf8) -> u8>,
+    pub set_text_content:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
+    pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
     pub drop: Option<DropCallback>,
 }
 
@@ -485,6 +498,37 @@ element_host_string_getter!(element_host_get_local_name, local_name);
 element_host_string_getter!(element_host_get_tag_name, tag_name);
 element_host_string_getter!(element_host_get_id, id);
 element_host_string_getter!(element_host_get_class_name, class_name);
+element_host_string_getter!(element_host_get_node_name, node_name);
+
+unsafe fn element_host_write_optional_owned_utf8(
+    output: *mut OptionalOwnedUtf8,
+    value: Option<String>,
+) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    let mut owned = OwnedUtf8 {
+        data: std::ptr::null(),
+        length: 0,
+        owner: std::ptr::null_mut(),
+        drop_owner: None,
+    };
+    let is_null = value.is_none();
+    if let Some(value) = value {
+        // SAFETY: `owned` is caller-owned writable storage in this frame.
+        if unsafe { element_host_write_owned_utf8(&mut owned, value) } == 0 {
+            return 0;
+        }
+    }
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe {
+        *output = OptionalOwnedUtf8 {
+            is_null: is_null as u8,
+            value: owned,
+        }
+    };
+    1
+}
 
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
     native: *mut c_void,
@@ -553,27 +597,8 @@ unsafe extern "C" fn element_host_get_attribute<T: ElementHostBinding>(
     let Ok(value) = result else {
         return 0;
     };
-    let mut owned = OwnedUtf8 {
-        data: std::ptr::null(),
-        length: 0,
-        owner: std::ptr::null_mut(),
-        drop_owner: None,
-    };
-    let is_null = value.is_none();
-    if let Some(value) = value {
-        // SAFETY: `owned` is caller-owned writable storage in this frame.
-        if unsafe { element_host_write_owned_utf8(&mut owned, value) } == 0 {
-            return 0;
-        }
-    }
-    // SAFETY: output is non-null and points to caller-owned writable storage.
-    unsafe {
-        *output = OptionalOwnedUtf8 {
-            is_null: is_null as u8,
-            value: owned,
-        }
-    };
-    1
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_optional_owned_utf8(output, value) }
 }
 
 unsafe extern "C" fn element_host_has_attribute<T: ElementHostBinding>(
@@ -597,6 +622,81 @@ unsafe extern "C" fn element_host_has_attribute<T: ElementHostBinding>(
     };
     // SAFETY: output is non-null and points to caller-owned writable storage.
     unsafe { *output = value as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_node_type<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u16,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).node_type() };
+    1
+}
+
+unsafe extern "C" fn element_host_get_is_connected<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).is_connected() as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_text_content<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut OptionalOwnedUtf8,
+) -> u8 {
+    if native.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let value = unsafe { (&*native.cast::<T>()).text_content() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_optional_owned_utf8(output, value) }
+}
+
+unsafe extern "C" fn element_host_set_text_content<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    is_null: u8,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || is_null > 1 {
+        return 0;
+    }
+    let value = if is_null != 0 {
+        if !value.is_null() || value_length != 0 {
+            return 0;
+        }
+        None
+    } else {
+        // SAFETY: The ABI lends this byte range for the synchronous call.
+        let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+            return 0;
+        };
+        Some(value)
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    unsafe { (&*native.cast::<T>()).set_text_content(host_context, value) as u8 }
+}
+
+unsafe extern "C" fn element_host_has_child_nodes<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).has_child_nodes() as u8 };
     1
 }
 
@@ -1230,6 +1330,12 @@ impl Runtime {
             has_attributes: Some(element_host_has_attributes::<T>),
             get_attribute: Some(element_host_get_attribute::<T>),
             has_attribute: Some(element_host_has_attribute::<T>),
+            get_node_type: Some(element_host_get_node_type::<T>),
+            get_node_name: Some(element_host_get_node_name::<T>),
+            get_is_connected: Some(element_host_get_is_connected::<T>),
+            get_text_content: Some(element_host_get_text_content::<T>),
+            set_text_content: Some(element_host_set_text_content::<T>),
+            has_child_nodes: Some(element_host_has_child_nodes::<T>),
             drop: Some(element_host_drop::<T>),
         };
         let mut storage = [0; ERROR_CAPACITY];
@@ -1760,10 +1866,21 @@ mod tests {
     #[derive(Default)]
     struct ElementProbeState {
         attributes: RefCell<Vec<(String, String)>>,
+        text_content: RefCell<Option<String>>,
+        has_child_nodes: Cell<bool>,
+        is_connected: Cell<bool>,
     }
 
     impl ElementProbeState {
         fn with_attributes(attributes: &[(&str, &str)]) -> Rc<Self> {
+            Self::with_node(attributes, "", false)
+        }
+
+        fn with_node(
+            attributes: &[(&str, &str)],
+            text_content: &str,
+            has_child_nodes: bool,
+        ) -> Rc<Self> {
             Rc::new(Self {
                 attributes: RefCell::new(
                     attributes
@@ -1771,6 +1888,9 @@ mod tests {
                         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                         .collect(),
                 ),
+                text_content: RefCell::new(Some(text_content.to_owned())),
+                has_child_nodes: Cell::new(has_child_nodes),
+                is_connected: Cell::new(true),
             })
         }
 
@@ -1892,6 +2012,34 @@ mod tests {
         unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool> {
             assert!(!host_context.is_null());
             Some(self.state.get(name).is_some())
+        }
+
+        fn node_type(&self) -> u16 {
+            1
+        }
+
+        fn node_name(&self) -> String {
+            self.tag_name.clone()
+        }
+
+        fn is_connected(&self) -> bool {
+            self.state.is_connected.get()
+        }
+
+        fn text_content(&self) -> Option<String> {
+            self.state.text_content.borrow().clone()
+        }
+
+        unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool {
+            assert!(!host_context.is_null());
+            let value = value.unwrap_or_default();
+            *self.state.text_content.borrow_mut() = Some(value.to_owned());
+            self.state.has_child_nodes.set(!value.is_empty());
+            true
+        }
+
+        fn has_child_nodes(&self) -> bool {
+            self.state.has_child_nodes.get()
         }
     }
 
@@ -2067,11 +2215,15 @@ mod tests {
                 id_element_identity: Box::new(0),
                 element_state: ElementProbeState::with_attributes(&[]),
                 head_state: ElementProbeState::with_attributes(&[]),
-                id_element_state: ElementProbeState::with_attributes(&[
-                    ("id", "target"),
-                    ("class", "alpha beta"),
-                    ("data-proof", "present"),
-                ]),
+                id_element_state: ElementProbeState::with_node(
+                    &[
+                        ("id", "target"),
+                        ("class", "alpha beta"),
+                        ("data-proof", "present"),
+                    ],
+                    "probe text",
+                    true,
+                ),
                 document_element_present: true,
                 head_present: true,
                 get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
@@ -3269,6 +3421,20 @@ mod tests {
                  elementPrototype, 'getAttribute');\n\
                const hasAttributeDescriptor = Object.getOwnPropertyDescriptor(\n\
                  elementPrototype, 'hasAttribute');\n\
+               const nodePrototype = Object.getPrototypeOf(elementPrototype);\n\
+               const nodeTypeDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'nodeType');\n\
+               const nodeNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'nodeName');\n\
+               const isConnectedDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'isConnected');\n\
+               const textContentDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'textContent');\n\
+               const hasChildNodesDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'hasChildNodes');\n\
+               const initialNodeValues = found.nodeType === 1 &&\n\
+                 found.nodeName === 'DIV' && found.isConnected === true &&\n\
+                 found.textContent === 'probe text' && found.hasChildNodes();\n\
                globalThis.elementWrongBrandStringified = false;\n\
                let elementRejectsWrongBrand = false;\n\
                try { getAttributeDescriptor.value.call({}, { toString() {\n\
@@ -3291,6 +3457,34 @@ mod tests {
                const convertedAttribute = found.getAttribute({\n\
                  toString() { return 'DATA-PROOF'; }\n\
                });\n\
+               globalThis.nodeWrongBrandStringified = false;\n\
+               let nodeRejectsWrongBrand = false;\n\
+               try { textContentDescriptor.set.call({}, { toString() {\n\
+                 nodeWrongBrandStringified = true; return 'bad';\n\
+               }}); } catch (error) { nodeRejectsWrongBrand = error instanceof TypeError; }\n\
+               const nodeConversionError = new Error('node conversion sentinel');\n\
+               let preservesNodeConversionError = false;\n\
+               try { textContentDescriptor.set.call(found, {\n\
+                 toString() { throw nodeConversionError; }\n\
+               }); } catch (error) { preservesNodeConversionError = error === nodeConversionError; }\n\
+               let nodeRejectsSymbol = false;\n\
+               try { found.textContent = Symbol('text'); }\n\
+               catch (error) { nodeRejectsSymbol = error instanceof TypeError; }\n\
+               const textSetterResult = textContentDescriptor.set.call(found, {\n\
+                 toString() { return 'changed text'; }\n\
+               });\n\
+               const textMutationWorked = textSetterResult === undefined &&\n\
+                 found.textContent === 'changed text' && found.hasChildNodes();\n\
+               found.textContent = undefined;\n\
+               const undefinedTextWorked = found.textContent === '' &&\n\
+                 !found.hasChildNodes();\n\
+               found.textContent = 'missing argument reset';\n\
+               const missingTextSetterResult = textContentDescriptor.set.call(found);\n\
+               const missingTextWorked = missingTextSetterResult === undefined &&\n\
+                 found.textContent === '' && !found.hasChildNodes();\n\
+               found.textContent = 'null reset';\n\
+               found.textContent = null;\n\
+               const nullTextWorked = found.textContent === '' && !found.hasChildNodes();\n\
                found.id = { toString() { return 'changed-id'; }};\n\
                found.className = null;\n\
                globalThis.getElementByIdBindingProof =\n\
@@ -3308,12 +3502,20 @@ mod tests {
                  found.getAttribute('missing') === null &&\n\
                  found.hasAttribute('ID') && !found.hasAttribute('missing') &&\n\
                  convertedAttribute === 'present' &&\n\
+                 initialNodeValues && textMutationWorked && undefinedTextWorked &&\n\
+                 missingTextWorked && nullTextWorked &&\n\
+                 Object.getPrototypeOf(nodePrototype) === Object.prototype &&\n\
                  !Object.hasOwn(found, 'localName') &&\n\
                  !Object.hasOwn(found, 'tagName') && !Object.hasOwn(found, 'id') &&\n\
                  !Object.hasOwn(found, 'className') &&\n\
                  !Object.hasOwn(found, 'hasAttributes') &&\n\
                  !Object.hasOwn(found, 'getAttribute') &&\n\
                  !Object.hasOwn(found, 'hasAttribute') &&\n\
+                 !Object.hasOwn(found, 'nodeType') &&\n\
+                 !Object.hasOwn(found, 'nodeName') &&\n\
+                 !Object.hasOwn(found, 'isConnected') &&\n\
+                 !Object.hasOwn(found, 'textContent') &&\n\
+                 !Object.hasOwn(found, 'hasChildNodes') &&\n\
                  localNameDescriptor && localNameDescriptor.get.length === 0 &&\n\
                  localNameDescriptor.set === undefined &&\n\
                  tagNameDescriptor && tagNameDescriptor.get.length === 0 &&\n\
@@ -3333,9 +3535,22 @@ mod tests {
                  [hasAttributesDescriptor, getAttributeDescriptor,\n\
                   hasAttributeDescriptor].every(d => d.writable &&\n\
                     d.enumerable && d.configurable) &&\n\
+                 [nodeTypeDescriptor, nodeNameDescriptor,\n\
+                  isConnectedDescriptor].every(d => d && d.get.length === 0 &&\n\
+                    d.set === undefined && d.enumerable && d.configurable) &&\n\
+                 textContentDescriptor && textContentDescriptor.get.length === 0 &&\n\
+                 textContentDescriptor.set.length === 1 &&\n\
+                 textContentDescriptor.enumerable && textContentDescriptor.configurable &&\n\
+                 hasChildNodesDescriptor.value.name === 'hasChildNodes' &&\n\
+                 hasChildNodesDescriptor.value.length === 0 &&\n\
+                 hasChildNodesDescriptor.writable &&\n\
+                 hasChildNodesDescriptor.enumerable &&\n\
+                 hasChildNodesDescriptor.configurable &&\n\
                  elementRejectsWrongBrand && setterRejectsWrongBrand &&\n\
                  !elementWrongBrandStringified && preservesElementConversionError &&\n\
                  elementRejectsSymbol && elementRejectsMissing &&\n\
+                 nodeRejectsWrongBrand && !nodeWrongBrandStringified &&\n\
+                 preservesNodeConversionError && nodeRejectsSymbol &&\n\
                  found !== document.documentElement && found !== document.head &&\n\
                  document.getElementById('target') === found &&\n\
                  document.getElementById('target').marker === 29 &&\n\

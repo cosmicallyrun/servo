@@ -1,14 +1,14 @@
 # V8-originated custom-element reactions
 
-Status: implemented for the current `Document.bgColor`, `Element.id`, and
-`Element.className` mutation surface.
+Status: implemented for the current `Document.bgColor`, `Element.id`,
+`Element.className`, and `Node.textContent` mutation surface.
 
 ## The mixed-engine hazard
 
-`Document.bgColor`, `Element.id`, and `Element.className` are
-`[CEReactions]`. Servo's ordinary SpiderMonkey binding pushes an element queue,
-performs the mutation, then pops the queue and invokes the callbacks before
-returning to JavaScript. Doing the same inside a V8 host setter runs
+`Document.bgColor`, `Element.id`, `Element.className`, and `Node.textContent`
+are `[CEReactions]`. Servo's ordinary SpiderMonkey binding pushes an element
+queue, performs the mutation, then pops the queue and invokes the callbacks
+before returning to JavaScript. Doing the same inside a V8 host setter runs
 SpiderMonkey `attributeChangedCallback` code while V8, the C ABI callback, and
 a mutable borrow of the sidecar are all still on the native stack. A callback
 that reaches a V8-authoritative API then recursively enters the same isolate
@@ -27,7 +27,7 @@ queue when there is none. The backup path schedules a
 
 The resulting sequence is:
 
-1. V8 enters a `Document.bgColor`, `Element.id`, or `Element.className` setter.
+1. V8 enters a `Document.bgColor`, Element attribute, or `Node.textContent` setter.
 2. Rust mutates the real Servo attribute and enqueues its reaction.
 3. Rust and C++ return; the V8 script or V8 microtask finishes.
 4. The authoritative-entry guard and sidecar borrow are released.
@@ -58,11 +58,12 @@ Servo-owned FIFO capable of representing V8 jobs and custom-element reactions.
 
 ## Runtime proof
 
-`authoritative_cereactions_proof.html` defines a customized body for `bgcolor`
-and an autonomous custom element for `id` and `class`. Every
-`attributeChangedCallback` reads V8-authoritative `document.hidden`. The proof
-requires both authoritative features. It succeeds only when the page renders
-lime, the body callback fires twice, both Element callbacks fire, the hidden
-host count includes all four callbacks' real round trips, and no reentry
+`authoritative_cereactions_proof.html` defines a customized body for `bgcolor`,
+an autonomous custom element for `id` and `class`, and a custom child removed
+by `textContent`. Every attribute or disconnection callback reads
+V8-authoritative `document.hidden`. The proof requires both authoritative
+features. It succeeds only when the page renders lime, the body callback fires
+twice, both Element attribute callbacks and the child disconnection fire, the
+hidden host count includes all five callbacks' real round trips, and no reentry
 short-circuit is logged. After building with both features,
 `run_cereactions_proof.sh` checks all of those signals together.

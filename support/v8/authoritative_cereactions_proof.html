@@ -2,14 +2,15 @@
 <!--
 Runtime proof that V8-originated CEReactions run only after V8 unwinds.
 
-A customized built-in <body> observes bgcolor, while an autonomous custom
-element observes id and class. The V8-authoritative script mutates all three
-through the host bridge. Servo leaves the resulting reactions on its rooted
-backup queue and invokes attributeChangedCallback at the existing microtask
-checkpoint, after the V8 setters, authoritative-entry guard, and sidecar borrow
-have unwound. Each SpiderMonkey callback then reads authoritative
-document.hidden and must complete a real V8 round trip rather than taking the
-defensive re-entry short circuit.
+A customized built-in <body> observes bgcolor, an autonomous custom element
+observes id and class, and its custom child observes disconnection caused by
+`textContent`. The V8-authoritative script mutates all four through the host
+bridge. Servo leaves the resulting reactions on its rooted backup queue and
+invokes the callbacks at the existing microtask checkpoint, after the V8
+setters, authoritative-entry guard, and sidecar borrow have unwound. Each
+SpiderMonkey callback then reads authoritative document.hidden and must
+complete a real V8 round trip rather than taking the defensive re-entry short
+circuit.
 
 This proof needs BOTH authoritative features, so it is not part of
 run_proofs.sh, which builds only the classic-script feature:
@@ -21,10 +22,10 @@ run_proofs.sh, which builds only the classic-script feature:
       --enable-experimental-web-platform-features \
       -o /tmp/cereactions.png support/v8/authoritative_cereactions_proof.html
 
-Expected: no panic, every pixel lime, the title reporting two body reactions
-and two Element reactions, five Document.hidden host calls at teardown (the
-realm probe and four callbacks), and no "answered from the host's own native
-source" warning.
+Expected: no panic, every pixel lime, the title reporting two body reactions,
+two Element attribute reactions, and one child disconnection; six
+Document.hidden host calls at teardown (the realm probe and five callbacks);
+and no "answered from the host's own native source" warning.
 -->
 <html>
   <head>
@@ -52,10 +53,19 @@ source" warning.
         }
       }
       customElements.define("v8-element", V8Element);
+
+      class V8Child extends HTMLElement {
+        disconnectedCallback() {
+          if (!window.trackElementReactions) return;
+          window.childDisconnected = (window.childDisconnected || 0) + 1;
+          window.childHidden = document.hidden;
+        }
+      }
+      customElements.define("v8-child", V8Child);
     </script>
   </head>
   <body is="v8-body" bgcolor="red">
-    <v8-element id="target" class="before"></v8-element>
+    <v8-element id="target" class="before"><v8-child></v8-child></v8-element>
     <script>
       window.elementFired = 0;
       window.trackElementReactions = true;
@@ -66,13 +76,16 @@ source" warning.
       var target = document.getElementById("target");
       target.id = "changed-id";
       target.className = "after";
+      target.textContent = null;
     </script>
     <script>
       document.title =
         "ceFired=" + (window.ceFired || 0) +
         " elementFired=" + (window.elementFired || 0) +
+        " childDisconnected=" + (window.childDisconnected || 0) +
         " ceHidden=" + window.ceHidden +
-        " elementHidden=" + window.elementHidden;
+        " elementHidden=" + window.elementHidden +
+        " childHidden=" + window.childHidden;
       console.log("RESULT " + document.title);
     </script>
   </body>

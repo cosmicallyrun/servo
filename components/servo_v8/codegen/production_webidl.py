@@ -42,6 +42,10 @@ DOCUMENT_VISIBILITY_STATE = "Document.visibilityState"
 DOCUMENT_READY_STATE = "Document.readyState"
 DOCUMENT_TITLE = "Document.title"
 NODE_NODE_TYPE = "Node.nodeType"
+NODE_NODE_NAME = "Node.nodeName"
+NODE_IS_CONNECTED = "Node.isConnected"
+NODE_TEXT_CONTENT = "Node.textContent"
+NODE_HAS_CHILD_NODES = "Node.hasChildNodes"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_HEAD = "Document.head"
 DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
@@ -196,6 +200,16 @@ ELEMENT_HOST = (
     ELEMENT_HAS_ATTRIBUTES,
     ELEMENT_GET_ATTRIBUTE,
     ELEMENT_HAS_ATTRIBUTE,
+)
+
+# Inherited scalar behavior installed on the Node prototype shared by Element
+# wrappers. These members introduce no new cross-heap edge or interface input.
+NODE_HOST = (
+    NODE_NODE_TYPE,
+    NODE_NODE_NAME,
+    NODE_IS_CONNECTED,
+    NODE_TEXT_CONTENT,
+    NODE_HAS_CHILD_NODES,
 )
 
 
@@ -860,6 +874,108 @@ def _select_element_host_member(
     return member
 
 
+def _select_node_host_member(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLAttribute | WebIDL.IDLMethod:
+    """Select one exact scalar member from the production Node interface."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{interface_name}`, found {len(interfaces)}"
+        )
+    members = [
+        member
+        for member in interfaces[0].members
+        if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+    member = members[0]
+
+    attribute_attributes = {
+        "nodeType": {"Constant"},
+        "nodeName": {"Pure"},
+        "isConnected": {"Pure"},
+        "textContent": {"CEReactions", "Pure", "SetterThrows"},
+    }
+    if member_name in attribute_attributes:
+        if not member.isAttr() or member.isStatic():
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must be an instance attribute"
+            )
+        expected_attributes = attribute_attributes[member_name]
+        actual_attributes = set(member._extendedAttrDict)
+        if actual_attributes != expected_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+                f"got {sorted(actual_attributes)}"
+            )
+        expected_readonly = member_name != "textContent"
+        if member.readonly != expected_readonly:
+            state = "readonly" if expected_readonly else "writable"
+            raise WebIDLSelectionError(f"`{qualified_name}` must be {state}")
+        if member_name == "nodeType":
+            if member.type.nullable() or member.type.tag() != WebIDL.IDLType.Tags.uint16:
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use non-nullable `unsigned short`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member_name == "isConnected":
+            if member.type.nullable() or not member.type.isBoolean():
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use non-nullable `boolean`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member_name == "textContent":
+            if not member.type.nullable() or not member.type.inner.isDOMString():
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use nullable `DOMString`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member.type.nullable() or not member.type.isDOMString():
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must use non-nullable `DOMString`, "
+                f"got `{member.type.prettyName()}`"
+            )
+        return member
+
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must be an ordinary instance operation"
+        )
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != {"Pure"}:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly ['Pure'], "
+            f"got {sorted(actual_attributes)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if return_type.nullable() or not return_type.isBoolean():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `boolean`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if arguments:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take no arguments, found {len(arguments)}"
+        )
+    return member
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -990,6 +1106,20 @@ def select_element_host_members(
             parser_results, qualified_name
         )
         for qualified_name in ELEMENT_HOST
+    }
+
+
+def select_node_host_members(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> dict[str, WebIDL.IDLAttribute | WebIDL.IDLMethod]:
+    """Load the production corpus and pin the inherited Node scalar slice."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return {
+        qualified_name: _select_node_host_member(parser_results, qualified_name)
+        for qualified_name in NODE_HOST
     }
 
 

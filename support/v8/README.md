@@ -269,7 +269,9 @@ string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
 `document.head`, and `document.getElementById()`. Elements returned through that
 surface share a per-realm prototype implementing `localName`, `tagName`, `id`,
-`className`, `hasAttributes()`, `getAttribute()`, and `hasAttribute()`.
+`className`, `hasAttributes()`, `getAttribute()`, and `hasAttribute()`. That
+prototype inherits from a shared Node prototype implementing `nodeType`,
+`nodeName`, `isConnected`, `textContent`, and `hasChildNodes()`.
 
 V8's inspector-oriented `console` silently discards output when no inspector
 delegate is attached. The realm replaces it with a native, production-WebIDL-
@@ -361,6 +363,7 @@ The proof suite uses that same counting argument:
 | `authoritative_wrapper_identity_proof.html` | a DOM object handed to V8 keeps one stable wrapper |
 | `authoritative_get_element_by_id_proof.html` | the generated DOMString operation preserves conversion, null, and wrapper semantics |
 | `authoritative_element_scalar_proof.html` | common Element scalar reads and mutations use the live Servo DOM with WebIDL prototype semantics |
+| `authoritative_node_scalar_proof.html` | Element wrappers inherit common Node scalars and text mutation through a real Node prototype |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -384,7 +387,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 22 and remains experimental. The original
+The current exported C ABI is version 23 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

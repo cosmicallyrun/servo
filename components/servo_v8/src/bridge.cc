@@ -326,6 +326,7 @@ struct ServoV8RealmState {
       wrappers;
   v8::Global<v8::ObjectTemplate> element_template;
   v8::Global<v8::Object> element_prototype;
+  v8::Global<v8::Object> node_prototype;
   ServoV8DocumentHostState document_host;
   ServoV8TimerHostState timer_host;
   ServoV8ConsoleHostState console_host;
@@ -739,7 +740,7 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
     DropUnownedElementHost(runtime, value.native, drop);
     return v8::Local<v8::Object>();
   }
-  if (realm->element_prototype.IsEmpty() ||
+  if (realm->element_prototype.IsEmpty() || realm->node_prototype.IsEmpty() ||
       !wrapper
            ->SetPrototype(context, realm->element_prototype.Get(isolate))
            .FromMaybe(false)) {
@@ -1013,6 +1014,191 @@ void ElementHostHasAttribute(
     }
   }
   info.GetReturnValue().Set(result != 0);
+}
+
+void NodeHostGetNodeType(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  uint16_t result = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_node_type(native, &result)) {
+      ThrowTypeError(isolate, "Node.nodeType host callback failed");
+      return;
+    }
+  }
+  info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, result));
+}
+
+void NodeHostGetNodeName(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetString(info, &ServoV8ElementHostVTable::get_node_name,
+                       "Node.nodeName host callback failed");
+}
+
+using ElementBooleanGetter = uint8_t (*)(void* native, uint8_t* output);
+using ElementBooleanGetterSlot =
+    ElementBooleanGetter ServoV8ElementHostVTable::*;
+
+void ElementHostGetBoolean(const v8::FunctionCallbackInfo<v8::Value>& info,
+                           ElementBooleanGetterSlot getter_slot,
+                           const char* member_name) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  const ElementBooleanGetter getter =
+      realm->runtime->element_host_vtable.*getter_slot;
+  uint8_t result = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!getter || !getter(native, &result) || result > 1) {
+      ThrowTypeError(isolate, member_name);
+      return;
+    }
+  }
+  info.GetReturnValue().Set(result != 0);
+}
+
+void NodeHostGetIsConnected(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetBoolean(info, &ServoV8ElementHostVTable::get_is_connected,
+                        "Node.isConnected host callback failed");
+}
+
+void NodeHostHasChildNodes(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetBoolean(info, &ServoV8ElementHostVTable::has_child_nodes,
+                        "Node.hasChildNodes host callback failed");
+}
+
+void NodeHostGetTextContent(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  ServoV8OptionalOwnedUtf8 result{};
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_text_content(native, &result)) {
+      ThrowTypeError(isolate, "Node.textContent host callback failed");
+      return;
+    }
+  }
+  DocumentHostOwnedUtf8Scope result_scope(realm->runtime, &result.value);
+  const bool malformed_null =
+      result.is_null != 0 &&
+      (result.value.data || result.value.length != 0 || result.value.owner ||
+       result.value.drop_owner);
+  if (result.is_null > 1 || malformed_null ||
+      (!result.value.data && result.value.length != 0) ||
+      result.value.length >
+          static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(isolate, "invalid Node.textContent result");
+    return;
+  }
+  if (result.is_null) {
+    info.GetReturnValue().Set(v8::Null(isolate));
+    return;
+  }
+  v8::Local<v8::String> value;
+  if (!v8::String::NewFromUtf8(
+           isolate, reinterpret_cast<const char*>(result.value.data),
+           v8::NewStringType::kNormal, static_cast<int>(result.value.length))
+           .ToLocal(&value)) {
+    return;
+  }
+  info.GetReturnValue().Set(value);
+}
+
+void NodeHostSetTextContent(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // Brand-check before nullable DOMString conversion.
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!realm->document_host.active_host_context ||
+      !realm->runtime->element_host_vtable.set_text_content) {
+    ThrowTypeError(isolate, "Node.textContent mutation requires a live host context");
+    return;
+  }
+
+  auto call_host = [&](uint8_t is_null, const uint8_t* data, size_t length) {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.set_text_content(
+            native, realm->document_host.active_host_context, is_null, data,
+            length)) {
+      ThrowTypeError(isolate, "Node.textContent host callback failed");
+      return false;
+    }
+    return true;
+  };
+  if (info[0]->IsNullOrUndefined()) {
+    call_host(1, nullptr, 0);
+    return;
+  }
+
+  v8::Local<v8::String> string;
+  if (!info[0]->ToString(isolate->GetCurrentContext()).ToLocal(&string)) return;
+  v8::String::Utf8Value utf8(isolate, string);
+  if (!*utf8 && utf8.length() != 0) return;
+  call_host(0, reinterpret_cast<const uint8_t*>(*utf8),
+            static_cast<size_t>(utf8.length()));
+}
+
+bool InstallNodePrototype(ServoV8RealmState* realm,
+                          v8::Local<v8::Context> context,
+                          v8::Local<v8::Object> prototype) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  struct NodeAccessor {
+    const char* name;
+    v8::FunctionCallback getter;
+    v8::FunctionCallback setter;
+  };
+  const NodeAccessor accessors[] = {
+      {"nodeType", &NodeHostGetNodeType, nullptr},
+      {"nodeName", &NodeHostGetNodeName, nullptr},
+      {"isConnected", &NodeHostGetIsConnected, nullptr},
+      {"textContent", &NodeHostGetTextContent, &NodeHostSetTextContent},
+  };
+  for (const auto& accessor : accessors) {
+    v8::Local<v8::Function> getter;
+    if (!v8::Function::New(context, accessor.getter, {}, 0,
+                           v8::ConstructorBehavior::kThrow,
+                           v8::SideEffectType::kHasNoSideEffect)
+             .ToLocal(&getter)) {
+      return false;
+    }
+    getter->SetName(V8String(isolate, (std::string("get ") + accessor.name).c_str()));
+    v8::Local<v8::Function> setter;
+    if (accessor.setter) {
+      if (!v8::Function::New(context, accessor.setter, {}, 1,
+                             v8::ConstructorBehavior::kThrow,
+                             v8::SideEffectType::kHasSideEffect)
+               .ToLocal(&setter)) {
+        return false;
+      }
+      setter->SetName(
+          V8String(isolate, (std::string("set ") + accessor.name).c_str()));
+    }
+    prototype->SetAccessorProperty(V8String(isolate, accessor.name), getter,
+                                   setter, v8::None);
+  }
+
+  v8::Local<v8::String> name = V8String(isolate, "hasChildNodes");
+  v8::Local<v8::Function> function;
+  if (!v8::Function::New(context, NodeHostHasChildNodes, {}, 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&function)) {
+    return false;
+  }
+  function->SetName(name);
+  return prototype->DefineOwnProperty(context, name, function, v8::None)
+      .FromMaybe(false);
 }
 
 bool InstallElementPrototype(ServoV8RealmState* realm,
@@ -1537,6 +1723,7 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->wrappers.clear();
   realm->element_template.Reset();
   realm->element_prototype.Reset();
+  realm->node_prototype.Reset();
   realm->document.Reset();
   realm->context.Reset();
   ResetConsoleHost(&realm->console_host);
@@ -1833,8 +2020,11 @@ extern "C" int32_t servo_v8_realm_create(
   element_constructor->SetClassName(V8String(isolate, "Element"));
   v8::Local<v8::ObjectTemplate> element_instance =
       element_constructor->InstanceTemplate();
+  v8::Local<v8::Object> node_prototype = v8::Object::New(isolate);
   v8::Local<v8::Object> element_prototype = v8::Object::New(isolate);
-  if (!InstallElementPrototype(realm.get(), context, element_prototype) ||
+  if (!InstallNodePrototype(realm.get(), context, node_prototype) ||
+      !InstallElementPrototype(realm.get(), context, element_prototype) ||
+      !element_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
       !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
       !global
            ->DefineOwnProperty(context, V8String(isolate, "window"), global,
@@ -1853,6 +2043,7 @@ extern "C" int32_t servo_v8_realm_create(
 
   realm->element_template.Reset(isolate, element_instance);
   realm->element_prototype.Reset(isolate, element_prototype);
+  realm->node_prototype.Reset(isolate, node_prototype);
   realm->context.Reset(isolate, context);
   realm->document.Reset(isolate, document);
   auto [entry, inserted] = runtime->realms.try_emplace(id, std::move(realm));
@@ -2368,7 +2559,10 @@ extern "C" int32_t servo_v8_install_element_host(
   if (!vtable || !vtable->get_local_name || !vtable->get_tag_name ||
       !vtable->get_id || !vtable->set_id || !vtable->get_class_name ||
       !vtable->set_class_name || !vtable->has_attributes ||
-      !vtable->get_attribute || !vtable->has_attribute || !vtable->drop) {
+      !vtable->get_attribute || !vtable->has_attribute ||
+      !vtable->get_node_type || !vtable->get_node_name ||
+      !vtable->get_is_connected || !vtable->get_text_content ||
+      !vtable->set_text_content || !vtable->has_child_nodes || !vtable->drop) {
     WriteError(error, "Element host vtable is incomplete");
     return 0;
   }
