@@ -208,6 +208,10 @@ def write_outputs(webidls_dir: Path, out_dir: Path) -> None:
             Path(cache_dir) / "console",
             webidls_dir=webidls_dir,
         )
+        production_webidl.select_element_host_members(
+            Path(cache_dir) / "element",
+            webidls_dir=webidls_dir,
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     for filename, contents in generate_outputs(selected_members).items():
         (out_dir / filename).write_text(contents, encoding="utf-8")

@@ -58,7 +58,10 @@ Run via support/v8/run_proofs.sh.
       }
       // tagName is brand-checked, like every other host accessor.
       var descriptor =
-        Object.getOwnPropertyDescriptor(first, "tagName");
+        Object.getOwnPropertyDescriptor(Object.getPrototypeOf(first), "tagName");
+      if (Object.hasOwn(first, "tagName")) {
+        throw new Error("tagName was installed as an own property");
+      }
       var brandChecked = false;
       try {
         descriptor.get.call({});

@@ -197,6 +197,27 @@ class ProductionConsoleTests(unittest.TestCase):
                 self.assertEqual(arguments[0].identifier.name, expected_name)
 
 
+class ProductionElementTests(unittest.TestCase):
+    def test_pins_the_real_scalar_element_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_element_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.ELEMENT_HOST))
+        self.assertTrue(members[production_webidl.ELEMENT_LOCAL_NAME].readonly)
+        self.assertTrue(members[production_webidl.ELEMENT_TAG_NAME].readonly)
+        self.assertFalse(members[production_webidl.ELEMENT_ID].readonly)
+        self.assertFalse(members[production_webidl.ELEMENT_CLASS_NAME].readonly)
+        return_type, arguments = members[
+            production_webidl.ELEMENT_GET_ATTRIBUTE
+        ].signatures()[0]
+        self.assertTrue(return_type.nullable())
+        self.assertTrue(return_type.inner.isDOMString())
+        self.assertEqual(arguments[0].identifier.name, "name")
+
+
 class SyntheticSelectionTests(unittest.TestCase):
     def parse(self, sources: dict[str, str], environment: dict[str, str] | None = None):
         temporary_directory = tempfile.TemporaryDirectory()
@@ -728,6 +749,59 @@ class SyntheticSelectionTests(unittest.TestCase):
             "[Throws] undefined error(any... messages);",
             "error",
             "`console.error` carries extended attributes that are not implemented: Throws",
+        )
+
+    def assert_element_rejected(
+        self,
+        declaration: str,
+        member: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse(
+            {"Element.webidl": f"interface Element {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_element_host_member(
+                parser_results,
+                f"Element.{member}",
+            )
+
+    def test_selects_exact_writable_element_id(self) -> None:
+        parser_results = self.parse(
+            {
+                "Element.webidl": """interface Element {
+                    [CEReactions, Pure] attribute DOMString id;
+                };""",
+            }
+        )
+        member = production_webidl._select_element_host_member(
+            parser_results,
+            production_webidl.ELEMENT_ID,
+        )
+        self.assertFalse(member.readonly)
+
+    def test_rejects_element_id_without_ce_reactions(self) -> None:
+        self.assert_element_rejected(
+            "[Pure] attribute DOMString id;",
+            "id",
+            "`Element.id` must carry exactly ['CEReactions', 'Pure'], got ['Pure']",
+        )
+
+    def test_rejects_nonnullable_get_attribute_return(self) -> None:
+        self.assert_element_rejected(
+            "[Pure] DOMString getAttribute(DOMString name);",
+            "getAttribute",
+            "`Element.getAttribute` must return nullable `DOMString`, got `DOMString`",
+        )
+
+    def test_rejects_optional_has_attribute_name(self) -> None:
+        self.assert_element_rejected(
+            "boolean hasAttribute(optional DOMString name);",
+            "hasAttribute",
+            "`Element.hasAttribute` must take required non-nullable `DOMString name`",
         )
 
 

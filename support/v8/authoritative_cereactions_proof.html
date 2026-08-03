@@ -2,11 +2,12 @@
 <!--
 Runtime proof that V8-originated CEReactions run only after V8 unwinds.
 
-A customized built-in <body> observes bgcolor. The V8-authoritative script sets
-document.bgColor. Servo leaves the resulting reaction on its rooted backup
-queue and invokes attributeChangedCallback at the existing microtask
-checkpoint, after the V8 setter, authoritative-entry guard, and sidecar borrow
-have unwound. The SpiderMonkey callback then reads authoritative
+A customized built-in <body> observes bgcolor, while an autonomous custom
+element observes id and class. The V8-authoritative script mutates all three
+through the host bridge. Servo leaves the resulting reactions on its rooted
+backup queue and invokes attributeChangedCallback at the existing microtask
+checkpoint, after the V8 setters, authoritative-entry guard, and sidecar borrow
+have unwound. Each SpiderMonkey callback then reads authoritative
 document.hidden and must complete a real V8 round trip rather than taking the
 defensive re-entry short circuit.
 
@@ -20,9 +21,10 @@ run_proofs.sh, which builds only the classic-script feature:
       --enable-experimental-web-platform-features \
       -o /tmp/cereactions.png support/v8/authoritative_cereactions_proof.html
 
-Expected: no panic, every pixel lime, the title reporting ceFired=2, three
-Document.hidden host calls at teardown (the realm probe and both callbacks),
-and no "answered from the host's own native source" warning.
+Expected: no panic, every pixel lime, the title reporting two body reactions
+and two Element reactions, five Document.hidden host calls at teardown (the
+realm probe and four callbacks), and no "answered from the host's own native
+source" warning.
 -->
 <html>
   <head>
@@ -38,16 +40,39 @@ and no "answered from the host's own native source" warning.
         }
       }
       customElements.define("v8-body", V8Body, { extends: "body" });
+
+      class V8Element extends HTMLElement {
+        static get observedAttributes() { return ["id", "class"]; }
+        attributeChangedCallback(name, oldValue, newValue) {
+          // Ignore parser-time initialization. Only mutations made by the V8
+          // script below are part of this ordering proof.
+          if (!window.trackElementReactions) return;
+          window.elementFired = (window.elementFired || 0) + 1;
+          window.elementHidden = document.hidden;
+        }
+      }
+      customElements.define("v8-element", V8Element);
     </script>
   </head>
   <body is="v8-body" bgcolor="red">
+    <v8-element id="target" class="before"></v8-element>
+    <script>
+      window.elementFired = 0;
+      window.trackElementReactions = true;
+    </script>
     <script data-servo-v8="authoritative">
       document.bgColor =
         document.bgColor === "lime" ? "red" : "lime";
+      var target = document.getElementById("target");
+      target.id = "changed-id";
+      target.className = "after";
     </script>
     <script>
       document.title =
-        "ceFired=" + (window.ceFired || 0) + " ceHidden=" + window.ceHidden;
+        "ceFired=" + (window.ceFired || 0) +
+        " elementFired=" + (window.elementFired || 0) +
+        " ceHidden=" + window.ceHidden +
+        " elementHidden=" + window.elementHidden;
       console.log("RESULT " + document.title);
     </script>
   </body>

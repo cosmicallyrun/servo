@@ -325,6 +325,7 @@ struct ServoV8RealmState {
   std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
       wrappers;
   v8::Global<v8::ObjectTemplate> element_template;
+  v8::Global<v8::Object> element_prototype;
   ServoV8DocumentHostState document_host;
   ServoV8TimerHostState timer_host;
   ServoV8ConsoleHostState console_host;
@@ -738,6 +739,13 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
     DropUnownedElementHost(runtime, value.native, drop);
     return v8::Local<v8::Object>();
   }
+  if (realm->element_prototype.IsEmpty() ||
+      !wrapper
+           ->SetPrototype(context, realm->element_prototype.Get(isolate))
+           .FromMaybe(false)) {
+    DropUnownedElementHost(runtime, value.native, drop);
+    return v8::Local<v8::Object>();
+  }
 
   v8::CppHeap* cpp_heap = isolate->GetCppHeap();
   auto* cell = cppgc::MakeGarbageCollected<ServoV8HostCell>(
@@ -759,34 +767,61 @@ void* UnwrapElementHostNative(const v8::FunctionCallbackInfo<v8::Value>& info) {
   return cell ? cell->native() : nullptr;
 }
 
-void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
+bool ElementHostCallbackState(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ServoV8RealmState** realm_output,
+    void** native_output) {
   v8::Isolate* isolate = info.GetIsolate();
   auto* realm = static_cast<ServoV8RealmState*>(
       info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
           isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
   void* native = UnwrapElementHostNative(info);
-  if (!realm || realm->tearing_down || !realm->runtime || !native ||
-      !realm->runtime->element_host_vtable.get_tag_name) {
+  if (!realm || realm->tearing_down || !realm->runtime ||
+      realm->runtime->isolate != isolate || realm->context.IsEmpty() ||
+      realm->context.Get(isolate) != isolate->GetCurrentContext() || !native) {
     ThrowTypeError(isolate, "invalid Element host state");
-    return;
+    return false;
   }
   if (realm->runtime->rust_callback_depth != 0) {
     ThrowTypeError(isolate, "re-entrant Element host callback");
+    return false;
+  }
+  *realm_output = realm;
+  *native_output = native;
+  return true;
+}
+
+using ElementStringGetter =
+    uint8_t (*)(void* native, ServoV8OwnedUtf8* output);
+using ElementStringGetterSlot =
+    ElementStringGetter ServoV8ElementHostVTable::*;
+
+void ElementHostGetString(const v8::FunctionCallbackInfo<v8::Value>& info,
+                          ElementStringGetterSlot getter_slot,
+                          const char* member_name) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  const ElementStringGetter getter =
+      realm->runtime->element_host_vtable.*getter_slot;
+  if (!getter) {
+    ThrowTypeError(isolate, "Element string getter is not installed");
     return;
   }
 
   ServoV8OwnedUtf8 value{};
   {
     RustCallbackScope callback_scope(realm->runtime);
-    if (!realm->runtime->element_host_vtable.get_tag_name(native, &value)) {
-      ThrowTypeError(isolate, "Element.tagName host callback failed");
+    if (!getter(native, &value)) {
+      ThrowTypeError(isolate, member_name);
       return;
     }
   }
   DocumentHostOwnedUtf8Scope value_scope(realm->runtime, &value);
   if ((!value.data && value.length != 0) ||
       value.length > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    ThrowTypeError(isolate, "invalid Element.tagName UTF-8 result");
+    ThrowTypeError(isolate, "invalid Element string UTF-8 result");
     return;
   }
   v8::Local<v8::String> result;
@@ -798,6 +833,257 @@ void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
     return;
   }
   info.GetReturnValue().Set(result);
+}
+
+void ElementHostGetLocalName(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetString(info, &ServoV8ElementHostVTable::get_local_name,
+                       "Element.localName host callback failed");
+}
+
+void ElementHostGetTagName(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetString(info, &ServoV8ElementHostVTable::get_tag_name,
+                       "Element.tagName host callback failed");
+}
+
+void ElementHostGetId(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetString(info, &ServoV8ElementHostVTable::get_id,
+                       "Element.id host callback failed");
+}
+
+void ElementHostGetClassName(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetString(info, &ServoV8ElementHostVTable::get_class_name,
+                       "Element.className host callback failed");
+}
+
+using ElementStringSetter = uint8_t (*)(void* native,
+                                        void* host_context,
+                                        const uint8_t* value,
+                                        size_t value_length);
+using ElementStringSetterSlot =
+    ElementStringSetter ServoV8ElementHostVTable::*;
+
+void ElementHostSetString(const v8::FunctionCallbackInfo<v8::Value>& info,
+                          ElementStringSetterSlot setter_slot,
+                          const char* member_name) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // Brand-check before conversion, as WebIDL requires.
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  const ElementStringSetter setter =
+      realm->runtime->element_host_vtable.*setter_slot;
+  if (!setter || !realm->document_host.active_host_context) {
+    ThrowTypeError(isolate, "Element mutation requires a live host context");
+    return;
+  }
+  v8::Local<v8::String> string;
+  if (!info[0]->ToString(isolate->GetCurrentContext()).ToLocal(&string)) return;
+  v8::String::Utf8Value value(isolate, string);
+  if (!*value && value.length() != 0) return;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!setter(native, realm->document_host.active_host_context,
+                reinterpret_cast<const uint8_t*>(*value), value.length())) {
+      ThrowTypeError(isolate, member_name);
+      return;
+    }
+  }
+}
+
+void ElementHostSetId(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostSetString(info, &ServoV8ElementHostVTable::set_id,
+                       "Element.id host callback failed");
+}
+
+void ElementHostSetClassName(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostSetString(info, &ServoV8ElementHostVTable::set_class_name,
+                       "Element.className host callback failed");
+}
+
+void ElementHostHasAttributes(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  uint8_t result = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.has_attributes(native, &result) ||
+        result > 1) {
+      ThrowTypeError(isolate, "Element.hasAttributes host callback failed");
+      return;
+    }
+  }
+  info.GetReturnValue().Set(result != 0);
+}
+
+bool ElementHostOperationName(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    const char* member_name,
+    ServoV8RealmState** realm_output,
+    void** native_output,
+    v8::Local<v8::String>* name_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  // Brand-check before required-argument checks and user-code conversion.
+  if (!ElementHostCallbackState(info, realm_output, native_output)) return false;
+  if (!(*realm_output)->document_host.active_host_context) {
+    ThrowTypeError(isolate, "Element operation requires a live host context");
+    return false;
+  }
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, member_name);
+    return false;
+  }
+  return info[0]->ToString(isolate->GetCurrentContext()).ToLocal(name_output);
+}
+
+void ElementHostGetAttribute(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  v8::Local<v8::String> name_string;
+  if (!ElementHostOperationName(info, "Element.getAttribute requires 1 argument",
+                                &realm, &native, &name_string)) {
+    return;
+  }
+  v8::String::Utf8Value name(isolate, name_string);
+  if (!*name && name.length() != 0) return;
+  ServoV8OptionalOwnedUtf8 result{};
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_attribute(
+            native, realm->document_host.active_host_context,
+            reinterpret_cast<const uint8_t*>(*name), name.length(), &result)) {
+      ThrowTypeError(isolate, "Element.getAttribute host callback failed");
+      return;
+    }
+  }
+  DocumentHostOwnedUtf8Scope result_scope(realm->runtime, &result.value);
+  const bool malformed_null =
+      result.is_null != 0 &&
+      (result.value.data || result.value.length != 0 || result.value.owner ||
+       result.value.drop_owner);
+  if (result.is_null > 1 || malformed_null ||
+      (!result.value.data && result.value.length != 0) ||
+      result.value.length >
+          static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(isolate, "invalid Element.getAttribute result");
+    return;
+  }
+  if (result.is_null) {
+    info.GetReturnValue().Set(v8::Null(isolate));
+    return;
+  }
+  v8::Local<v8::String> value;
+  if (!v8::String::NewFromUtf8(
+           isolate, reinterpret_cast<const char*>(result.value.data),
+           v8::NewStringType::kNormal, static_cast<int>(result.value.length))
+           .ToLocal(&value)) {
+    return;
+  }
+  info.GetReturnValue().Set(value);
+}
+
+void ElementHostHasAttribute(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  v8::Local<v8::String> name_string;
+  if (!ElementHostOperationName(info, "Element.hasAttribute requires 1 argument",
+                                &realm, &native, &name_string)) {
+    return;
+  }
+  v8::String::Utf8Value name(isolate, name_string);
+  if (!*name && name.length() != 0) return;
+  uint8_t result = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.has_attribute(
+            native, realm->document_host.active_host_context,
+            reinterpret_cast<const uint8_t*>(*name), name.length(), &result) ||
+        result > 1) {
+      ThrowTypeError(isolate, "Element.hasAttribute host callback failed");
+      return;
+    }
+  }
+  info.GetReturnValue().Set(result != 0);
+}
+
+bool InstallElementPrototype(ServoV8RealmState* realm,
+                             v8::Local<v8::Context> context,
+                             v8::Local<v8::Object> prototype) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  struct ElementAccessor {
+    const char* name;
+    v8::FunctionCallback getter;
+    v8::FunctionCallback setter;
+  };
+  const ElementAccessor accessors[] = {
+      {"localName", &ElementHostGetLocalName, nullptr},
+      {"tagName", &ElementHostGetTagName, nullptr},
+      {"id", &ElementHostGetId, &ElementHostSetId},
+      {"className", &ElementHostGetClassName, &ElementHostSetClassName},
+  };
+  for (const auto& accessor : accessors) {
+    v8::Local<v8::Function> getter;
+    if (!v8::Function::New(context, accessor.getter, {}, 0,
+                           v8::ConstructorBehavior::kThrow,
+                           v8::SideEffectType::kHasNoSideEffect)
+             .ToLocal(&getter)) {
+      return false;
+    }
+    getter->SetName(V8String(isolate, (std::string("get ") + accessor.name).c_str()));
+    v8::Local<v8::Function> setter;
+    if (accessor.setter) {
+      if (!v8::Function::New(context, accessor.setter, {}, 1,
+                             v8::ConstructorBehavior::kThrow,
+                             v8::SideEffectType::kHasSideEffect)
+               .ToLocal(&setter)) {
+        return false;
+      }
+      setter->SetName(
+          V8String(isolate, (std::string("set ") + accessor.name).c_str()));
+    }
+    prototype->SetAccessorProperty(V8String(isolate, accessor.name), getter,
+                                   setter, v8::None);
+  }
+
+  struct ElementOperation {
+    const char* name;
+    v8::FunctionCallback callback;
+    int length;
+    v8::SideEffectType side_effect_type;
+  };
+  const ElementOperation operations[] = {
+      {"hasAttributes", &ElementHostHasAttributes, 0,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"getAttribute", &ElementHostGetAttribute, 1,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"hasAttribute", &ElementHostHasAttribute, 1,
+       v8::SideEffectType::kHasSideEffect},
+  };
+  for (const auto& operation : operations) {
+    v8::Local<v8::String> name = V8String(isolate, operation.name);
+    v8::Local<v8::Function> function;
+    if (!v8::Function::New(context, operation.callback, {}, operation.length,
+                           v8::ConstructorBehavior::kThrow,
+                           operation.side_effect_type)
+             .ToLocal(&function)) {
+      return false;
+    }
+    function->SetName(name);
+    if (!prototype->DefineOwnProperty(context, name, function, v8::None)
+             .FromMaybe(false)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 ServoV8RealmState* CallbackRealm(
@@ -1250,6 +1536,7 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   }
   realm->wrappers.clear();
   realm->element_template.Reset();
+  realm->element_prototype.Reset();
   realm->document.Reset();
   realm->context.Reset();
   ResetConsoleHost(&realm->console_host);
@@ -1539,20 +1826,16 @@ extern "C" int32_t servo_v8_realm_create(
   }
 
   // Element instances are built from a FunctionTemplate instance template,
-  // which is what makes them wrappable by v8::Object::Wrap.
+  // which is what makes them wrappable by v8::Object::Wrap. WebIDL members
+  // live on one realm-shared prototype, not as own properties on each wrapper.
   v8::Local<v8::FunctionTemplate> element_constructor =
       v8::FunctionTemplate::New(isolate);
   element_constructor->SetClassName(V8String(isolate, "Element"));
   v8::Local<v8::ObjectTemplate> element_instance =
       element_constructor->InstanceTemplate();
-  element_instance->SetAccessorProperty(
-      V8String(isolate, "tagName"),
-      v8::FunctionTemplate::New(isolate, ElementHostGetTagName,
-                                v8::Local<v8::Value>(),
-                                v8::Local<v8::Signature>(), 0,
-                                v8::ConstructorBehavior::kThrow,
-                                v8::SideEffectType::kHasNoSideEffect));
-  if (!document->SetPrototype(context, document_prototype).FromMaybe(false) ||
+  v8::Local<v8::Object> element_prototype = v8::Object::New(isolate);
+  if (!InstallElementPrototype(realm.get(), context, element_prototype) ||
+      !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
       !global
            ->DefineOwnProperty(context, V8String(isolate, "window"), global,
                                immutable)
@@ -1569,6 +1852,7 @@ extern "C" int32_t servo_v8_realm_create(
   }
 
   realm->element_template.Reset(isolate, element_instance);
+  realm->element_prototype.Reset(isolate, element_prototype);
   realm->context.Reset(isolate, context);
   realm->document.Reset(isolate, document);
   auto [entry, inserted] = runtime->realms.try_emplace(id, std::move(realm));
@@ -2081,7 +2365,10 @@ extern "C" int32_t servo_v8_install_element_host(
     ServoV8ErrorBuffer* error) {
   ClearError(error);
   if (!CheckRuntime(runtime, error)) return 0;
-  if (!vtable || !vtable->get_tag_name || !vtable->drop) {
+  if (!vtable || !vtable->get_local_name || !vtable->get_tag_name ||
+      !vtable->get_id || !vtable->set_id || !vtable->get_class_name ||
+      !vtable->set_class_name || !vtable->has_attributes ||
+      !vtable->get_attribute || !vtable->has_attribute || !vtable->drop) {
     WriteError(error, "Element host vtable is incomplete");
     return 0;
   }

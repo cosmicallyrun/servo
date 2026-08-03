@@ -55,12 +55,12 @@ if [ "$rgb" != "(0, 255, 0)" ]; then
   echo "FAIL  expected a uniformly lime render, got $rgb"
   failures=$((failures + 1))
 fi
-if ! grep -Eq 'RESULT ceFired=2 ceHidden=(true|false)' "$log"; then
-  echo "FAIL  expected both custom-element callbacks to read document.hidden"
+if ! grep -Eq 'RESULT ceFired=2 elementFired=2 ceHidden=(true|false) elementHidden=(true|false)' "$log"; then
+  echo "FAIL  expected all four custom-element callbacks to read document.hidden"
   failures=$((failures + 1))
 fi
-if [ "$counts" != "3 1 1" ]; then
-  echo "FAIL  expected hidden/bgColor-get/bgColor-set counts '3 1 1', got '${counts:-none}'"
+if [ "$counts" != "5 1 1" ]; then
+  echo "FAIL  expected hidden/bgColor-get/bgColor-set counts '5 1 1', got '${counts:-none}'"
   failures=$((failures + 1))
 fi
 if grep -Eq "answered from the host's own native source|re-entrant authoritative V8|panicked at" "$log"; then
@@ -72,4 +72,4 @@ fi
 if [ "$failures" -ne 0 ]; then
   exit 1
 fi
-echo "ok    CEReactions deferred: rgb=$rgb hidden/bgColor-get/bgColor-set=$counts"
+echo "ok    Document and Element CEReactions deferred: rgb=$rgb hidden/bgColor-get/bgColor-set=$counts"

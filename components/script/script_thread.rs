@@ -248,8 +248,86 @@ struct V8ElementHost {
 // the element only for the duration of a synchronous read, and its Drop only
 // releases a Trusted handle -- it never re-enters V8 or pumps an event loop.
 unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
+    fn local_name(&self) -> String {
+        self.element.root().LocalName().into()
+    }
+
     fn tag_name(&self) -> String {
         self.element.root().TagName().into()
+    }
+
+    fn id(&self) -> String {
+        self.element.root().Id().into()
+    }
+
+    unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context
+        // for this synchronous call and clears it before returning to Servo.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // Do not push and pop a CEReactions queue here: that could invoke a
+        // SpiderMonkey callback beneath a V8 accessor and the sidecar borrow.
+        // Servo's outer or backup queue runs the reaction after V8 unwinds.
+        self.element.root().SetId(cx, DOMString::from(value));
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    fn class_name(&self) -> String {
+        self.element.root().ClassName().into()
+    }
+
+    unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // CEReactions deliberately stay on Servo's outer or backup queue; see
+        // `set_id` above for why they must not run under this V8 callback.
+        self.element.root().SetClassName(cx, DOMString::from(value));
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    fn has_attributes(&self) -> bool {
+        self.element.root().HasAttributes()
+    }
+
+    unsafe fn get_attribute(
+        &self,
+        host_context: *mut c_void,
+        name: &str,
+    ) -> Result<Option<String>, ()> {
+        if host_context.is_null() {
+            return Err(());
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let value = self
+            .element
+            .root()
+            .GetAttribute(cx, DOMString::from(name))
+            .map(Into::into);
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            Err(())
+        } else {
+            Ok(value)
+        }
+    }
+
+    unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let value = self.element.root().HasAttribute(cx, DOMString::from(name));
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
     }
 }
 

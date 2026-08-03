@@ -55,6 +55,13 @@ CONSOLE_INFO = "console.info"
 CONSOLE_LOG = "console.log"
 CONSOLE_TRACE = "console.trace"
 CONSOLE_WARN = "console.warn"
+ELEMENT_LOCAL_NAME = "Element.localName"
+ELEMENT_TAG_NAME = "Element.tagName"
+ELEMENT_ID = "Element.id"
+ELEMENT_CLASS_NAME = "Element.className"
+ELEMENT_HAS_ATTRIBUTES = "Element.hasAttributes"
+ELEMENT_GET_ATTRIBUTE = "Element.getAttribute"
+ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -176,6 +183,19 @@ CONSOLE_HOST = (
     CONSOLE_LOG,
     CONSOLE_TRACE,
     CONSOLE_WARN,
+)
+
+# The scalar Element surface implemented by the per-object wrapper host. No
+# member returns or accepts an interface, so this keeps the existing one-way
+# cppgc -> SpiderMonkey ownership graph intact.
+ELEMENT_HOST = (
+    ELEMENT_LOCAL_NAME,
+    ELEMENT_TAG_NAME,
+    ELEMENT_ID,
+    ELEMENT_CLASS_NAME,
+    ELEMENT_HAS_ATTRIBUTES,
+    ELEMENT_GET_ATTRIBUTE,
+    ELEMENT_HAS_ATTRIBUTE,
 )
 
 
@@ -724,6 +744,122 @@ def _select_console_log_operation(
     return member
 
 
+def _select_element_host_member(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLAttribute | WebIDL.IDLMethod:
+    """Select one exact scalar member from the production Element interface."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{interface_name}`, found {len(interfaces)}"
+        )
+    members = [
+        member
+        for member in interfaces[0].members
+        if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+    member = members[0]
+
+    attribute_attributes = {
+        "localName": {"Constant"},
+        "tagName": {"Pure"},
+        "id": {"CEReactions", "Pure"},
+        "className": {"CEReactions", "Pure"},
+    }
+    if member_name in attribute_attributes:
+        if not member.isAttr() or member.isStatic():
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must be an instance attribute"
+            )
+        expected_attributes = attribute_attributes[member_name]
+        actual_attributes = set(member._extendedAttrDict)
+        if actual_attributes != expected_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+                f"got {sorted(actual_attributes)}"
+            )
+        expected_readonly = member_name in {"localName", "tagName"}
+        if member.readonly != expected_readonly:
+            state = "readonly" if expected_readonly else "writable"
+            raise WebIDLSelectionError(f"`{qualified_name}` must be {state}")
+        if member.type.nullable() or not member.type.isDOMString():
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must use non-nullable `DOMString`, "
+                f"got `{member.type.prettyName()}`"
+            )
+        return member
+
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must be an ordinary instance operation"
+        )
+    expected_attributes = (
+        {"Pure"} if member_name in {"hasAttributes", "getAttribute"} else set()
+    )
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != expected_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+            f"got {sorted(actual_attributes)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if member_name == "getAttribute":
+        if not return_type.nullable() or not return_type.inner.isDOMString():
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must return nullable `DOMString`, "
+                f"got `{return_type.prettyName()}`"
+            )
+    elif return_type.nullable() or not return_type.isBoolean():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `boolean`, "
+            f"got `{return_type.prettyName()}`"
+        )
+
+    expected_count = 0 if member_name == "hasAttributes" else 1
+    if len(arguments) != expected_count:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly {expected_count} argument(s), "
+            f"found {len(arguments)}"
+        )
+    if arguments:
+        argument = arguments[0]
+        if (
+            argument.identifier.name != "name"
+            or argument.optional
+            or argument.variadic
+            or argument.type.nullable()
+            or not argument.type.isDOMString()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take required non-nullable `DOMString name`"
+            )
+        attributes = set(argument._extendedAttrDict) | set(
+            argument.type._extendedAttrDict
+        )
+        if attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` argument `name` carries extended attributes "
+                "that are not implemented: " + ", ".join(sorted(attributes))
+            )
+    return member
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -838,6 +974,22 @@ def select_console_host_members(
             parser_results, qualified_name
         )
         for qualified_name in CONSOLE_HOST
+    }
+
+
+def select_element_host_members(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> dict[str, WebIDL.IDLAttribute | WebIDL.IDLMethod]:
+    """Load the production corpus and pin the scalar Element host slice."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return {
+        qualified_name: _select_element_host_member(
+            parser_results, qualified_name
+        )
+        for qualified_name in ELEMENT_HOST
     }
 
 

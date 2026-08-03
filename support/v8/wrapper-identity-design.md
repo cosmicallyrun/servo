@@ -1,13 +1,14 @@
 # Per-realm wrapper identity for DOM objects
 
-Status: implemented, at exported C ABI version 19. `Document.documentElement`,
-`Document.head`, `Document.getElementById()`, and `Element.tagName` are built on
-it.
+Status: implemented, initially at exported C ABI version 19 and extended with a
+shared Element prototype at ABI version 22. `Document.documentElement`,
+`Document.head`, `Document.getElementById()`, and the scalar Element slice are
+built on it.
 
 This is the subsystem every interface-typed binding waits on.
 `Document.documentElement`, `Document.head`, `Document.getElementById`,
-`Element.tagName`, and eventually anything that hands a DOM node to script all
-need the same thing: asking for the same DOM object twice must produce the
+the scalar Element slice, and eventually anything that hands a DOM node to
+script all need the same thing: asking for the same DOM object twice must produce the
 *same* JavaScript object, while two different DOM objects must never share one
 wrapper.
 
@@ -219,16 +220,17 @@ still clears the cache synchronously and releases live Servo hosts first.
 
 ## Proofs
 
-`authoritative_wrapper_identity_proof.html` and
-`authoritative_get_element_by_id_proof.html` cover runtime behaviour against
-real Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the
-bridge:
+`authoritative_wrapper_identity_proof.html`,
+`authoritative_get_element_by_id_proof.html`, and
+`authoritative_element_scalar_proof.html` cover runtime behaviour against real
+Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by
   an expando surviving a re-read rather than by equality alone
 - `documentElement`, `head`, and the id-selected `DIV` are distinct wrappers
   with independent expandos
-- the wrapper is not the document facade, and `tagName` is brand-checked
+- the wrapper is not the document facade, and members live on one shared,
+  brand-checked Element prototype rather than being copied onto each wrapper
 - a cache hit drops the host the reading path speculatively allocated
 - a hostile surplus-host `Drop` is rejected before it can re-enter V8
 - realm destruction releases all three live hosts synchronously

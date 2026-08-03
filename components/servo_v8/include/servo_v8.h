@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 21u
+#define SERVO_V8_ABI_VERSION 22u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -88,8 +88,35 @@ typedef struct ServoV8InterfaceValue {
 #include "servo_v8_document_host_generated.h"
 
 /* Declared after the generated header, which defines ServoV8OwnedUtf8. */
+typedef struct ServoV8OptionalOwnedUtf8 {
+  uint8_t is_null;
+  ServoV8OwnedUtf8 value;
+} ServoV8OptionalOwnedUtf8;
+
 typedef struct ServoV8ElementHostVTable {
+  uint8_t (*get_local_name)(void* native, ServoV8OwnedUtf8* output);
   uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*get_id)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*set_id)(void* native,
+                    void* host_context,
+                    const uint8_t* value,
+                    size_t value_length);
+  uint8_t (*get_class_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*set_class_name)(void* native,
+                            void* host_context,
+                            const uint8_t* value,
+                            size_t value_length);
+  uint8_t (*has_attributes)(void* native, uint8_t* output);
+  uint8_t (*get_attribute)(void* native,
+                           void* host_context,
+                           const uint8_t* name,
+                           size_t name_length,
+                           ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*has_attribute)(void* native,
+                           void* host_context,
+                           const uint8_t* name,
+                           size_t name_length,
+                           uint8_t* output);
   ServoV8DropCallback drop;
 } ServoV8ElementHostVTable;
 

@@ -92,13 +92,14 @@ its selector pins the exact value set the glue was generated against; a new
 state appearing upstream becomes a build failure rather than an unvalidated
 string.
 
-`Document.documentElement`, `Document.head`, `Document.getElementById`, and
-`Element.tagName` are the members whose value or receiver is another DOM
+`Document.documentElement`, `Document.head`, `Document.getElementById`, and the
+scalar Element slice are the members whose value or receiver is another DOM
 object, and they rest on the per-realm wrapper cache described in
-`wrapper-identity-design.md`. The two attributes and the operation prove that
-distinct DOM identities get distinct stable wrappers in one realm. That cache
-was recorded here as blocked by a cross-heap cycle; it is not, because every
-edge between the heaps points from cppgc into SpiderMonkey and none point back.
+`wrapper-identity-design.md`. The two Document attributes and operation prove
+that distinct DOM identities get distinct stable wrappers in one realm. That
+cache was recorded here as blocked by a cross-heap cycle; it is not, because
+every edge between the heaps points from cppgc into SpiderMonkey and none point
+back.
 The design doc records the constraint that keeps that true, along with why the
 DOM object's address is a safe cache key and why realm teardown must release
 hosts synchronously. A major-GC epilogue prunes every cleared weak entry after
@@ -266,8 +267,9 @@ surface is deliberately limited to `window`, the `console` logging slice,
 `document.bgColor`, `document.URL`, `document.documentURI`, document metadata
 string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
-`document.head`, and `document.getElementById()`, plus `Element.tagName` on the
-elements that return.
+`document.head`, and `document.getElementById()`. Elements returned through that
+surface share a per-realm prototype implementing `localName`, `tagName`, `id`,
+`className`, `hasAttributes()`, `getAttribute()`, and `hasAttribute()`.
 
 V8's inspector-oriented `console` silently discards output when no inspector
 delegate is attached. The realm replaces it with a native, production-WebIDL-
@@ -358,6 +360,7 @@ The proof suite uses that same counting argument:
 | `authoritative_job_error_proof.html` | a page sees its own failing V8 promise via `onerror` |
 | `authoritative_wrapper_identity_proof.html` | a DOM object handed to V8 keeps one stable wrapper |
 | `authoritative_get_element_by_id_proof.html` | the generated DOMString operation preserves conversion, null, and wrapper semantics |
+| `authoritative_element_scalar_proof.html` | common Element scalar reads and mutations use the live Servo DOM with WebIDL prototype semantics |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -381,7 +384,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 21 and remains experimental. The original
+The current exported C ABI is version 22 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

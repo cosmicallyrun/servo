@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 21;
+const ABI_VERSION: u32 = 22;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -192,12 +192,48 @@ impl InterfaceHandle {
 /// implementation is dropped from a cppgc destructor during a V8 collection,
 /// so its `Drop` must not re-enter V8 or pump an event loop.
 pub unsafe trait ElementHostBinding: Sized + 'static {
+    fn local_name(&self) -> String;
     fn tag_name(&self) -> String;
+    fn id(&self) -> String;
+    unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool;
+    fn class_name(&self) -> String;
+    unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool;
+    fn has_attributes(&self) -> bool;
+    unsafe fn get_attribute(
+        &self,
+        host_context: *mut c_void,
+        name: &str,
+    ) -> Result<Option<String>, ()>;
+    unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool>;
+}
+
+#[repr(C)]
+pub struct OptionalOwnedUtf8 {
+    pub is_null: u8,
+    pub value: OwnedUtf8,
 }
 
 #[repr(C)]
 pub struct ElementHostVTable {
+    pub get_local_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
     pub get_tag_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub get_id: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub set_id: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
+    pub get_class_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub set_class_name:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
+    pub has_attributes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_attribute: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut OptionalOwnedUtf8,
+        ) -> u8,
+    >,
+    pub has_attribute:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, *mut u8) -> u8>,
     pub drop: Option<DropCallback>,
 }
 
@@ -398,16 +434,11 @@ impl ConsoleHostVTable {
     }
 }
 
-unsafe extern "C" fn element_host_get_tag_name<T: ElementHostBinding>(
-    native: *mut c_void,
-    output: *mut OwnedUtf8,
-) -> u8 {
+unsafe fn element_host_write_owned_utf8(output: *mut OwnedUtf8, value: String) -> u8 {
     if output.is_null() {
         return 0;
     }
-    // SAFETY: The vtable contract requires a live Box<T> native pointer.
-    let native = unsafe { &*native.cast::<T>() };
-    let owner = Box::new(native.tag_name().into_bytes());
+    let owner = Box::new(value.into_bytes());
     // SAFETY: output is non-null and points to caller-owned writable storage.
     unsafe {
         *output = OwnedUtf8 {
@@ -420,7 +451,159 @@ unsafe extern "C" fn element_host_get_tag_name<T: ElementHostBinding>(
     1
 }
 
+unsafe fn element_host_utf8<'a>(value: *const u8, value_length: usize) -> Option<&'a str> {
+    if value.is_null() && value_length != 0 {
+        return None;
+    }
+    let bytes = if value_length == 0 {
+        &[]
+    } else {
+        // SAFETY: The ABI lends this exact byte range for the synchronous call.
+        unsafe { std::slice::from_raw_parts(value, value_length) }
+    };
+    std::str::from_utf8(bytes).ok()
+}
+
+macro_rules! element_host_string_getter {
+    ($function:ident, $method:ident) => {
+        unsafe extern "C" fn $function<T: ElementHostBinding>(
+            native: *mut c_void,
+            output: *mut OwnedUtf8,
+        ) -> u8 {
+            if native.is_null() {
+                return 0;
+            }
+            // SAFETY: The vtable contract supplies this exact live Box<T>.
+            let value = unsafe { &*native.cast::<T>() }.$method();
+            // SAFETY: The C++ caller owns writable output storage.
+            unsafe { element_host_write_owned_utf8(output, value) }
+        }
+    };
+}
+
+element_host_string_getter!(element_host_get_local_name, local_name);
+element_host_string_getter!(element_host_get_tag_name, tag_name);
+element_host_string_getter!(element_host_get_id, id);
+element_host_string_getter!(element_host_get_class_name, class_name);
+
+unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    // SAFETY: The live context is borrowed only for this synchronous call.
+    unsafe { (&*native.cast::<T>()).set_id(host_context, value) as u8 }
+}
+
+unsafe extern "C" fn element_host_set_class_name<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    // SAFETY: The live context is borrowed only for this synchronous call.
+    unsafe { (&*native.cast::<T>()).set_class_name(host_context, value) as u8 }
+}
+
+unsafe extern "C" fn element_host_has_attributes<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).has_attributes() as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_attribute<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+    output: *mut OptionalOwnedUtf8,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(name) = (unsafe { element_host_utf8(name, name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).get_attribute(host_context, name) };
+    let Ok(value) = result else {
+        return 0;
+    };
+    let mut owned = OwnedUtf8 {
+        data: std::ptr::null(),
+        length: 0,
+        owner: std::ptr::null_mut(),
+        drop_owner: None,
+    };
+    let is_null = value.is_none();
+    if let Some(value) = value {
+        // SAFETY: `owned` is caller-owned writable storage in this frame.
+        if unsafe { element_host_write_owned_utf8(&mut owned, value) } == 0 {
+            return 0;
+        }
+    }
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe {
+        *output = OptionalOwnedUtf8 {
+            is_null: is_null as u8,
+            value: owned,
+        }
+    };
+    1
+}
+
+unsafe extern "C" fn element_host_has_attribute<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(name) = (unsafe { element_host_utf8(name, name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).has_attribute(host_context, name) };
+    let Some(value) = result else {
+        return 0;
+    };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = value as u8 };
+    1
+}
+
 unsafe extern "C" fn element_host_drop<T: ElementHostBinding>(native: *mut c_void) {
+    if native.is_null() {
+        return;
+    }
     // SAFETY: The bridge hands back exactly the Box<T> it was given, once.
     drop(unsafe { Box::from_raw(native.cast::<T>()) });
 }
@@ -1038,7 +1221,15 @@ impl Runtime {
     /// are handed over one at a time by an interface-typed getter.
     pub fn install_element_host<T: ElementHostBinding>(&mut self) -> Result<(), Error> {
         let vtable = ElementHostVTable {
+            get_local_name: Some(element_host_get_local_name::<T>),
             get_tag_name: Some(element_host_get_tag_name::<T>),
+            get_id: Some(element_host_get_id::<T>),
+            set_id: Some(element_host_set_id::<T>),
+            get_class_name: Some(element_host_get_class_name::<T>),
+            set_class_name: Some(element_host_set_class_name::<T>),
+            has_attributes: Some(element_host_has_attributes::<T>),
+            get_attribute: Some(element_host_get_attribute::<T>),
+            has_attribute: Some(element_host_has_attribute::<T>),
             drop: Some(element_host_drop::<T>),
         };
         let mut storage = [0; ERROR_CAPACITY];
@@ -1566,9 +1757,53 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ElementProbeState {
+        attributes: RefCell<Vec<(String, String)>>,
+    }
+
+    impl ElementProbeState {
+        fn with_attributes(attributes: &[(&str, &str)]) -> Rc<Self> {
+            Rc::new(Self {
+                attributes: RefCell::new(
+                    attributes
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                        .collect(),
+                ),
+            })
+        }
+
+        fn get(&self, name: &str) -> Option<String> {
+            let name = name.to_ascii_lowercase();
+            self.attributes
+                .borrow()
+                .iter()
+                .find(|(attribute, _)| attribute == &name)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set(&self, name: &str, value: &str) {
+            if let Some((_, current)) = self
+                .attributes
+                .borrow_mut()
+                .iter_mut()
+                .find(|(attribute, _)| attribute == name)
+            {
+                *current = value.to_owned();
+                return;
+            }
+            self.attributes
+                .borrow_mut()
+                .push((name.to_owned(), value.to_owned()));
+        }
+    }
+
     /// A stand-in for one Servo Element.
     struct ElementHostProbe {
+        local_name: String,
         tag_name: String,
+        state: Rc<ElementProbeState>,
         drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -1613,8 +1848,50 @@ mod tests {
     // optional test-only Drop probe is rejected by the bridge before it can
     // actually re-enter V8.
     unsafe impl ElementHostBinding for ElementHostProbe {
+        fn local_name(&self) -> String {
+            self.local_name.clone()
+        }
+
         fn tag_name(&self) -> String {
             self.tag_name.clone()
+        }
+
+        fn id(&self) -> String {
+            self.state.get("id").unwrap_or_default()
+        }
+
+        unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            self.state.set("id", value);
+            true
+        }
+
+        fn class_name(&self) -> String {
+            self.state.get("class").unwrap_or_default()
+        }
+
+        unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            self.state.set("class", value);
+            true
+        }
+
+        fn has_attributes(&self) -> bool {
+            !self.state.attributes.borrow().is_empty()
+        }
+
+        unsafe fn get_attribute(
+            &self,
+            host_context: *mut c_void,
+            name: &str,
+        ) -> Result<Option<String>, ()> {
+            assert!(!host_context.is_null());
+            Ok(self.state.get(name))
+        }
+
+        unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool> {
+            assert!(!host_context.is_null());
+            Some(self.state.get(name).is_some())
         }
     }
 
@@ -1761,6 +2038,9 @@ mod tests {
         element_identity: Box<u8>,
         head_identity: Box<u8>,
         id_element_identity: Box<u8>,
+        element_state: Rc<ElementProbeState>,
+        head_state: Rc<ElementProbeState>,
+        id_element_state: Rc<ElementProbeState>,
         document_element_present: bool,
         head_present: bool,
         get_element_by_id_calls: Rc<RefCell<Vec<String>>>,
@@ -1785,6 +2065,13 @@ mod tests {
                 element_identity: Box::new(0),
                 head_identity: Box::new(0),
                 id_element_identity: Box::new(0),
+                element_state: ElementProbeState::with_attributes(&[]),
+                head_state: ElementProbeState::with_attributes(&[]),
+                id_element_state: ElementProbeState::with_attributes(&[
+                    ("id", "target"),
+                    ("class", "alpha beta"),
+                    ("data-proof", "present"),
+                ]),
                 document_element_present: true,
                 head_present: true,
                 get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
@@ -1885,7 +2172,9 @@ mod tests {
                 InterfaceHandle::new(
                     (&*self.element_identity as *const u8).cast::<c_void>(),
                     ElementHostProbe {
+                        local_name: "html".to_owned(),
                         tag_name: "HTML".to_owned(),
+                        state: Rc::clone(&self.element_state),
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -1903,7 +2192,9 @@ mod tests {
                 InterfaceHandle::new(
                     (&*self.head_identity as *const u8).cast::<c_void>(),
                     ElementHostProbe {
+                        local_name: "head".to_owned(),
                         tag_name: "HEAD".to_owned(),
+                        state: Rc::clone(&self.head_state),
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -1929,7 +2220,9 @@ mod tests {
                 InterfaceHandle::new(
                     (&*self.id_element_identity as *const u8).cast::<c_void>(),
                     ElementHostProbe {
+                        local_name: "div".to_owned(),
                         tag_name: "DIV".to_owned(),
+                        state: Rc::clone(&self.id_element_state),
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -2961,6 +3254,45 @@ mod tests {
                  toString() { return 'target'; }\n\
                });\n\
                found.marker = 29;\n\
+               const elementPrototype = Object.getPrototypeOf(found);\n\
+               const localNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'localName');\n\
+               const tagNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'tagName');\n\
+               const idDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'id');\n\
+               const classNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'className');\n\
+               const hasAttributesDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'hasAttributes');\n\
+               const getAttributeDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'getAttribute');\n\
+               const hasAttributeDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'hasAttribute');\n\
+               globalThis.elementWrongBrandStringified = false;\n\
+               let elementRejectsWrongBrand = false;\n\
+               try { getAttributeDescriptor.value.call({}, { toString() {\n\
+                 elementWrongBrandStringified = true; return 'id';\n\
+               }}); } catch (error) { elementRejectsWrongBrand = error instanceof TypeError; }\n\
+               let setterRejectsWrongBrand = false;\n\
+               try { idDescriptor.set.call({}, { toString() {\n\
+                 elementWrongBrandStringified = true; return 'changed';\n\
+               }}); } catch (error) { setterRejectsWrongBrand = error instanceof TypeError; }\n\
+               const elementConversionError = new Error('element conversion sentinel');\n\
+               let preservesElementConversionError = false;\n\
+               try { found.getAttribute({ toString() { throw elementConversionError; }}); }\n\
+               catch (error) { preservesElementConversionError = error === elementConversionError; }\n\
+               let elementRejectsSymbol = false;\n\
+               try { found.hasAttribute(Symbol('id')); }\n\
+               catch (error) { elementRejectsSymbol = error instanceof TypeError; }\n\
+               let elementRejectsMissing = false;\n\
+               try { found.getAttribute(); }\n\
+               catch (error) { elementRejectsMissing = error instanceof TypeError; }\n\
+               const convertedAttribute = found.getAttribute({\n\
+                 toString() { return 'DATA-PROOF'; }\n\
+               });\n\
+               found.id = { toString() { return 'changed-id'; }};\n\
+               found.className = null;\n\
                globalThis.getElementByIdBindingProof =\n\
                  !Object.hasOwn(document, 'getElementById') && descriptor &&\n\
                  descriptor.writable && descriptor.enumerable &&\n\
@@ -2969,6 +3301,41 @@ mod tests {
                  rejectsWrongBrand && !getElementByIdWrongBrandStringified &&\n\
                  preservesConversionError && rejectsSymbol && rejectsMissing &&\n\
                  found.tagName === 'DIV' &&\n\
+                 found.localName === 'div' && found.id === 'changed-id' &&\n\
+                 found.className === 'null' && found.hasAttributes() === true &&\n\
+                 found.getAttribute('id') === 'changed-id' &&\n\
+                 found.getAttribute('class') === 'null' &&\n\
+                 found.getAttribute('missing') === null &&\n\
+                 found.hasAttribute('ID') && !found.hasAttribute('missing') &&\n\
+                 convertedAttribute === 'present' &&\n\
+                 !Object.hasOwn(found, 'localName') &&\n\
+                 !Object.hasOwn(found, 'tagName') && !Object.hasOwn(found, 'id') &&\n\
+                 !Object.hasOwn(found, 'className') &&\n\
+                 !Object.hasOwn(found, 'hasAttributes') &&\n\
+                 !Object.hasOwn(found, 'getAttribute') &&\n\
+                 !Object.hasOwn(found, 'hasAttribute') &&\n\
+                 localNameDescriptor && localNameDescriptor.get.length === 0 &&\n\
+                 localNameDescriptor.set === undefined &&\n\
+                 tagNameDescriptor && tagNameDescriptor.get.length === 0 &&\n\
+                 tagNameDescriptor.set === undefined &&\n\
+                 idDescriptor && idDescriptor.get.length === 0 &&\n\
+                 idDescriptor.set.length === 1 &&\n\
+                 classNameDescriptor && classNameDescriptor.get.length === 0 &&\n\
+                 classNameDescriptor.set.length === 1 &&\n\
+                 [localNameDescriptor, tagNameDescriptor, idDescriptor,\n\
+                  classNameDescriptor].every(d => d.enumerable && d.configurable) &&\n\
+                 hasAttributesDescriptor.value.name === 'hasAttributes' &&\n\
+                 hasAttributesDescriptor.value.length === 0 &&\n\
+                 getAttributeDescriptor.value.name === 'getAttribute' &&\n\
+                 getAttributeDescriptor.value.length === 1 &&\n\
+                 hasAttributeDescriptor.value.name === 'hasAttribute' &&\n\
+                 hasAttributeDescriptor.value.length === 1 &&\n\
+                 [hasAttributesDescriptor, getAttributeDescriptor,\n\
+                  hasAttributeDescriptor].every(d => d.writable &&\n\
+                    d.enumerable && d.configurable) &&\n\
+                 elementRejectsWrongBrand && setterRejectsWrongBrand &&\n\
+                 !elementWrongBrandStringified && preservesElementConversionError &&\n\
+                 elementRejectsSymbol && elementRejectsMissing &&\n\
                  found !== document.documentElement && found !== document.head &&\n\
                  document.getElementById('target') === found &&\n\
                  document.getElementById('target').marker === 29 &&\n\
@@ -3047,14 +3414,15 @@ mod tests {
                 )
                 .unwrap()
         );
-        // Reading tagName off a foreign receiver must not reach a host.
+        // Reading tagName off a foreign receiver must not reach a host. The
+        // WebIDL accessor belongs to the shared Element prototype.
         assert!(
             runtime
                 .eval_bool_in_realm(
                     realm,
                     "(() => { \
                        const descriptor = Object.getOwnPropertyDescriptor( \
-                         document.documentElement, 'tagName'); \
+                         Object.getPrototypeOf(document.documentElement), 'tagName'); \
                        try { descriptor.get.call({}); } \
                        catch (error) { return error instanceof TypeError; } \
                        return false; \
