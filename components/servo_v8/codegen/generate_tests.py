@@ -108,6 +108,7 @@ class GeneratedStableInterfaceIdTests(unittest.TestCase):
                 """
                 interface EngineBindingSmoke {
                   constructor(long value);
+                  attribute long value;
                   long setChild(EngineBindingSmoke child);
                 };
                 """,
@@ -138,8 +139,18 @@ class GeneratedStableInterfaceIdTests(unittest.TestCase):
             rust,
         )
         self.assertIn(
-            "cpp_heap->GetAllocationHandle(), native, SERVO_V8_ENGINE_BINDING_SMOKE_INTERFACE_ID,",
+            "cpp_heap->GetAllocationHandle(), runtime, native, SERVO_V8_ENGINE_BINDING_SMOKE_INTERFACE_ID,",
             cpp,
+        )
+
+    def test_wraps_every_generated_rust_callback_in_a_reentry_scope(self) -> None:
+        _, _, cpp = self.generate_outputs()
+
+        self.assertIn("RustCallbackScope callback_scope(runtime);", cpp)
+        self.assertEqual(
+            cpp.count("RustCallbackScope callback_scope(cell->runtime());"),
+            3,
+            "the generated getter, setter, and method must guard their Rust callbacks",
         )
 
 

@@ -1,0 +1,92 @@
+<!doctype html>
+<!--
+Runtime proof that V8-originated CEReactions run only after V8 unwinds.
+
+A customized built-in <body> observes bgcolor, an autonomous custom element
+observes id and class, and its custom child observes disconnection caused by
+`textContent`. The V8-authoritative script mutates all four through the host
+bridge. Servo leaves the resulting reactions on its rooted backup queue and
+invokes the callbacks at the existing microtask checkpoint, after the V8
+setters, authoritative-entry guard, and sidecar borrow have unwound. Each
+SpiderMonkey callback then reads authoritative document.hidden and must
+complete a real V8 round trip rather than taking the defensive re-entry short
+circuit.
+
+This proof needs BOTH authoritative features, so it is not part of
+run_proofs.sh, which builds only the classic-script feature:
+
+  cargo build -p servoshell \
+    --features v8-classic-script-authoritative,v8-document-hidden-authoritative
+  RUST_LOG=warn,script::script_thread=debug \
+    target/debug/servoshell -z -x --hard-fail \
+      --enable-experimental-web-platform-features \
+      -o /tmp/cereactions.png support/v8/authoritative_cereactions_proof.html
+
+Expected: no panic, every pixel lime, the title reporting two body reactions,
+two Element attribute reactions, and one child disconnection; six
+Document.hidden host calls at teardown (the realm probe and five callbacks);
+and no "answered from the host's own native source" warning.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative CEReactions re-entrancy proof</title>
+    <script>
+      class V8Body extends HTMLBodyElement {
+        static get observedAttributes() { return ["bgcolor"]; }
+        attributeChangedCallback(name, oldValue, newValue) {
+          window.ceFired = (window.ceFired || 0) + 1;
+          // This must run only after the V8 bgColor setter has unwound.
+          window.ceHidden = document.hidden;
+        }
+      }
+      customElements.define("v8-body", V8Body, { extends: "body" });
+
+      class V8Element extends HTMLElement {
+        static get observedAttributes() { return ["id", "class"]; }
+        attributeChangedCallback(name, oldValue, newValue) {
+          // Ignore parser-time initialization. Only mutations made by the V8
+          // script below are part of this ordering proof.
+          if (!window.trackElementReactions) return;
+          window.elementFired = (window.elementFired || 0) + 1;
+          window.elementHidden = document.hidden;
+        }
+      }
+      customElements.define("v8-element", V8Element);
+
+      class V8Child extends HTMLElement {
+        disconnectedCallback() {
+          if (!window.trackElementReactions) return;
+          window.childDisconnected = (window.childDisconnected || 0) + 1;
+          window.childHidden = document.hidden;
+        }
+      }
+      customElements.define("v8-child", V8Child);
+    </script>
+  </head>
+  <body is="v8-body" bgcolor="red">
+    <v8-element id="target" class="before"><v8-child></v8-child></v8-element>
+    <script>
+      window.elementFired = 0;
+      window.trackElementReactions = true;
+    </script>
+    <script data-servo-v8="authoritative">
+      document.bgColor =
+        document.bgColor === "lime" ? "red" : "lime";
+      var target = document.getElementById("target");
+      target.id = "changed-id";
+      target.className = "after";
+      target.textContent = null;
+    </script>
+    <script>
+      document.title =
+        "ceFired=" + (window.ceFired || 0) +
+        " elementFired=" + (window.elementFired || 0) +
+        " childDisconnected=" + (window.childDisconnected || 0) +
+        " ceHidden=" + window.ceHidden +
+        " elementHidden=" + window.elementHidden +
+        " childHidden=" + window.childHidden;
+      console.log("RESULT " + document.title);
+    </script>
+  </body>
+</html>

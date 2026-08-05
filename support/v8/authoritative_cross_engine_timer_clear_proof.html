@@ -1,0 +1,30 @@
+<!doctype html>
+<!--
+Runtime proof that SpiderMonkey cancellation releases a V8-owned timer.
+
+The authoritative script schedules and publishes its Servo handle through the
+shared Document. The following ordinary script clears that handle through
+Servo's production Window binding. The V8 callback must never run.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8 cross-engine timer clear proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      document.title = String(setTimeout(() => {
+        document.title = "unexpected V8 timer fire";
+        document.bgColor = "blue";
+      }, 0));
+    </script>
+    <script>
+      clearTimeout(Number(document.title));
+      setTimeout(function () {
+        document.bgColor = document.title === "unexpected V8 timer fire" ? "blue" : "lime";
+      }, 0);
+    </script>
+  </body>
+</html>

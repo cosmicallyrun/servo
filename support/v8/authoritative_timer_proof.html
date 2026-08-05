@@ -1,0 +1,34 @@
+<!doctype html>
+<!--
+Runtime proof that a string timer handler runs on V8.
+
+This was the last classic-script creation site on the window script thread that
+still forced SpiderMonkey, so it is what completes classic-script coverage.
+Worker and service-worker scripts remain SpiderMonkey-owned by design.
+
+A timer handler is a bare source string with no element to carry the
+data-servo-v8 attribute the other routes use, so the marker travels inside the
+source as a prologue directive. Like "use strict", it evaluates to a harmless
+expression statement in an engine that does not recognise it, and only a
+genuine prologue directive counts -- "use servo-v8-nope" does not opt in.
+
+SpiderMonkey schedules the timer; V8 executes its body. The engines hand off
+across a task boundary here rather than within one parse, which is what makes
+this path different from dynamic insertion.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative timer proof</title>
+  </head>
+  <body bgcolor="red">
+    <script>
+      setTimeout(
+        '"use servo-v8"; ' +
+        'document.bgColor = document.bgColor === "lime" ? "red" : "lime";',
+        0);
+    </script>
+  </body>
+</html>

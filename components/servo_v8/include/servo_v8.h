@@ -12,13 +12,14 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 7u
+#define SERVO_V8_ABI_VERSION 23u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
 typedef struct ServoV8TraceVisitor ServoV8TraceVisitor;
 typedef uint64_t ServoV8RealmId;
 typedef uint64_t ServoV8ScriptId;
+typedef uint64_t ServoV8TimerCallbackId;
 
 typedef struct ServoV8ErrorBuffer {
   char* data;
@@ -66,9 +67,116 @@ typedef void (*ServoV8TraceCallback)(void* native,
                                      ServoV8TraceVisitor* visitor);
 typedef void (*ServoV8DropCallback)(void* native);
 
+/* A DOM object being handed to script.
+ *
+ * `key` is the DOM object's address, used only as a cache identity. It is safe
+ * as one because the wrapper cell holds a strong Servo root, so the object
+ * cannot be freed -- and its address cannot be reused -- while a cache entry
+ * for it can still be hit.
+ *
+ * `native` is a freshly boxed host. The bridge consumes it only when it
+ * creates a new wrapper, and drops it through the vtable's drop callback when
+ * an existing wrapper is found, so the transfer stays transactional. */
+typedef struct ServoV8InterfaceValue {
+  uint8_t is_null;
+  const void* key;
+  void* native;
+} ServoV8InterfaceValue;
+
 /* Generated typed WebIDL vtables contain only POD values and native pointers. */
 #include "servo_v8_generated.h"
 #include "servo_v8_document_host_generated.h"
+
+/* Declared after the generated header, which defines ServoV8OwnedUtf8. */
+typedef struct ServoV8OptionalOwnedUtf8 {
+  uint8_t is_null;
+  ServoV8OwnedUtf8 value;
+} ServoV8OptionalOwnedUtf8;
+
+typedef struct ServoV8ElementHostVTable {
+  uint8_t (*get_local_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*get_id)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*set_id)(void* native,
+                    void* host_context,
+                    const uint8_t* value,
+                    size_t value_length);
+  uint8_t (*get_class_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*set_class_name)(void* native,
+                            void* host_context,
+                            const uint8_t* value,
+                            size_t value_length);
+  uint8_t (*has_attributes)(void* native, uint8_t* output);
+  uint8_t (*get_attribute)(void* native,
+                           void* host_context,
+                           const uint8_t* name,
+                           size_t name_length,
+                           ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*has_attribute)(void* native,
+                           void* host_context,
+                           const uint8_t* name,
+                           size_t name_length,
+                           uint8_t* output);
+  uint8_t (*get_node_type)(void* native, uint16_t* output);
+  uint8_t (*get_node_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*get_is_connected)(void* native, uint8_t* output);
+  uint8_t (*get_text_content)(void* native,
+                              ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*set_text_content)(void* native,
+                              void* host_context,
+                              uint8_t is_null,
+                              const uint8_t* value,
+                              size_t value_length);
+  uint8_t (*has_child_nodes)(void* native, uint8_t* output);
+  ServoV8DropCallback drop;
+} ServoV8ElementHostVTable;
+
+/* A realm-owned host for HTML's timer scheduling algorithms.
+ *
+ * V8 owns callable handlers and their arbitrary JS arguments. Servo owns wall
+ * clock scheduling, nesting, cancellation, and the numeric handle exposed to
+ * the page. `host_context` is the live SpiderMonkey JSContext for the current
+ * V8 entry and may be used only synchronously. */
+typedef struct ServoV8TimerHostVTable {
+  uint8_t (*schedule_function)(void* native,
+                               void* host_context,
+                               ServoV8TimerCallbackId callback_id,
+                               int32_t timeout_ms,
+                               uint8_t is_interval,
+                               int32_t* handle);
+  uint8_t (*schedule_string)(void* native,
+                             void* host_context,
+                             const uint8_t* source,
+                             size_t source_length,
+                             int32_t timeout_ms,
+                             uint8_t is_interval,
+                             int32_t* handle);
+  void (*clear)(void* native, int32_t handle);
+  ServoV8DropCallback drop;
+} ServoV8TimerHostVTable;
+
+/* The supported console namespace logging levels. Values are stable ABI. */
+enum ServoV8ConsoleLevel {
+  SERVO_V8_CONSOLE_DEBUG = 0,
+  SERVO_V8_CONSOLE_ERROR = 1,
+  SERVO_V8_CONSOLE_INFO = 2,
+  SERVO_V8_CONSOLE_LOG = 3,
+  SERVO_V8_CONSOLE_TRACE = 4,
+  SERVO_V8_CONSOLE_WARN = 5,
+};
+
+/* A realm-owned sink for V8 console output.
+ *
+ * V8 values are formatted while they are still local handles in C++. Only
+ * validated UTF-8 and a POD level cross into Rust, so no V8 handle, traced
+ * pointer, or cross-heap ownership edge enters Servo. */
+typedef struct ServoV8ConsoleHostVTable {
+  void (*write)(void* native,
+                uint32_t level,
+                const uint8_t* message,
+                size_t message_length);
+  ServoV8DropCallback drop;
+} ServoV8ConsoleHostVTable;
 
 uint32_t servo_v8_abi_version(void);
 
@@ -124,6 +232,39 @@ int32_t servo_v8_realm_script_discard(ServoV8Runtime* runtime,
                                       ServoV8ScriptId script_id,
                                       ServoV8ErrorBuffer* error);
 
+/* Drains the isolate's explicit microtask queue.
+ *
+ * The queue is isolate-wide because V8 requires contexts that can access each
+ * other synchronously to share one queue, and same-origin Servo pipelines on
+ * one script thread do exactly that. A job may therefore belong to any realm,
+ * so the ephemeral host context is installed on every live realm for the
+ * duration of the drain and cleared from all of them on every return path.
+ *
+ * Only termination is reported through the outcome. A job that fails is
+ * buffered instead, because one drain can produce many failures; pull them
+ * with servo_v8_runtime_take_pending_job_error. That covers both channels: an
+ * uncaught job exception and a rejection still unhandled when the drain
+ * ends. */
+int32_t servo_v8_runtime_perform_microtask_checkpoint(
+    ServoV8Runtime* runtime,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error);
+
+/* Pops the oldest buffered microtask job error, if any.
+ *
+ * Sets *has_error to 0 and leaves the exception cleared once drained, so the
+ * caller loops until it reports none. *realm_id names the realm the failure
+ * belongs to -- for a rejection, the realm that created the promise rather
+ * than whichever was entered -- so the embedder can fire the event on the
+ * right global. It is 0 when the realm could not be determined. */
+int32_t servo_v8_runtime_take_pending_job_error(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId* realm_id,
+    ServoV8ScriptException* exception,
+    uint8_t* has_error,
+    ServoV8ErrorBuffer* error);
+
 /* Consumes native only on success; failure leaves ownership with the caller. */
 int32_t servo_v8_realm_install_document_host(
     ServoV8Runtime* runtime,
@@ -132,10 +273,49 @@ int32_t servo_v8_realm_install_document_host(
     const ServoV8DocumentHostVTable* vtable,
     ServoV8ErrorBuffer* error);
 
+/* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_timer_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8TimerHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_console_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8ConsoleHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Invokes one V8 function handler retained by setTimeout/setInterval. */
+int32_t servo_v8_realm_timer_callback_run(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error);
+
+/* Releases a retained timer function without invoking it. Missing callbacks
+ * are a successful no-op, matching clearTimeout/clearInterval semantics. */
+int32_t servo_v8_realm_timer_callback_clear(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
+    ServoV8ErrorBuffer* error);
+
 int32_t servo_v8_realm_document_hidden(ServoV8Runtime* runtime,
                                        ServoV8RealmId realm_id,
                                        uint8_t* result,
                                        ServoV8ErrorBuffer* error);
+
+/* Registers the type-level Element host vtable for this runtime. */
+int32_t servo_v8_install_element_host(
+    ServoV8Runtime* runtime,
+    const ServoV8ElementHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
 
 int32_t servo_v8_install_engine_binding_smoke(
     ServoV8Runtime* runtime,
@@ -169,6 +349,13 @@ void servo_v8_terminate_execution(ServoV8Runtime* runtime);
 
 /* Requires the runtime to have been created with expose_gc for test use. */
 void servo_v8_collect_garbage_for_testing(ServoV8Runtime* runtime);
+
+/* Test-only visibility into weak wrapper-cache pruning; requires expose_gc. */
+int32_t servo_v8_realm_wrapper_cache_size_for_testing(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    size_t* result,
+    ServoV8ErrorBuffer* error);
 
 /* Returns the native allocation only when the live cell's interface ID matches. */
 void* servo_v8_dom_cell_native(ServoV8DomCell* cell,

@@ -43,6 +43,8 @@ use devtools_traits::{
     CSSError, DevtoolScriptControlMsg, DevtoolsPageInfo, NavigationState,
     ScriptToDevtoolsControlMsg, WorkerId,
 };
+#[cfg(feature = "v8-shadow")]
+use embedder_traits::ConsoleLogLevel;
 use embedder_traits::user_contents::{UserContentManagerId, UserContents, UserScript};
 use embedder_traits::{
     EmbedderControlId, EmbedderControlResponse, EmbedderMsg, FocusSequenceNumber,
@@ -124,11 +126,21 @@ use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+#[cfg(feature = "v8-classic-script-authoritative")]
+use crate::dom::bindings::codegen::UnionTypes::TrustedScriptOrString;
 use crate::dom::bindings::conversions::{
     ConversionResult, FromJSValConvertible, StringificationBehavior,
 };
+#[cfg(feature = "v8-classic-script-authoritative")]
+use crate::dom::bindings::error::ErrorInfo;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::error::throw_dom_exception;
 use crate::dom::bindings::inheritance::Castable;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::refcounted::Trusted;
@@ -172,8 +184,12 @@ use crate::script_runtime::{
 use crate::script_window_proxies::ScriptWindowProxies;
 use crate::svg_font::SvgFontResolver;
 use crate::task_queue::TaskQueue;
+#[cfg(feature = "v8-classic-script-authoritative")]
+use crate::timers::{IsInterval, TimerCallback};
 use crate::webdriver_handlers::jsval_to_webdriver;
 use crate::{devtools, webdriver_handlers};
+#[cfg(feature = "v8-classic-script-authoritative")]
+use js::gc::HandleValue;
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
 
@@ -214,6 +230,152 @@ struct V8DocumentHiddenStats {
     getter_calls: Cell<u64>,
     bg_color_getter_calls: Cell<u64>,
     bg_color_setter_calls: Cell<u64>,
+    url_getter_calls: Cell<u64>,
+}
+
+/// A host for one Servo `Element` that V8 has been handed.
+///
+/// The `Trusted<Element>` is the single cross-heap edge: it keeps the element
+/// alive while script can still reach the wrapper, and it is released when the
+/// wrapper's cppgc cell is collected. Nothing in the SpiderMonkey heap points
+/// back at V8, so this edge cannot close a cycle.
+#[cfg(feature = "v8-shadow")]
+struct V8ElementHost {
+    element: Trusted<Element>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: This host stays on its element's originating script thread, roots
+// the element only for the duration of a synchronous read, and its Drop only
+// releases a Trusted handle -- it never re-enters V8 or pumps an event loop.
+unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
+    fn local_name(&self) -> String {
+        self.element.root().LocalName().into()
+    }
+
+    fn tag_name(&self) -> String {
+        self.element.root().TagName().into()
+    }
+
+    fn id(&self) -> String {
+        self.element.root().Id().into()
+    }
+
+    unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context
+        // for this synchronous call and clears it before returning to Servo.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // Do not push and pop a CEReactions queue here: that could invoke a
+        // SpiderMonkey callback beneath a V8 accessor and the sidecar borrow.
+        // Servo's outer or backup queue runs the reaction after V8 unwinds.
+        self.element.root().SetId(cx, DOMString::from(value));
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    fn class_name(&self) -> String {
+        self.element.root().ClassName().into()
+    }
+
+    unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // CEReactions deliberately stay on Servo's outer or backup queue; see
+        // `set_id` above for why they must not run under this V8 callback.
+        self.element.root().SetClassName(cx, DOMString::from(value));
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    fn has_attributes(&self) -> bool {
+        self.element.root().HasAttributes()
+    }
+
+    unsafe fn get_attribute(
+        &self,
+        host_context: *mut c_void,
+        name: &str,
+    ) -> Result<Option<String>, ()> {
+        if host_context.is_null() {
+            return Err(());
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let value = self
+            .element
+            .root()
+            .GetAttribute(cx, DOMString::from(name))
+            .map(Into::into);
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            Err(())
+        } else {
+            Ok(value)
+        }
+    }
+
+    unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let value = self.element.root().HasAttribute(cx, DOMString::from(name));
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
+    }
+
+    fn node_type(&self) -> u16 {
+        self.element.root().upcast::<Node>().NodeType()
+    }
+
+    fn node_name(&self) -> String {
+        self.element.root().upcast::<Node>().NodeName().into()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.element.root().upcast::<Node>().IsConnected()
+    }
+
+    fn text_content(&self) -> Option<String> {
+        self.element
+            .root()
+            .upcast::<Node>()
+            .GetTextContent()
+            .map(Into::into)
+    }
+
+    unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let element = self.element.root();
+        let result = element
+            .upcast::<Node>()
+            .SetTextContent(cx, value.map(DOMString::from));
+        if let Err(error) = result {
+            throw_dom_exception(cx, &element.global(), error);
+            return false;
+        }
+        // `[CEReactions]` deliberately remains on Servo's outer or backup
+        // queue, so no disconnected callback can enter SpiderMonkey beneath
+        // the V8 setter or sidecar borrow.
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    fn has_child_nodes(&self) -> bool {
+        self.element.root().upcast::<Node>().HasChildNodes()
+    }
 }
 
 #[cfg(feature = "v8-shadow")]
@@ -223,11 +385,42 @@ struct V8DocumentHost {
 }
 
 #[cfg(feature = "v8-shadow")]
+struct V8ConsoleHost {
+    document: Trusted<Document>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: The host is confined to the Document's script thread. It receives
+// only owned UTF-8/POD data, synchronously sends one embedder message, and its
+// Drop only releases a Trusted<Document>; it never retains or re-enters V8.
+unsafe impl servo_v8::ConsoleHostBinding for V8ConsoleHost {
+    fn write(&self, level: servo_v8::ConsoleLevel, message: &str) {
+        let level = match level {
+            servo_v8::ConsoleLevel::Debug => ConsoleLogLevel::Debug,
+            servo_v8::ConsoleLevel::Error => ConsoleLogLevel::Error,
+            servo_v8::ConsoleLevel::Info => ConsoleLogLevel::Info,
+            servo_v8::ConsoleLevel::Log => ConsoleLogLevel::Log,
+            servo_v8::ConsoleLevel::Trace => ConsoleLogLevel::Trace,
+            servo_v8::ConsoleLevel::Warn => ConsoleLogLevel::Warn,
+        };
+        let document = self.document.root();
+        let global = document.window().as_global_scope();
+        global.send_to_embedder(EmbedderMsg::ShowConsoleApiMessage(
+            global.webview_id(),
+            level,
+            message.to_owned(),
+        ));
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
 #[expect(unsafe_code)]
 // SAFETY: This host stays on the Document's originating script thread, roots
 // only for a synchronous callback, and never retains the ephemeral JSContext
-// or touches the V8 sidecar RefCell. The mutation path runs Servo's production
-// CEReactions wrapper and reports a SpiderMonkey exception as callback failure.
+// or touches the V8 sidecar RefCell. The mutation path deliberately leaves
+// custom-element reactions on Servo's current or backup element queue, so a
+// SpiderMonkey callback cannot run beneath the live V8 host callback.
 unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
     fn hidden(&self) -> bool {
         self.stats
@@ -246,6 +439,121 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             .into()
     }
 
+    fn url(&self) -> String {
+        self.stats
+            .url_getter_calls
+            .set(self.stats.url_getter_calls.get().wrapping_add(1));
+        // Servo's production getter returns a USVString, which is already
+        // well-formed UTF-8, so the C ABI transfer needs no further conversion.
+        self.document.root().URL().0
+    }
+
+    fn document_uri(&self) -> String {
+        self.document.root().DocumentURI().0
+    }
+
+    fn compat_mode(&self) -> String {
+        self.document.root().CompatMode().into()
+    }
+
+    fn character_set(&self) -> String {
+        self.document.root().CharacterSet().into()
+    }
+
+    fn charset(&self) -> String {
+        self.document.root().Charset().into()
+    }
+
+    fn input_encoding(&self) -> String {
+        self.document.root().InputEncoding().into()
+    }
+
+    fn content_type(&self) -> String {
+        self.document.root().ContentType().into()
+    }
+
+    fn referrer(&self) -> String {
+        self.document.root().Referrer().into()
+    }
+
+    fn last_modified(&self) -> String {
+        self.document.root().LastModified().into()
+    }
+
+    fn visibility_state(&self) -> String {
+        // The generator pinned this enum's value set, so `as_str` can only
+        // produce a value the V8 side was generated against.
+        self.document.root().VisibilityState().as_str().to_owned()
+    }
+
+    fn ready_state(&self) -> String {
+        self.document.root().ReadyState().as_str().to_owned()
+    }
+
+    fn title(&self) -> String {
+        self.document.root().Title().into()
+    }
+
+    fn node_type(&self) -> u16 {
+        // Document inherits from Node, so this is served by the same facade.
+        self.document.root().upcast::<Node>().NodeType()
+    }
+
+    fn document_element(&self) -> Option<servo_v8::InterfaceHandle> {
+        let element = self.document.root().GetDocumentElement()?;
+        // SAFETY: The key is the address of the element the host below roots,
+        // and that root outlives every cache entry keyed on it.
+        Some(unsafe {
+            servo_v8::InterfaceHandle::new(
+                (&*element as *const Element).cast::<c_void>(),
+                V8ElementHost {
+                    element: Trusted::new(&*element),
+                },
+            )
+        })
+    }
+
+    fn head(&self) -> Option<servo_v8::InterfaceHandle> {
+        let head = self.document.root().GetHead()?;
+        let element = head.upcast::<Element>();
+        // SAFETY: HTMLHeadElement inherits from Element. The cache key is the
+        // address of the same Element allocation the host roots.
+        Some(unsafe {
+            servo_v8::InterfaceHandle::new(
+                (element as *const Element).cast::<c_void>(),
+                V8ElementHost {
+                    element: Trusted::new(element),
+                },
+            )
+        })
+    }
+
+    unsafe fn get_element_by_id(
+        &self,
+        host_context: *mut c_void,
+        element_id: &str,
+    ) -> Option<servo_v8::InterfaceHandle> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative run API supplies this synchronously
+        // borrowed JSContext wrapper and clears the pointer before returning.
+        let cx = unsafe { &*host_context.cast::<JSContext>() };
+        let element = self
+            .document
+            .root()
+            .GetElementById(cx, DOMString::from(element_id))?;
+        // SAFETY: The key is the address of the same Element the host roots.
+        Some(unsafe {
+            servo_v8::InterfaceHandle::new(
+                (&*element as *const Element).cast::<c_void>(),
+                V8ElementHost {
+                    element: Trusted::new(&*element),
+                },
+            )
+        })
+    }
+
     unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
         if host_context.is_null() {
             return false;
@@ -256,16 +564,120 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         self.stats
             .bg_color_setter_calls
             .set(self.stats.bg_color_setter_calls.get().wrapping_add(1));
-        let reactions = ScriptThread::custom_element_reaction_stack();
-        reactions.push_new_element_queue();
+        // Do not push and pop a CEReactions queue here. Popping would invoke a
+        // SpiderMonkey custom-element callback while the V8 accessor and the
+        // sidecar's mutable borrow are still on the stack. With no wrapper of
+        // our own, Servo enqueues the reaction on an already active outer
+        // queue or on its rooted backup queue. The latter schedules Servo's
+        // CustomElementReaction microtask, which runs after the V8 call and
+        // authoritative-entry guard have unwound.
         self.document.root().set_body_attribute(
             cx,
             &local_name!("bgcolor"),
             DOMString::from(value),
         );
-        reactions.pop_current_element_queue(cx);
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         !unsafe { JS_IsExceptionPending(cx) }
+    }
+
+    unsafe fn set_title(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative run API supplies its synchronously
+        // borrowed JSContext wrapper and clears the pointer before returning.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // As with bgColor, the outer Servo entry owns CEReactions scheduling;
+        // invoking a SpiderMonkey reaction beneath this V8 callback would
+        // violate the sidecar borrow and callback-depth invariants.
+        self.document.root().SetTitle(cx, DOMString::from(value));
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        !unsafe { JS_IsExceptionPending(cx) }
+    }
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+struct V8TimerHost {
+    document: Trusted<Document>,
+    realm_id: servo_v8::RealmId,
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+#[expect(unsafe_code)]
+// SAFETY: The host is confined to its Document's script thread, never touches
+// the V8 sidecar RefCell, and only schedules or cancels Servo tasks. It uses
+// host_context synchronously and never retains it.
+unsafe impl servo_v8::TimerHostBinding for V8TimerHost {
+    fn schedule_function(
+        &self,
+        host_context: *mut c_void,
+        callback_id: servo_v8::TimerCallbackId,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The bridge supplies the current live SpiderMonkey JSContext
+        // for this synchronous V8 entry and clears it before returning.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let document = self.document.root();
+        document
+            .window()
+            .as_global_scope()
+            .set_timeout_or_interval(
+                cx,
+                TimerCallback::V8FunctionTimerCallback(self.realm_id, callback_id),
+                Vec::new(),
+                Duration::from_millis(timeout_ms.max(0) as u64),
+                if is_interval {
+                    IsInterval::Interval
+                } else {
+                    IsInterval::NonInterval
+                },
+            )
+            .ok()
+    }
+
+    fn schedule_string(
+        &self,
+        host_context: *mut c_void,
+        source: &str,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The bridge supplies the current live SpiderMonkey JSContext
+        // for this synchronous V8 entry and clears it before returning.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let document = self.document.root();
+        document
+            .window()
+            .as_global_scope()
+            .set_timeout_or_interval(
+                cx,
+                TimerCallback::V8StringTimerCallback(TrustedScriptOrString::String(
+                    DOMString::from(source),
+                )),
+                Vec::new(),
+                Duration::from_millis(timeout_ms.max(0) as u64),
+                if is_interval {
+                    IsInterval::Interval
+                } else {
+                    IsInterval::NonInterval
+                },
+            )
+            .ok()
+    }
+
+    fn clear(&self, handle: i32) {
+        self.document
+            .root()
+            .window()
+            .as_global_scope()
+            .clear_timeout_or_interval(handle);
     }
 }
 
@@ -279,12 +691,57 @@ impl Drop for V8DocumentHiddenQueryGuard<'_> {
     }
 }
 
+/// Why a V8 `Document.hidden` read did not reach V8.
+///
+/// The two cases need opposite policies, which is the whole reason they are
+/// distinguished: re-entrancy is normal and page-reachable, while a bridge
+/// failure is a bug in the embedding.
+#[cfg(feature = "v8-document-hidden-diagnostic")]
+enum V8DocumentHiddenError {
+    /// The bridge is already on the stack, so the sidecar cannot be borrowed
+    /// again. The V8 accessor's host implementation returns the same native
+    /// state it would have been asked for, so no answer is lost.
+    Reentrant(String),
+    /// The sidecar, the realm, or V8 itself failed.
+    Failed(String),
+}
+
+#[cfg(feature = "v8-document-hidden-diagnostic")]
+impl std::fmt::Display for V8DocumentHiddenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            V8DocumentHiddenError::Reentrant(reason) | V8DocumentHiddenError::Failed(reason) => {
+                formatter.write_str(reason)
+            },
+        }
+    }
+}
+
 #[cfg(feature = "v8-classic-script-authoritative")]
 struct V8AuthoritativeScriptGuard<'a>(&'a Cell<bool>);
 
 #[cfg(feature = "v8-classic-script-authoritative")]
+impl<'a> V8AuthoritativeScriptGuard<'a> {
+    /// Marks the script thread as running an authoritative V8 classic script,
+    /// or fails if one is already running. The flag is tested before it is
+    /// set, and setting it is inseparable from arming the reset, so a
+    /// rejected recursive entry can never observe or leave a modified flag.
+    fn enter(flag: &'a Cell<bool>) -> Result<Self, String> {
+        if flag.get() {
+            return Err("re-entrant authoritative V8 classic-script run".to_owned());
+        }
+        flag.set(true);
+        Ok(Self(flag))
+    }
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
 impl Drop for V8AuthoritativeScriptGuard<'_> {
     fn drop(&mut self) {
+        debug_assert!(
+            self.0.get(),
+            "authoritative V8 classic-script guard was cleared before it was dropped"
+        );
         self.0.set(false);
     }
 }
@@ -438,6 +895,14 @@ pub struct ScriptThread {
     /// Document host during an authoritative classic-script run.
     #[cfg(feature = "v8-classic-script-authoritative")]
     in_v8_authoritative_script: Cell<bool>,
+
+    /// Set when an authoritative script has run and may have enqueued V8
+    /// microtasks. The public `MicrotaskQueue` API has no emptiness query, and
+    /// draining an empty queue is a no-op rather than an error, so this is
+    /// purely a gate that keeps sidecar cost off every SpiderMonkey script on
+    /// the thread. No authoritative script having run means no V8 job exists.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    v8_may_have_pending_jobs: Cell<bool>,
 
     /// Guards the synchronous V8 -> Rust `Document.hidden` callback against
     /// accidentally borrowing the V8 sidecar recursively.
@@ -751,6 +1216,42 @@ impl ScriptThread {
         })
     }
 
+    /// Releases a retained V8 classic script that will never be executed.
+    ///
+    /// This is deliberately best effort and infallible. It runs from a drop
+    /// path, so it must not panic, and every way it can fail — a disposed
+    /// sidecar, an already destroyed realm, a sidecar borrowed further up the
+    /// stack — means the handle is either already gone or will be released
+    /// when its realm is destroyed. Realm and script IDs are never reused, so
+    /// a stale discard can never free an unrelated handle.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn discard_authoritative_classic_script(
+        realm_id: servo_v8::RealmId,
+        script_id: servo_v8::ScriptId,
+    ) {
+        with_optional_script_thread(|script_thread| {
+            let Some(script_thread) = script_thread else {
+                return;
+            };
+            let Ok(mut slot) = script_thread.v8_shadow.try_borrow_mut() else {
+                debug!(
+                    "V8 sidecar is already borrowed; leaving {script_id:?} in {realm_id:?} to \
+                     realm destruction"
+                );
+                return;
+            };
+            let Some(shadow) = slot.as_mut() else {
+                return;
+            };
+            match shadow.runtime.discard_script_in_realm(realm_id, script_id) {
+                Ok(()) => debug!("discarded unexecuted V8 {script_id:?} in {realm_id:?}"),
+                Err(error) => {
+                    debug!("discarding unexecuted V8 {script_id:?} in {realm_id:?} failed: {error}")
+                },
+            }
+        });
+    }
+
     #[cfg(feature = "v8-classic-script-authoritative")]
     pub(crate) fn run_authoritative_classic_script(
         pipeline_id: PipelineId,
@@ -761,10 +1262,8 @@ impl ScriptThread {
         with_optional_script_thread(|script_thread| {
             let script_thread = script_thread
                 .ok_or_else(|| "no current ScriptThread for authoritative V8 run".to_owned())?;
-            if script_thread.in_v8_authoritative_script.replace(true) {
-                return Err("re-entrant authoritative V8 classic-script run".to_owned());
-            }
-            let _guard = V8AuthoritativeScriptGuard(&script_thread.in_v8_authoritative_script);
+            let _guard =
+                V8AuthoritativeScriptGuard::enter(&script_thread.in_v8_authoritative_script)?;
             let mut slot = script_thread.v8_shadow.borrow_mut();
             let shadow = slot
                 .as_mut()
@@ -780,6 +1279,10 @@ impl ScriptThread {
                      current realm is {actual_realm_id:?}"
                 ));
             }
+            // The script is about to run and may enqueue V8 jobs. Marking
+            // before execution keeps the mark correct for a script that throws
+            // after enqueuing one.
+            script_thread.v8_may_have_pending_jobs.set(true);
             // SAFETY: cx is synchronously borrowed for this call, the bridge
             // clears it on every return path, and generated hosts cannot retain it.
             unsafe {
@@ -791,6 +1294,205 @@ impl ScriptThread {
             }
             .map_err(|error| error.to_string())
         })
+    }
+
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn run_authoritative_v8_timer_callback(
+        pipeline_id: PipelineId,
+        expected_realm_id: servo_v8::RealmId,
+        callback_id: servo_v8::TimerCallbackId,
+        cx: &mut JSContext,
+    ) -> Result<servo_v8::ScriptRunOutcome, String> {
+        with_optional_script_thread(|script_thread| {
+            let script_thread = script_thread
+                .ok_or_else(|| "no current ScriptThread for authoritative V8 timer".to_owned())?;
+            let _guard =
+                V8AuthoritativeScriptGuard::enter(&script_thread.in_v8_authoritative_script)?;
+            let mut slot = script_thread.v8_shadow.borrow_mut();
+            let shadow = slot
+                .as_mut()
+                .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned())?;
+            let actual_realm_id = shadow
+                .realms
+                .get(&pipeline_id)
+                .map(|realm| realm.id)
+                .ok_or_else(|| format!("V8 shadow has no realm for {pipeline_id}"))?;
+            if actual_realm_id != expected_realm_id {
+                return Err(format!(
+                    "V8 realm changed for {pipeline_id}: timer belongs to \
+                     {expected_realm_id:?}, current realm is {actual_realm_id:?}"
+                ));
+            }
+            script_thread.v8_may_have_pending_jobs.set(true);
+            // SAFETY: cx is borrowed only for this synchronous invocation and
+            // the bridge clears it on every return path.
+            unsafe {
+                shadow
+                    .runtime
+                    .run_timer_callback_in_realm_with_host_context(
+                        actual_realm_id,
+                        callback_id,
+                        (cx as *mut JSContext).cast(),
+                    )
+            }
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    /// Releases a V8 callable when a non-V8 path cancels its Servo timer.
+    /// Clear calls made from V8 have already erased the callback in C++ and
+    /// cannot borrow the sidecar again beneath their live host callback.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    pub(crate) fn clear_authoritative_v8_timer_callback(
+        realm_id: servo_v8::RealmId,
+        callback_id: servo_v8::TimerCallbackId,
+    ) {
+        with_optional_script_thread(|script_thread| {
+            let Some(script_thread) = script_thread else {
+                return;
+            };
+            if script_thread.in_v8_authoritative_script.get() {
+                return;
+            }
+            let Ok(mut slot) = script_thread.v8_shadow.try_borrow_mut() else {
+                debug!("V8 sidecar is borrowed; timer callback will release at realm teardown");
+                return;
+            };
+            let Some(shadow) = slot.as_mut() else {
+                return;
+            };
+            if let Err(error) = shadow
+                .runtime
+                .clear_timer_callback_in_realm(realm_id, callback_id)
+            {
+                debug!("clearing V8 timer callback failed after Servo cancellation: {error}");
+            }
+        });
+    }
+
+    /// Drains V8's microtask queue at HTML's "clean up after running script"
+    /// boundary, immediately before Servo's own checkpoint.
+    ///
+    /// V8 runs first so a job that enqueues a SpiderMonkey microtask — today
+    /// only reachable through a DOM host, for example CEReactions running a
+    /// custom element callback — is still serviced by the SpiderMonkey
+    /// checkpoint that follows, within the same boundary. Draining V8 second
+    /// would strand such a job until the next task, which is observable.
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    fn perform_a_v8_microtask_checkpoint(&self, cx: &mut js::context::JSContext) {
+        if !self.v8_may_have_pending_jobs.get() {
+            return;
+        }
+
+        // Never checkpoint inside an authoritative script. The settings-stack
+        // boundary cannot reach here that way, but the parser and event loop
+        // also call this. Leave the mark set so the next boundary drains.
+        let Ok(_guard) = V8AuthoritativeScriptGuard::enter(&self.in_v8_authoritative_script) else {
+            debug!("skipping V8 microtask checkpoint inside an authoritative script");
+            return;
+        };
+
+        // Everything that touches the sidecar happens inside this borrow, and
+        // the borrow is released before anything is reported: reporting fires
+        // page-visible events whose handlers must not find the sidecar
+        // already borrowed.
+        let (outcome, job_failures): (_, Vec<(Option<PipelineId>, servo_v8::ScriptException)>) = {
+            let mut slot = self.v8_shadow.borrow_mut();
+            let Some(shadow) = slot.as_mut() else {
+                // The sidecar is gone, so its jobs are too. Nothing to fall
+                // back to and nothing to report.
+                self.v8_may_have_pending_jobs.set(false);
+                return;
+            };
+            self.v8_may_have_pending_jobs.set(false);
+
+            // SAFETY: cx is synchronously borrowed for this call, the bridge
+            // clears it from every realm on every return path, and generated
+            // hosts cannot retain it.
+            let outcome = unsafe {
+                shadow
+                    .runtime
+                    .perform_microtask_checkpoint_with_host_context((cx as *mut JSContext).cast())
+            };
+
+            // A job that fails never reaches the outcome above: V8 catches it
+            // inside its own microtask builtin, and a reaction that throws
+            // rejects its derived promise instead. Both are pulled here, after
+            // the drain, so a handler attached during the drain has already
+            // revoked its entry.
+            let job_failures = match shadow.runtime.take_pending_job_errors() {
+                Ok(failures) => failures
+                    .into_iter()
+                    .map(|failure| {
+                        // Resolve the realm to its pipeline while the map is
+                        // still borrowed; the realm may be destroyed by the
+                        // time anything is reported.
+                        let pipeline_id = failure.realm_id.and_then(|realm_id| {
+                            shadow
+                                .realms
+                                .iter()
+                                .find(|(_, realm)| realm.id == realm_id)
+                                .map(|(pipeline_id, _)| *pipeline_id)
+                        });
+                        (pipeline_id, failure.exception)
+                    })
+                    .collect(),
+                Err(error) => panic!("collecting V8 microtask job errors failed: {error}"),
+            };
+            (outcome, job_failures)
+        };
+        match outcome {
+            Ok(servo_v8::ScriptRunOutcome::Completed) => {},
+            Ok(servo_v8::ScriptRunOutcome::Terminated) => {
+                warn!("V8 execution was terminated during a microtask checkpoint")
+            },
+            Ok(servo_v8::ScriptRunOutcome::Thrown(exception)) => warn!(
+                "V8 microtask threw at {}:{}:{}: {}",
+                exception.resource_name,
+                exception.line_number,
+                exception.column_number,
+                exception.message
+            ),
+            // Authoritative mode fails strictly. There is no SpiderMonkey
+            // fallback for a V8 job, so a bridge failure is a bug, not a
+            // condition to recover from.
+            Err(error) => {
+                panic!("authoritative V8 microtask checkpoint failed internally: {error}")
+            },
+        }
+
+        // Report each failure on the global that owns it, so a page observes
+        // its own failing promise through `onerror` rather than only in the
+        // browser's log.
+        for (pipeline_id, exception) in job_failures {
+            let global = pipeline_id.and_then(|id| self.documents.borrow().find_global(id));
+            let Some(global) = global else {
+                // The realm was unknown, or its pipeline is already gone, so
+                // there is no global left to fire on.
+                warn!(
+                    "uncaught error in a V8 microtask with no reportable global, at {}:{}:{}: \
+                     {}{}",
+                    exception.resource_name,
+                    exception.line_number,
+                    exception.column_number,
+                    exception.message,
+                    exception.stack
+                );
+                continue;
+            };
+            let mut realm = enter_auto_realm(cx, &*global);
+            let cx = &mut realm.current_realm();
+            global.report_an_error(
+                cx,
+                ErrorInfo {
+                    message: exception.message,
+                    filename: exception.resource_name,
+                    lineno: exception.line_number,
+                    column: exception.column_number,
+                },
+                HandleValue::null(),
+            );
+        }
     }
 
     #[cfg(feature = "v8-shadow")]
@@ -824,6 +1526,40 @@ impl ScriptThread {
                         ));
                     }
                     return Err(format!("Document host installation failed: {error}"));
+                }
+
+                if let Err(error) = shadow.runtime.install_console_host(
+                    realm_id,
+                    V8ConsoleHost {
+                        document: Trusted::new(document),
+                    },
+                ) {
+                    if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                        reset_entire_state = true;
+                        return Err(format!(
+                            "console host installation failed: {error}; fresh realm cleanup \
+                             also failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(format!("console host installation failed: {error}"));
+                }
+
+                #[cfg(feature = "v8-classic-script-authoritative")]
+                if let Err(error) = shadow.runtime.install_timer_host(
+                    realm_id,
+                    V8TimerHost {
+                        document: Trusted::new(document),
+                        realm_id,
+                    },
+                ) {
+                    if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                        reset_entire_state = true;
+                        return Err(format!(
+                            "timer host installation failed: {error}; fresh realm cleanup \
+                             also failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(format!("timer host installation failed: {error}"));
                 }
 
                 let native_hidden = document.hidden_state_for_v8();
@@ -870,7 +1606,9 @@ impl ScriptThread {
         }
 
         match result {
-            Ok(()) => debug!("V8 shadow created realm and Document host for {pipeline_id}"),
+            Ok(()) => {
+                debug!("V8 shadow created realm with Document and console hosts for {pipeline_id}")
+            },
             Err(error) => {
                 #[cfg(any(
                     feature = "v8-classic-script-authoritative",
@@ -902,10 +1640,12 @@ impl ScriptThread {
                     let realm = shadow.realms.remove(&pipeline_id).unwrap();
                     debug!(
                         "V8 shadow destroyed realm for {pipeline_id} after {} Document.hidden, \
-                         {} Document.bgColor getter, and {} Document.bgColor setter host calls",
+                         {} Document.bgColor getter, {} Document.bgColor setter, and {} \
+                         Document.URL host calls",
                         realm.document_hidden_stats.getter_calls.get(),
                         realm.document_hidden_stats.bg_color_getter_calls.get(),
-                        realm.document_hidden_stats.bg_color_setter_calls.get()
+                        realm.document_hidden_stats.bg_color_setter_calls.get(),
+                        realm.document_hidden_stats.url_getter_calls.get()
                     );
                     None
                 },
@@ -926,13 +1666,16 @@ impl ScriptThread {
     }
 
     #[cfg(feature = "v8-document-hidden-diagnostic")]
-    fn query_v8_document_hidden(&self, pipeline_id: PipelineId) -> Result<bool, String> {
+    fn query_v8_document_hidden(
+        &self,
+        pipeline_id: PipelineId,
+    ) -> Result<bool, V8DocumentHiddenError> {
         #[cfg(feature = "v8-classic-script-authoritative")]
         if self.in_v8_authoritative_script.get() {
-            return Err(format!(
+            return Err(V8DocumentHiddenError::Reentrant(format!(
                 "cannot re-enter V8 Document.hidden during an authoritative script for \
                  {pipeline_id}"
-            ));
+            )));
         }
         if self.in_v8_document_hidden.get() {
             let attempts = self
@@ -940,26 +1683,28 @@ impl ScriptThread {
                 .get()
                 .wrapping_add(1);
             self.v8_document_hidden_reentrant_attempts.set(attempts);
-            return Err(format!(
+            return Err(V8DocumentHiddenError::Reentrant(format!(
                 "re-entrant V8 Document.hidden query for {pipeline_id} (attempt {attempts})"
-            ));
+            )));
         }
 
         self.in_v8_document_hidden.set(true);
         let _guard = V8DocumentHiddenQueryGuard(&self.in_v8_document_hidden);
         let mut slot = self.v8_shadow.borrow_mut();
-        let shadow = slot
-            .as_mut()
-            .ok_or_else(|| "V8 shadow runtime is unavailable".to_owned())?;
+        let shadow = slot.as_mut().ok_or_else(|| {
+            V8DocumentHiddenError::Failed("V8 shadow runtime is unavailable".to_owned())
+        })?;
         let realm_id = shadow
             .realms
             .get(&pipeline_id)
             .map(|realm| realm.id)
-            .ok_or_else(|| format!("V8 shadow has no realm for {pipeline_id}"))?;
+            .ok_or_else(|| {
+                V8DocumentHiddenError::Failed(format!("V8 shadow has no realm for {pipeline_id}"))
+            })?;
         shadow
             .runtime
             .document_hidden(realm_id)
-            .map_err(|error| error.to_string())
+            .map_err(|error| V8DocumentHiddenError::Failed(error.to_string()))
     }
 
     #[cfg(all(
@@ -992,14 +1737,46 @@ impl ScriptThread {
         });
     }
 
+    /// Reads `Document.hidden` through V8, or defensively short-circuits when
+    /// the bridge is already on the stack.
+    ///
+    /// `native` is only consulted for the re-entrant case, and that is not a
+    /// SpiderMonkey fallback: the V8 accessor's own host implementation reads
+    /// `hidden_state_for_v8` and returns it unchanged, so the answer is not in
+    /// doubt — only the round trip is skipped, because the sidecar is already
+    /// mutably borrowed further up the stack.
+    ///
+    /// V8-originated CEReactions are now deferred until the existing Servo
+    /// checkpoint, after V8 frames and the sidecar borrow unwind. The short
+    /// circuit remains a safety net for any other page-reachable nested route;
+    /// only a genuine bridge failure — a disposed sidecar, a missing realm, a
+    /// V8 error — aborts.
     #[cfg(feature = "v8-document-hidden-authoritative")]
-    pub(crate) fn v8_document_hidden_strict(pipeline_id: PipelineId) -> bool {
+    pub(crate) fn v8_document_hidden_strict(pipeline_id: PipelineId, native: bool) -> bool {
         let result = with_optional_script_thread(|script_thread| {
-            script_thread.map(|script_thread| script_thread.query_v8_document_hidden(pipeline_id))
+            script_thread.map(|script_thread| {
+                (
+                    script_thread.query_v8_document_hidden(pipeline_id),
+                    script_thread.v8_document_hidden_fallbacks.get(),
+                )
+            })
         });
         match result {
-            Some(Ok(hidden)) => hidden,
-            Some(Err(error)) => {
+            Some((Ok(hidden), _)) => hidden,
+            Some((Err(V8DocumentHiddenError::Reentrant(reason)), fallbacks)) => {
+                let fallbacks = fallbacks.wrapping_add(1);
+                with_optional_script_thread(|script_thread| {
+                    if let Some(script_thread) = script_thread {
+                        script_thread.v8_document_hidden_fallbacks.set(fallbacks);
+                    }
+                });
+                warn!(
+                    "V8 Document.hidden answered from the host's own native source for \
+                     {pipeline_id} (short circuit {fallbacks}): {reason}"
+                );
+                native
+            },
+            Some((Err(V8DocumentHiddenError::Failed(error)), _)) => {
                 panic!("authoritative V8 Document.hidden query failed for {pipeline_id}: {error}")
             },
             None => panic!(
@@ -1459,8 +2236,13 @@ impl ScriptThread {
 
         #[cfg(feature = "v8-shadow")]
         let v8_shadow = match servo_v8::Runtime::new(servo_v8::Options::default()) {
-            Ok(runtime) => {
+            Ok(mut runtime) => {
                 *v8_interrupt.lock().unwrap() = Some(runtime.interrupt_handle());
+                // Type-level and installed once per runtime, before any realm
+                // can hand an Element to script.
+                if let Err(error) = runtime.install_element_host::<V8ElementHost>() {
+                    panic!("V8 Element host installation failed: {error}");
+                }
                 Some(V8ShadowState {
                     runtime,
                     realms: FxHashMap::default(),
@@ -1510,6 +2292,8 @@ impl ScriptThread {
                     v8_shadow: RefCell::new(v8_shadow),
                     #[cfg(feature = "v8-classic-script-authoritative")]
                     in_v8_authoritative_script: Cell::new(false),
+                    #[cfg(feature = "v8-classic-script-authoritative")]
+                    v8_may_have_pending_jobs: Cell::new(false),
                     #[cfg(feature = "v8-document-hidden-diagnostic")]
                     in_v8_document_hidden: Cell::new(false),
                     #[cfg(feature = "v8-document-hidden-diagnostic")]
@@ -4835,6 +5619,9 @@ impl ScriptThread {
     pub(crate) fn perform_a_microtask_checkpoint(&self, cx: &mut js::context::JSContext) {
         // Only perform the checkpoint if we're not shutting down.
         if self.can_continue_running_inner() {
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            self.perform_a_v8_microtask_checkpoint(cx);
+
             let globals = self
                 .documents
                 .borrow()

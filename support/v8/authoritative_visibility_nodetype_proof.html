@@ -1,0 +1,38 @@
+<!doctype html>
+<!--
+Runtime proof for the two members added alongside Document.URL.
+
+Document.visibilityState is an enum: it crosses the C ABI as its string value,
+so the generator pins the exact value set the glue was written against and a new
+state upstream becomes a build failure rather than an unvalidated string.
+
+Node.nodeType is served by this same document facade, with no second host and no
+second vtable, because Document inherits from Node. It must arrive as a number,
+which is what distinguishes it from every string-valued member so far.
+
+The script throws unless both reads are correct, so red means a wrong value
+rather than merely that nothing ran.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative visibilityState and nodeType proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      if (!["visible", "hidden"].includes(document.visibilityState)) {
+        throw new Error("unexpected visibilityState: " +
+                        document.visibilityState);
+      }
+      // Node.DOCUMENT_NODE, and a number rather than a string.
+      if (document.nodeType !== 9 ||
+          typeof document.nodeType !== "number") {
+        throw new Error("unexpected nodeType: " + document.nodeType);
+      }
+      document.bgColor =
+        document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

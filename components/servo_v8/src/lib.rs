@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 7;
+const ABI_VERSION: u32 = 23;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -48,6 +48,14 @@ pub struct RealmId(u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct ScriptId(u64);
+
+/// Identifies one V8 function and argument list retained for a Servo timer.
+///
+/// Callback IDs are realm-local, never reused, and stop being valid when the
+/// one-shot fires, the timer is cleared, or the realm is destroyed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct TimerCallbackId(u64);
 
 #[repr(C)]
 struct ErrorBuffer {
@@ -93,6 +101,16 @@ pub struct ScriptException {
     pub column_number: u32,
 }
 
+/// One failed microtask job, and the realm it belongs to.
+///
+/// `realm_id` is `None` only when V8 could not name a context for the failure,
+/// which leaves the embedder no global to report it on.
+#[derive(Debug, Eq, PartialEq)]
+pub struct JobError {
+    pub realm_id: Option<RealmId>,
+    pub exception: ScriptException,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum ScriptRunOutcome {
     Completed,
@@ -126,6 +144,569 @@ impl Default for Options {
 
 pub type TraceCallback = unsafe extern "C" fn(*mut c_void, *mut TraceVisitor);
 pub type DropCallback = unsafe extern "C" fn(*mut c_void);
+
+#[repr(C)]
+pub struct RawInterfaceValue {
+    pub is_null: u8,
+    pub key: *const c_void,
+    pub native: *mut c_void,
+}
+
+/// One Servo DOM object being handed to script.
+///
+/// `key` identifies the object for the realm's wrapper cache, so that reading
+/// the same object twice yields the same JavaScript object. A raw address is
+/// safe here only because the wrapper cell keeps that object alive for exactly
+/// as long as a cache entry for it can be hit.
+///
+/// `native` is a freshly boxed host. The bridge takes it only when it creates
+/// a new wrapper, and drops it through the vtable when an existing wrapper is
+/// found, so ownership never straddles the two outcomes.
+pub struct InterfaceHandle {
+    pub key: *const c_void,
+    pub native: *mut c_void,
+}
+
+impl InterfaceHandle {
+    /// Boxes `host` and derives the cache key from `dom_object`.
+    ///
+    /// # Safety
+    ///
+    /// `dom_object` must be the address of the DOM object `host` roots, and
+    /// that root must keep it alive for as long as the host lives. Passing an
+    /// address the host does not root would let the cache outlive its object.
+    pub unsafe fn new<T: ElementHostBinding>(dom_object: *const c_void, host: T) -> Self {
+        Self {
+            key: dom_object,
+            native: Box::into_raw(Box::new(host)).cast::<c_void>(),
+        }
+    }
+}
+
+/// A host for one Servo `Element` reachable from V8.
+///
+/// # Safety
+///
+/// Implementations must stay on the owning script thread, must not unwind,
+/// and must root the DOM object they read for the duration of the call. The
+/// implementation is dropped from a cppgc destructor during a V8 collection,
+/// so its `Drop` must not re-enter V8 or pump an event loop.
+pub unsafe trait ElementHostBinding: Sized + 'static {
+    fn local_name(&self) -> String;
+    fn tag_name(&self) -> String;
+    fn id(&self) -> String;
+    unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool;
+    fn class_name(&self) -> String;
+    unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool;
+    fn has_attributes(&self) -> bool;
+    unsafe fn get_attribute(
+        &self,
+        host_context: *mut c_void,
+        name: &str,
+    ) -> Result<Option<String>, ()>;
+    unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool>;
+    fn node_type(&self) -> u16;
+    fn node_name(&self) -> String;
+    fn is_connected(&self) -> bool;
+    fn text_content(&self) -> Option<String>;
+    unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool;
+    fn has_child_nodes(&self) -> bool;
+}
+
+#[repr(C)]
+pub struct OptionalOwnedUtf8 {
+    pub is_null: u8,
+    pub value: OwnedUtf8,
+}
+
+#[repr(C)]
+pub struct ElementHostVTable {
+    pub get_local_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub get_tag_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub get_id: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub set_id: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
+    pub get_class_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub set_class_name:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
+    pub has_attributes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_attribute: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut OptionalOwnedUtf8,
+        ) -> u8,
+    >,
+    pub has_attribute:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, *mut u8) -> u8>,
+    pub get_node_type: Option<unsafe extern "C" fn(*mut c_void, *mut u16) -> u8>,
+    pub get_node_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub get_is_connected: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_text_content: Option<unsafe extern "C" fn(*mut c_void, *mut OptionalOwnedUtf8) -> u8>,
+    pub set_text_content:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
+    pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub drop: Option<DropCallback>,
+}
+
+/// A realm-owned bridge to Servo's timer scheduler.
+///
+/// # Safety
+///
+/// Implementations and `Drop` must stay on the owning script thread, must not
+/// unwind, re-enter V8, pump an event loop, or access the V8 sidecar `RefCell`.
+/// `host_context` is valid only during the synchronous call that supplies it.
+pub unsafe trait TimerHostBinding: Sized + 'static {
+    fn schedule_function(
+        &self,
+        host_context: *mut c_void,
+        callback_id: TimerCallbackId,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32>;
+
+    fn schedule_string(
+        &self,
+        host_context: *mut c_void,
+        source: &str,
+        timeout_ms: i32,
+        is_interval: bool,
+    ) -> Option<i32>;
+
+    fn clear(&self, handle: i32);
+}
+
+/// A console logging level pinned to the experimental C ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ConsoleLevel {
+    Debug = 0,
+    Error = 1,
+    Info = 2,
+    Log = 3,
+    Trace = 4,
+    Warn = 5,
+}
+
+/// A realm-owned sink for the supported V8 console logging operations.
+///
+/// # Safety
+///
+/// Implementations and `Drop` must remain on the owning script thread, must
+/// not unwind, re-enter V8, or pump an event loop. JavaScript values never
+/// cross this trait: C++ formats them first and supplies only valid UTF-8.
+pub unsafe trait ConsoleHostBinding: Sized + 'static {
+    fn write(&self, level: ConsoleLevel, message: &str);
+}
+
+#[repr(C)]
+struct TimerHostVTable {
+    schedule_function: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, TimerCallbackId, i32, u8, *mut i32) -> u8,
+    >,
+    schedule_string: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, i32, u8, *mut i32) -> u8,
+    >,
+    clear: Option<unsafe extern "C" fn(*mut c_void, i32)>,
+    drop: Option<DropCallback>,
+}
+
+unsafe extern "C" fn timer_host_schedule_function<T: TimerHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    callback_id: TimerCallbackId,
+    timeout_ms: i32,
+    is_interval: u8,
+    handle: *mut i32,
+) -> u8 {
+    if native.is_null() || handle.is_null() || is_interval > 1 {
+        return 0;
+    }
+    // SAFETY: The timer-host vtable contract supplies this exact live Box<T>.
+    let native = unsafe { &*native.cast::<T>() };
+    let Some(value) =
+        native.schedule_function(host_context, callback_id, timeout_ms, is_interval != 0)
+    else {
+        return 0;
+    };
+    // SAFETY: handle is non-null and points to caller-owned writable storage.
+    unsafe { *handle = value };
+    1
+}
+
+unsafe extern "C" fn timer_host_schedule_string<T: TimerHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    source: *const u8,
+    source_length: usize,
+    timeout_ms: i32,
+    is_interval: u8,
+    handle: *mut i32,
+) -> u8 {
+    if native.is_null()
+        || handle.is_null()
+        || is_interval > 1
+        || (source.is_null() && source_length != 0)
+    {
+        return 0;
+    }
+    let bytes = if source_length == 0 {
+        &[]
+    } else {
+        // SAFETY: C++ keeps this UTF-8 allocation live for the synchronous call.
+        unsafe { std::slice::from_raw_parts(source, source_length) }
+    };
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    // SAFETY: The timer-host vtable contract supplies this exact live Box<T>.
+    let native = unsafe { &*native.cast::<T>() };
+    let Some(value) = native.schedule_string(host_context, source, timeout_ms, is_interval != 0)
+    else {
+        return 0;
+    };
+    // SAFETY: handle is non-null and points to caller-owned writable storage.
+    unsafe { *handle = value };
+    1
+}
+
+unsafe extern "C" fn timer_host_clear<T: TimerHostBinding>(native: *mut c_void, handle: i32) {
+    if native.is_null() {
+        return;
+    }
+    // SAFETY: The timer-host vtable contract supplies this exact live Box<T>.
+    unsafe { &*native.cast::<T>() }.clear(handle);
+}
+
+unsafe extern "C" fn timer_host_drop<T: TimerHostBinding>(native: *mut c_void) {
+    // SAFETY: The bridge hands back exactly the Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+impl TimerHostVTable {
+    fn for_type<T: TimerHostBinding>() -> Self {
+        Self {
+            schedule_function: Some(timer_host_schedule_function::<T>),
+            schedule_string: Some(timer_host_schedule_string::<T>),
+            clear: Some(timer_host_clear::<T>),
+            drop: Some(timer_host_drop::<T>),
+        }
+    }
+}
+
+#[repr(C)]
+struct ConsoleHostVTable {
+    write: Option<unsafe extern "C" fn(*mut c_void, u32, *const u8, usize)>,
+    drop: Option<DropCallback>,
+}
+
+unsafe extern "C" fn console_host_write<T: ConsoleHostBinding>(
+    native: *mut c_void,
+    level: u32,
+    message: *const u8,
+    message_length: usize,
+) {
+    if native.is_null() || (message.is_null() && message_length != 0) {
+        return;
+    }
+    let level = match level {
+        0 => ConsoleLevel::Debug,
+        1 => ConsoleLevel::Error,
+        2 => ConsoleLevel::Info,
+        3 => ConsoleLevel::Log,
+        4 => ConsoleLevel::Trace,
+        5 => ConsoleLevel::Warn,
+        _ => return,
+    };
+    let bytes = if message_length == 0 {
+        &[]
+    } else {
+        // SAFETY: C++ keeps the message allocation live for this synchronous
+        // callback and supplies its exact byte length.
+        unsafe { std::slice::from_raw_parts(message, message_length) }
+    };
+    let Ok(message) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    // SAFETY: The console-host vtable contract supplies this exact live Box<T>.
+    unsafe { &*native.cast::<T>() }.write(level, message);
+}
+
+unsafe extern "C" fn console_host_drop<T: ConsoleHostBinding>(native: *mut c_void) {
+    // SAFETY: The bridge hands back exactly the Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+impl ConsoleHostVTable {
+    fn for_type<T: ConsoleHostBinding>() -> Self {
+        Self {
+            write: Some(console_host_write::<T>),
+            drop: Some(console_host_drop::<T>),
+        }
+    }
+}
+
+unsafe fn element_host_write_owned_utf8(output: *mut OwnedUtf8, value: String) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    let owner = Box::new(value.into_bytes());
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe {
+        *output = OwnedUtf8 {
+            data: owner.as_ptr(),
+            length: owner.len(),
+            owner: Box::into_raw(owner).cast::<c_void>(),
+            drop_owner: Some(document_host_owned_utf8_drop),
+        };
+    }
+    1
+}
+
+unsafe fn element_host_utf8<'a>(value: *const u8, value_length: usize) -> Option<&'a str> {
+    if value.is_null() && value_length != 0 {
+        return None;
+    }
+    let bytes = if value_length == 0 {
+        &[]
+    } else {
+        // SAFETY: The ABI lends this exact byte range for the synchronous call.
+        unsafe { std::slice::from_raw_parts(value, value_length) }
+    };
+    std::str::from_utf8(bytes).ok()
+}
+
+macro_rules! element_host_string_getter {
+    ($function:ident, $method:ident) => {
+        unsafe extern "C" fn $function<T: ElementHostBinding>(
+            native: *mut c_void,
+            output: *mut OwnedUtf8,
+        ) -> u8 {
+            if native.is_null() {
+                return 0;
+            }
+            // SAFETY: The vtable contract supplies this exact live Box<T>.
+            let value = unsafe { &*native.cast::<T>() }.$method();
+            // SAFETY: The C++ caller owns writable output storage.
+            unsafe { element_host_write_owned_utf8(output, value) }
+        }
+    };
+}
+
+element_host_string_getter!(element_host_get_local_name, local_name);
+element_host_string_getter!(element_host_get_tag_name, tag_name);
+element_host_string_getter!(element_host_get_id, id);
+element_host_string_getter!(element_host_get_class_name, class_name);
+element_host_string_getter!(element_host_get_node_name, node_name);
+
+unsafe fn element_host_write_optional_owned_utf8(
+    output: *mut OptionalOwnedUtf8,
+    value: Option<String>,
+) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    let mut owned = OwnedUtf8 {
+        data: std::ptr::null(),
+        length: 0,
+        owner: std::ptr::null_mut(),
+        drop_owner: None,
+    };
+    let is_null = value.is_none();
+    if let Some(value) = value {
+        // SAFETY: `owned` is caller-owned writable storage in this frame.
+        if unsafe { element_host_write_owned_utf8(&mut owned, value) } == 0 {
+            return 0;
+        }
+    }
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe {
+        *output = OptionalOwnedUtf8 {
+            is_null: is_null as u8,
+            value: owned,
+        }
+    };
+    1
+}
+
+unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    // SAFETY: The live context is borrowed only for this synchronous call.
+    unsafe { (&*native.cast::<T>()).set_id(host_context, value) as u8 }
+}
+
+unsafe extern "C" fn element_host_set_class_name<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    // SAFETY: The live context is borrowed only for this synchronous call.
+    unsafe { (&*native.cast::<T>()).set_class_name(host_context, value) as u8 }
+}
+
+unsafe extern "C" fn element_host_has_attributes<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).has_attributes() as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_attribute<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+    output: *mut OptionalOwnedUtf8,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(name) = (unsafe { element_host_utf8(name, name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).get_attribute(host_context, name) };
+    let Ok(value) = result else {
+        return 0;
+    };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_optional_owned_utf8(output, value) }
+}
+
+unsafe extern "C" fn element_host_has_attribute<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(name) = (unsafe { element_host_utf8(name, name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).has_attribute(host_context, name) };
+    let Some(value) = result else {
+        return 0;
+    };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = value as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_node_type<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u16,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).node_type() };
+    1
+}
+
+unsafe extern "C" fn element_host_get_is_connected<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).is_connected() as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_text_content<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut OptionalOwnedUtf8,
+) -> u8 {
+    if native.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let value = unsafe { (&*native.cast::<T>()).text_content() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_optional_owned_utf8(output, value) }
+}
+
+unsafe extern "C" fn element_host_set_text_content<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    is_null: u8,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || is_null > 1 {
+        return 0;
+    }
+    let value = if is_null != 0 {
+        if !value.is_null() || value_length != 0 {
+            return 0;
+        }
+        None
+    } else {
+        // SAFETY: The ABI lends this byte range for the synchronous call.
+        let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+            return 0;
+        };
+        Some(value)
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    unsafe { (&*native.cast::<T>()).set_text_content(host_context, value) as u8 }
+}
+
+unsafe extern "C" fn element_host_has_child_nodes<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).has_child_nodes() as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_drop<T: ElementHostBinding>(native: *mut c_void) {
+    if native.is_null() {
+        return;
+    }
+    // SAFETY: The bridge hands back exactly the Box<T> it was given, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
 
 include!(concat!(env!("OUT_DIR"), "/servo_v8_generated.rs"));
 include!(concat!(
@@ -190,6 +771,19 @@ unsafe extern "C" {
         script_id: ScriptId,
         error: *mut ErrorBuffer,
     ) -> i32;
+    fn servo_v8_runtime_perform_microtask_checkpoint(
+        runtime: *mut RawRuntime,
+        host_context: *mut c_void,
+        outcome: *mut RawScriptRunOutcome,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_runtime_take_pending_job_error(
+        runtime: *mut RawRuntime,
+        realm_id: *mut RealmId,
+        exception: *mut RawScriptException,
+        has_error: *mut u8,
+        error: *mut ErrorBuffer,
+    ) -> i32;
     fn servo_v8_realm_install_document_host(
         runtime: *mut RawRuntime,
         realm_id: RealmId,
@@ -197,10 +791,43 @@ unsafe extern "C" {
         vtable: *const DocumentHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
+    fn servo_v8_realm_install_timer_host(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        native: *mut c_void,
+        vtable: *const TimerHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_realm_install_console_host(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        native: *mut c_void,
+        vtable: *const ConsoleHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_realm_timer_callback_run(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+        host_context: *mut c_void,
+        outcome: *mut RawScriptRunOutcome,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_realm_timer_callback_clear(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+        error: *mut ErrorBuffer,
+    ) -> i32;
     fn servo_v8_realm_document_hidden(
         runtime: *mut RawRuntime,
         realm_id: RealmId,
         result: *mut u8,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_install_element_host(
+        runtime: *mut RawRuntime,
+        vtable: *const ElementHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_install_engine_binding_smoke(
@@ -235,6 +862,13 @@ unsafe extern "C" {
     fn servo_v8_terminate_execution(runtime: *mut RawRuntime);
     #[cfg(test)]
     fn servo_v8_collect_garbage_for_testing(runtime: *mut RawRuntime);
+    #[cfg(test)]
+    fn servo_v8_realm_wrapper_cache_size_for_testing(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        result: *mut usize,
+        error: *mut ErrorBuffer,
+    ) -> i32;
     fn servo_v8_dom_cell_native(cell: *mut DomCell, expected_interface_id: u32) -> *mut c_void;
     fn servo_v8_trace_dom_cell(
         visitor: *mut TraceVisitor,
@@ -555,6 +1189,167 @@ impl Runtime {
         }
     }
 
+    /// Drains the isolate's explicit microtask queue with one ephemeral host
+    /// context installed on every live realm.
+    ///
+    /// The queue is isolate-wide because V8 requires contexts that can access
+    /// each other synchronously to share one queue, and same-origin Servo
+    /// pipelines on one script thread do exactly that.
+    ///
+    /// Only termination is reported through the return value. A job that
+    /// throws is buffered, because one drain can produce many errors; collect
+    /// them with [`Runtime::take_pending_job_errors`]. An unhandled promise
+    /// rejection is still silent and needs the promise-rejection callback.
+    ///
+    /// # Safety
+    ///
+    /// `host_context` must remain valid for every synchronous native callback
+    /// made during the drain. The bridge clears it from every realm before
+    /// returning and no generated binding may retain it.
+    pub unsafe fn perform_microtask_checkpoint_with_host_context(
+        &mut self,
+        host_context: *mut c_void,
+    ) -> Result<ScriptRunOutcome, Error> {
+        let mut error_storage = [0; ERROR_CAPACITY];
+        let mut message_storage = [0; ERROR_CAPACITY];
+        let mut resource_storage = [0; ERROR_CAPACITY];
+        let mut stack_storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut error_storage);
+        let mut outcome = RawScriptRunOutcome {
+            status: SCRIPT_RUN_COMPLETED,
+            exception: RawScriptException {
+                message: error_buffer(&mut message_storage),
+                resource_name: error_buffer(&mut resource_storage),
+                stack: error_buffer(&mut stack_storage),
+                line_number: 0,
+                column_number: 0,
+            },
+        };
+        // SAFETY: The runtime is live and the error buffer remains valid for
+        // the duration of the call. Every outcome buffer has independent live
+        // backing storage.
+        let succeeded = unsafe {
+            servo_v8_runtime_perform_microtask_checkpoint(
+                self.raw.as_ptr(),
+                host_context,
+                &mut outcome,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            return Err(error_from(&error_storage, &error));
+        }
+        match outcome.status {
+            SCRIPT_RUN_COMPLETED => Ok(ScriptRunOutcome::Completed),
+            SCRIPT_RUN_THROWN => Ok(ScriptRunOutcome::Thrown(ScriptException {
+                message: text_from(&message_storage, &outcome.exception.message),
+                resource_name: text_from(&resource_storage, &outcome.exception.resource_name),
+                stack: text_from(&stack_storage, &outcome.exception.stack),
+                line_number: outcome.exception.line_number,
+                column_number: outcome.exception.column_number,
+            })),
+            SCRIPT_RUN_TERMINATED => Ok(ScriptRunOutcome::Terminated),
+            status => Err(Error(format!(
+                "V8 returned unknown microtask checkpoint status {status}"
+            ))),
+        }
+    }
+
+    /// Drains the isolate's explicit microtask queue with no host context, so
+    /// jobs that call an embedding host fail deterministically.
+    pub fn perform_microtask_checkpoint(&mut self) -> Result<ScriptRunOutcome, Error> {
+        // SAFETY: A null context disables host callbacks that require an
+        // embedding-engine context.
+        unsafe { self.perform_microtask_checkpoint_with_host_context(std::ptr::null_mut()) }
+    }
+
+    /// Collects every uncaught error thrown by a microtask job, oldest first.
+    ///
+    /// V8 catches a throwing job inside its own microtask builtin, reports the
+    /// message, and lets execution continue, so these never reach a `TryCatch`
+    /// at the checkpoint boundary and must be pulled instead.
+    pub fn take_pending_job_errors(&mut self) -> Result<Vec<JobError>, Error> {
+        let mut errors = Vec::new();
+        loop {
+            let mut error_storage = [0; ERROR_CAPACITY];
+            let mut message_storage = [0; ERROR_CAPACITY];
+            let mut resource_storage = [0; ERROR_CAPACITY];
+            let mut stack_storage = [0; ERROR_CAPACITY];
+            let mut error = error_buffer(&mut error_storage);
+            let mut exception = RawScriptException {
+                message: error_buffer(&mut message_storage),
+                resource_name: error_buffer(&mut resource_storage),
+                stack: error_buffer(&mut stack_storage),
+                line_number: 0,
+                column_number: 0,
+            };
+            let mut has_error = 0u8;
+            let mut realm_id = RealmId(0);
+            // SAFETY: The runtime is live and every output buffer has
+            // independent live backing storage for the duration of the call.
+            let succeeded = unsafe {
+                servo_v8_runtime_take_pending_job_error(
+                    self.raw.as_ptr(),
+                    &mut realm_id,
+                    &mut exception,
+                    &mut has_error,
+                    &mut error,
+                )
+            };
+            if succeeded == 0 {
+                return Err(error_from(&error_storage, &error));
+            }
+            if has_error == 0 {
+                return Ok(errors);
+            }
+            errors.push(JobError {
+                realm_id: (realm_id != RealmId(0)).then_some(realm_id),
+                exception: ScriptException {
+                    message: text_from(&message_storage, &exception.message),
+                    resource_name: text_from(&resource_storage, &exception.resource_name),
+                    stack: text_from(&stack_storage, &exception.stack),
+                    line_number: exception.line_number,
+                    column_number: exception.column_number,
+                },
+            });
+        }
+    }
+
+    /// Registers how the bridge talks to an `Element` host, once per runtime.
+    ///
+    /// The vtable is type-level; the hosts it describes are per DOM object and
+    /// are handed over one at a time by an interface-typed getter.
+    pub fn install_element_host<T: ElementHostBinding>(&mut self) -> Result<(), Error> {
+        let vtable = ElementHostVTable {
+            get_local_name: Some(element_host_get_local_name::<T>),
+            get_tag_name: Some(element_host_get_tag_name::<T>),
+            get_id: Some(element_host_get_id::<T>),
+            set_id: Some(element_host_set_id::<T>),
+            get_class_name: Some(element_host_get_class_name::<T>),
+            set_class_name: Some(element_host_set_class_name::<T>),
+            has_attributes: Some(element_host_has_attributes::<T>),
+            get_attribute: Some(element_host_get_attribute::<T>),
+            has_attribute: Some(element_host_has_attribute::<T>),
+            get_node_type: Some(element_host_get_node_type::<T>),
+            get_node_name: Some(element_host_get_node_name::<T>),
+            get_is_connected: Some(element_host_get_is_connected::<T>),
+            get_text_content: Some(element_host_get_text_content::<T>),
+            set_text_content: Some(element_host_set_text_content::<T>),
+            has_child_nodes: Some(element_host_has_child_nodes::<T>),
+            drop: Some(element_host_drop::<T>),
+        };
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The runtime is live and both the vtable and error buffer
+        // remain valid for the duration of the call.
+        let succeeded =
+            unsafe { servo_v8_install_element_host(self.raw.as_ptr(), &vtable, &mut error) };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
     /// Discards a retained classic script without executing it.
     pub fn discard_script_in_realm(
         &mut self,
@@ -574,8 +1369,8 @@ impl Runtime {
         Ok(())
     }
 
-    /// Installs a realm-owned host for Servo's production `Document.hidden`
-    /// binding. After successful installation, the native host is destroyed
+    /// Installs a realm-owned host for the selected production `Document`
+    /// bindings. After successful installation, the native host is destroyed
     /// synchronously when its realm or runtime is destroyed. Failed
     /// installation leaves ownership in Rust and drops the host here.
     pub fn install_document_host<T: DocumentHostBinding>(
@@ -602,6 +1397,161 @@ impl Runtime {
             // SAFETY: C++ leaves native untouched on every failure path, so it
             // is still the exact Box<T> allocated above.
             drop(unsafe { Box::from_raw(native.cast::<T>()) });
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
+    /// Installs one realm-owned host that connects V8 timer operations to the
+    /// embedder's scheduler. Failed installation leaves ownership in Rust.
+    pub fn install_timer_host<T: TimerHostBinding>(
+        &mut self,
+        realm_id: RealmId,
+        host: T,
+    ) -> Result<(), Error> {
+        let vtable = TimerHostVTable::for_type::<T>();
+        let native = Box::into_raw(Box::new(host)).cast();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: native is one live Box<T>; C++ consumes it only on success.
+        let succeeded = unsafe {
+            servo_v8_realm_install_timer_host(
+                self.raw.as_ptr(),
+                realm_id,
+                native,
+                &vtable,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            // SAFETY: Every C++ failure path leaves native untouched.
+            drop(unsafe { Box::from_raw(native.cast::<T>()) });
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
+    /// Installs one realm-owned sink for the supported console namespace
+    /// logging operations. Failed installation leaves ownership in Rust.
+    pub fn install_console_host<T: ConsoleHostBinding>(
+        &mut self,
+        realm_id: RealmId,
+        host: T,
+    ) -> Result<(), Error> {
+        let vtable = ConsoleHostVTable::for_type::<T>();
+        let native = Box::into_raw(Box::new(host)).cast();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: native is one live Box<T>; C++ consumes it only on success.
+        let succeeded = unsafe {
+            servo_v8_realm_install_console_host(
+                self.raw.as_ptr(),
+                realm_id,
+                native,
+                &vtable,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            // SAFETY: Every C++ failure path leaves native untouched.
+            drop(unsafe { Box::from_raw(native.cast::<T>()) });
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
+    /// Invokes a retained timer function with no embedding host context.
+    pub fn run_timer_callback_in_realm(
+        &mut self,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+    ) -> Result<ScriptRunOutcome, Error> {
+        // SAFETY: A null context disables embedding callbacks that need one.
+        unsafe {
+            self.run_timer_callback_in_realm_with_host_context(
+                realm_id,
+                callback_id,
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// Invokes a retained timer function with one ephemeral host context.
+    ///
+    /// # Safety
+    ///
+    /// `host_context` must remain valid for every synchronous native callback
+    /// made during this invocation and may not be retained by a host.
+    pub unsafe fn run_timer_callback_in_realm_with_host_context(
+        &mut self,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+        host_context: *mut c_void,
+    ) -> Result<ScriptRunOutcome, Error> {
+        let mut error_storage = [0; ERROR_CAPACITY];
+        let mut message_storage = [0; ERROR_CAPACITY];
+        let mut resource_storage = [0; ERROR_CAPACITY];
+        let mut stack_storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut error_storage);
+        let mut outcome = RawScriptRunOutcome {
+            status: SCRIPT_RUN_COMPLETED,
+            exception: RawScriptException {
+                message: error_buffer(&mut message_storage),
+                resource_name: error_buffer(&mut resource_storage),
+                stack: error_buffer(&mut stack_storage),
+                line_number: 0,
+                column_number: 0,
+            },
+        };
+        // SAFETY: The runtime and every independent output buffer stay live.
+        let succeeded = unsafe {
+            servo_v8_realm_timer_callback_run(
+                self.raw.as_ptr(),
+                realm_id,
+                callback_id,
+                host_context,
+                &mut outcome,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            return Err(error_from(&error_storage, &error));
+        }
+        match outcome.status {
+            SCRIPT_RUN_COMPLETED => Ok(ScriptRunOutcome::Completed),
+            SCRIPT_RUN_THROWN => Ok(ScriptRunOutcome::Thrown(ScriptException {
+                message: text_from(&message_storage, &outcome.exception.message),
+                resource_name: text_from(&resource_storage, &outcome.exception.resource_name),
+                stack: text_from(&stack_storage, &outcome.exception.stack),
+                line_number: outcome.exception.line_number,
+                column_number: outcome.exception.column_number,
+            })),
+            SCRIPT_RUN_TERMINATED => Ok(ScriptRunOutcome::Terminated),
+            status => Err(Error(format!(
+                "V8 returned unknown timer callback run status {status}"
+            ))),
+        }
+    }
+
+    /// Releases one retained timer function without invoking it. Clearing an
+    /// already-fired or already-cleared callback is a successful no-op.
+    pub fn clear_timer_callback_in_realm(
+        &mut self,
+        realm_id: RealmId,
+        callback_id: TimerCallbackId,
+    ) -> Result<(), Error> {
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The runtime is live and the error buffer remains valid.
+        let succeeded = unsafe {
+            servo_v8_realm_timer_callback_clear(
+                self.raw.as_ptr(),
+                realm_id,
+                callback_id,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
             return Err(error_from(&storage, &error));
         }
         Ok(())
@@ -734,6 +1684,27 @@ impl Runtime {
         // thread confinement keeps the request on the isolate owner thread.
         unsafe { servo_v8_collect_garbage_for_testing(self.raw.as_ptr()) }
     }
+
+    #[cfg(test)]
+    fn wrapper_cache_size_for_testing(&mut self, realm_id: RealmId) -> Result<usize, Error> {
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        let mut result = 0;
+        // SAFETY: The result and error storage remain writable for the call;
+        // Runtime's thread confinement keeps inspection on the owner thread.
+        let succeeded = unsafe {
+            servo_v8_realm_wrapper_cache_size_for_testing(
+                self.raw.as_ptr(),
+                realm_id,
+                &mut result,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(result)
+    }
 }
 
 impl Drop for Runtime {
@@ -777,6 +1748,59 @@ mod tests {
     use super::*;
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
+        static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    struct CallbackReentryConfig;
+
+    impl CallbackReentryConfig {
+        fn new(runtime: *mut RawRuntime) -> Self {
+            CALLBACK_REENTRY_RUNTIME.with(|slot| {
+                assert!(slot.replace(runtime).is_null());
+            });
+            CALLBACK_REENTRY_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+            Self
+        }
+    }
+
+    impl Drop for CallbackReentryConfig {
+        fn drop(&mut self) {
+            CALLBACK_REENTRY_RUNTIME.with(|slot| slot.set(std::ptr::null_mut()));
+        }
+    }
+
+    fn attempt_callback_reentry(phase: &'static str) {
+        CALLBACK_REENTRY_RUNTIME.with(|runtime| {
+            let runtime = runtime.get();
+            if runtime.is_null() {
+                return;
+            }
+            let source = b"true";
+            let mut storage = [0; ERROR_CAPACITY];
+            let mut error = error_buffer(&mut storage);
+            let mut result = 0;
+            // SAFETY: Each test callback receives a still-live runtime. The
+            // C++ callback scope must reject this nested entry before V8 is
+            // touched, including while cppgc is tracing or sweeping.
+            let succeeded = unsafe {
+                servo_v8_eval_bool(
+                    runtime,
+                    source.as_ptr(),
+                    source.len(),
+                    &mut result,
+                    &mut error,
+                )
+            };
+            CALLBACK_REENTRY_ATTEMPTS.with(|attempts| {
+                attempts
+                    .borrow_mut()
+                    .push((phase, succeeded, text_from(&storage, &error)));
+            });
+        });
+    }
 
     fn compiled(result: Result<ScriptCompileOutcome, Error>) -> ScriptId {
         match result.unwrap() {
@@ -792,13 +1816,384 @@ mod tests {
         child: Cell<Option<EngineBindingSmokeHandle>>,
     }
 
+    struct CallbackReentrySmoke {
+        value: i32,
+    }
+
+    impl Drop for CallbackReentrySmoke {
+        fn drop(&mut self) {
+            attempt_callback_reentry("drop");
+        }
+    }
+
+    // SAFETY: Every attempted nested runtime entry is expected to be rejected
+    // by the surrounding C++ callback scope. The callbacks do not unwind, and
+    // this probe stores no outgoing cppgc edges.
+    unsafe impl EngineBindingSmokeBinding for CallbackReentrySmoke {
+        fn constructor(value: i32) -> Option<Self> {
+            attempt_callback_reentry("constructor");
+            Some(Self { value })
+        }
+
+        fn value(&self) -> i32 {
+            attempt_callback_reentry("getter");
+            self.value
+        }
+
+        fn set_value(&mut self, value: i32) {
+            attempt_callback_reentry("setter");
+            self.value = value;
+        }
+
+        fn add(&self, rhs: i32) -> i32 {
+            attempt_callback_reentry("method");
+            self.value.wrapping_add(rhs)
+        }
+
+        fn set_child(&self, _child: EngineBindingSmokeHandle) -> i32 {
+            self.value
+        }
+
+        fn child_value(&self) -> i32 {
+            self.value
+        }
+
+        unsafe fn trace(&self, _visitor: *mut TraceVisitor) {
+            attempt_callback_reentry("trace");
+        }
+    }
+
+    #[derive(Default)]
+    struct ElementProbeState {
+        attributes: RefCell<Vec<(String, String)>>,
+        text_content: RefCell<Option<String>>,
+        has_child_nodes: Cell<bool>,
+        is_connected: Cell<bool>,
+    }
+
+    impl ElementProbeState {
+        fn with_attributes(attributes: &[(&str, &str)]) -> Rc<Self> {
+            Self::with_node(attributes, "", false)
+        }
+
+        fn with_node(
+            attributes: &[(&str, &str)],
+            text_content: &str,
+            has_child_nodes: bool,
+        ) -> Rc<Self> {
+            Rc::new(Self {
+                attributes: RefCell::new(
+                    attributes
+                        .iter()
+                        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                        .collect(),
+                ),
+                text_content: RefCell::new(Some(text_content.to_owned())),
+                has_child_nodes: Cell::new(has_child_nodes),
+                is_connected: Cell::new(true),
+            })
+        }
+
+        fn get(&self, name: &str) -> Option<String> {
+            let name = name.to_ascii_lowercase();
+            self.attributes
+                .borrow()
+                .iter()
+                .find(|(attribute, _)| attribute == &name)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set(&self, name: &str, value: &str) {
+            if let Some((_, current)) = self
+                .attributes
+                .borrow_mut()
+                .iter_mut()
+                .find(|(attribute, _)| attribute == name)
+            {
+                *current = value.to_owned();
+                return;
+            }
+            self.attributes
+                .borrow_mut()
+                .push((name.to_owned(), value.to_owned()));
+        }
+    }
+
+    /// A stand-in for one Servo Element.
+    struct ElementHostProbe {
+        local_name: String,
+        tag_name: String,
+        state: Rc<ElementProbeState>,
+        drops: Rc<Cell<usize>>,
+        drop_reentry: Option<ElementDropReentryProbe>,
+    }
+
+    #[derive(Clone)]
+    struct ElementDropReentryProbe {
+        runtime: *mut RawRuntime,
+        realm: RealmId,
+        attempts: Rc<RefCell<Vec<(i32, String)>>>,
+    }
+
+    impl Drop for ElementHostProbe {
+        fn drop(&mut self) {
+            if let Some(probe) = &self.drop_reentry {
+                let source = b"true";
+                let mut storage = [0; ERROR_CAPACITY];
+                let mut error = error_buffer(&mut storage);
+                let mut result = 0;
+                // SAFETY: This deliberately hostile test-only Drop attempts
+                // to enter its still-live runtime. The C++ callback-depth
+                // guard must reject it before touching the isolate.
+                let succeeded = unsafe {
+                    servo_v8_realm_eval_bool(
+                        probe.runtime,
+                        probe.realm,
+                        source.as_ptr(),
+                        source.len(),
+                        &mut result,
+                        &mut error,
+                    )
+                };
+                probe
+                    .attempts
+                    .borrow_mut()
+                    .push((succeeded, text_from(&storage, &error)));
+            }
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    // SAFETY: The probe stays on its Runtime's thread and cannot unwind. Its
+    // optional test-only Drop probe is rejected by the bridge before it can
+    // actually re-enter V8.
+    unsafe impl ElementHostBinding for ElementHostProbe {
+        fn local_name(&self) -> String {
+            self.local_name.clone()
+        }
+
+        fn tag_name(&self) -> String {
+            self.tag_name.clone()
+        }
+
+        fn id(&self) -> String {
+            self.state.get("id").unwrap_or_default()
+        }
+
+        unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            self.state.set("id", value);
+            true
+        }
+
+        fn class_name(&self) -> String {
+            self.state.get("class").unwrap_or_default()
+        }
+
+        unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            self.state.set("class", value);
+            true
+        }
+
+        fn has_attributes(&self) -> bool {
+            !self.state.attributes.borrow().is_empty()
+        }
+
+        unsafe fn get_attribute(
+            &self,
+            host_context: *mut c_void,
+            name: &str,
+        ) -> Result<Option<String>, ()> {
+            assert!(!host_context.is_null());
+            Ok(self.state.get(name))
+        }
+
+        unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool> {
+            assert!(!host_context.is_null());
+            Some(self.state.get(name).is_some())
+        }
+
+        fn node_type(&self) -> u16 {
+            1
+        }
+
+        fn node_name(&self) -> String {
+            self.tag_name.clone()
+        }
+
+        fn is_connected(&self) -> bool {
+            self.state.is_connected.get()
+        }
+
+        fn text_content(&self) -> Option<String> {
+            self.state.text_content.borrow().clone()
+        }
+
+        unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool {
+            assert!(!host_context.is_null());
+            let value = value.unwrap_or_default();
+            *self.state.text_content.borrow_mut() = Some(value.to_owned());
+            self.state.has_child_nodes.set(!value.is_empty());
+            true
+        }
+
+        fn has_child_nodes(&self) -> bool {
+            self.state.has_child_nodes.get()
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ScheduledTimerFunction {
+        callback_id: TimerCallbackId,
+        timeout_ms: i32,
+        is_interval: bool,
+        host_context: usize,
+        handle: i32,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ScheduledTimerString {
+        source: String,
+        timeout_ms: i32,
+        is_interval: bool,
+        host_context: usize,
+        handle: i32,
+    }
+
+    struct TimerHostProbe {
+        functions: Rc<RefCell<Vec<ScheduledTimerFunction>>>,
+        strings: Rc<RefCell<Vec<ScheduledTimerString>>>,
+        clears: Rc<RefCell<Vec<i32>>>,
+        drops: Rc<Cell<usize>>,
+        next_handle: Cell<i32>,
+    }
+
+    impl TimerHostProbe {
+        fn new(
+            functions: Rc<RefCell<Vec<ScheduledTimerFunction>>>,
+            strings: Rc<RefCell<Vec<ScheduledTimerString>>>,
+            clears: Rc<RefCell<Vec<i32>>>,
+            drops: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                functions,
+                strings,
+                clears,
+                drops,
+                next_handle: Cell::new(1),
+            }
+        }
+
+        fn allocate_handle(&self) -> i32 {
+            let handle = self.next_handle.get();
+            self.next_handle.set(handle + 1);
+            handle
+        }
+    }
+
+    impl Drop for TimerHostProbe {
+        fn drop(&mut self) {
+            attempt_callback_reentry("timer host drop");
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    // SAFETY: The probe is thread-confined, only records POD/string copies,
+    // cannot unwind, and never re-enters V8 or retains host_context.
+    unsafe impl TimerHostBinding for TimerHostProbe {
+        fn schedule_function(
+            &self,
+            host_context: *mut c_void,
+            callback_id: TimerCallbackId,
+            timeout_ms: i32,
+            is_interval: bool,
+        ) -> Option<i32> {
+            attempt_callback_reentry("timer schedule function");
+            let handle = self.allocate_handle();
+            self.functions.borrow_mut().push(ScheduledTimerFunction {
+                callback_id,
+                timeout_ms,
+                is_interval,
+                host_context: host_context as usize,
+                handle,
+            });
+            Some(handle)
+        }
+
+        fn schedule_string(
+            &self,
+            host_context: *mut c_void,
+            source: &str,
+            timeout_ms: i32,
+            is_interval: bool,
+        ) -> Option<i32> {
+            attempt_callback_reentry("timer schedule string");
+            let handle = self.allocate_handle();
+            self.strings.borrow_mut().push(ScheduledTimerString {
+                source: source.to_owned(),
+                timeout_ms,
+                is_interval,
+                host_context: host_context as usize,
+                handle,
+            });
+            Some(handle)
+        }
+
+        fn clear(&self, handle: i32) {
+            attempt_callback_reentry("timer clear");
+            self.clears.borrow_mut().push(handle);
+        }
+    }
+
+    struct ConsoleHostProbe {
+        messages: Rc<RefCell<Vec<(ConsoleLevel, String)>>>,
+        drops: Rc<Cell<usize>>,
+        attempt_reentry: bool,
+    }
+
+    impl Drop for ConsoleHostProbe {
+        fn drop(&mut self) {
+            if self.attempt_reentry {
+                attempt_callback_reentry("console host drop");
+            }
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    // SAFETY: The probe is owner-thread confined, copies only POD and UTF-8,
+    // and its deliberately hostile re-entry attempts must be rejected by the
+    // surrounding C++ RustCallbackScope.
+    unsafe impl ConsoleHostBinding for ConsoleHostProbe {
+        fn write(&self, level: ConsoleLevel, message: &str) {
+            if self.attempt_reentry {
+                attempt_callback_reentry("console write");
+            }
+            self.messages.borrow_mut().push((level, message.to_owned()));
+        }
+    }
+
     struct DocumentHostProbe {
         hidden: Rc<Cell<bool>>,
         bg_color: Rc<RefCell<String>>,
+        title: Rc<RefCell<String>>,
         getter_calls: Rc<Cell<usize>>,
         bg_color_getter_calls: Rc<Cell<usize>>,
         bg_color_setter_calls: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
+        /// Stands in for the address of a Servo Element the host would root.
+        /// Stable for this probe's lifetime, which is what identity needs.
+        element_identity: Box<u8>,
+        head_identity: Box<u8>,
+        id_element_identity: Box<u8>,
+        element_state: Rc<ElementProbeState>,
+        head_state: Rc<ElementProbeState>,
+        id_element_state: Rc<ElementProbeState>,
+        document_element_present: bool,
+        head_present: bool,
+        get_element_by_id_calls: Rc<RefCell<Vec<String>>>,
+        element_drops: Rc<Cell<usize>>,
+        element_drop_reentry: Option<ElementDropReentryProbe>,
     }
 
     impl DocumentHostProbe {
@@ -810,10 +2205,30 @@ mod tests {
             Self {
                 hidden,
                 bg_color: Rc::new(RefCell::new("red".to_owned())),
+                title: Rc::new(RefCell::new("probe title".to_owned())),
                 getter_calls,
                 bg_color_getter_calls: Rc::new(Cell::new(0)),
                 bg_color_setter_calls: Rc::new(Cell::new(0)),
                 drops,
+                element_identity: Box::new(0),
+                head_identity: Box::new(0),
+                id_element_identity: Box::new(0),
+                element_state: ElementProbeState::with_attributes(&[]),
+                head_state: ElementProbeState::with_attributes(&[]),
+                id_element_state: ElementProbeState::with_node(
+                    &[
+                        ("id", "target"),
+                        ("class", "alpha beta"),
+                        ("data-proof", "present"),
+                    ],
+                    "probe text",
+                    true,
+                ),
+                document_element_present: true,
+                head_present: true,
+                get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
+                element_drops: Rc::new(Cell::new(0)),
+                element_drop_reentry: None,
             }
         }
     }
@@ -838,11 +2253,146 @@ mod tests {
             self.bg_color.borrow().clone()
         }
 
+        fn url(&self) -> String {
+            // A lone surrogate cannot survive a Rust String, so the USVString
+            // guarantee is met by construction rather than by conversion.
+            "https://example.com/probe?q=\u{2713}".to_owned()
+        }
+
+        fn document_uri(&self) -> String {
+            "https://example.com/probe?q=\u{2713}".to_owned()
+        }
+
+        fn compat_mode(&self) -> String {
+            "CSS1Compat".to_owned()
+        }
+
+        fn character_set(&self) -> String {
+            "UTF-8".to_owned()
+        }
+
+        fn charset(&self) -> String {
+            "UTF-8".to_owned()
+        }
+
+        fn input_encoding(&self) -> String {
+            "UTF-8".to_owned()
+        }
+
+        fn content_type(&self) -> String {
+            "text/html".to_owned()
+        }
+
+        fn referrer(&self) -> String {
+            String::new()
+        }
+
+        fn last_modified(&self) -> String {
+            "01/02/2026 03:04:05".to_owned()
+        }
+
+        fn visibility_state(&self) -> String {
+            // Mirrors Servo's enum-to-string, which is what crosses the ABI.
+            if self.hidden.get() {
+                "hidden"
+            } else {
+                "visible"
+            }
+            .to_owned()
+        }
+
+        fn ready_state(&self) -> String {
+            "complete".to_owned()
+        }
+
+        fn title(&self) -> String {
+            self.title.borrow().clone()
+        }
+
+        fn node_type(&self) -> u16 {
+            // Node.DOCUMENT_NODE.
+            9
+        }
+
+        fn document_element(&self) -> Option<InterfaceHandle> {
+            if !self.document_element_present {
+                return None;
+            }
+            // SAFETY: `element_identity` lives as long as this host, which is
+            // what the probe stands in for -- a real host roots its element.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    (&*self.element_identity as *const u8).cast::<c_void>(),
+                    ElementHostProbe {
+                        local_name: "html".to_owned(),
+                        tag_name: "HTML".to_owned(),
+                        state: Rc::clone(&self.element_state),
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        fn head(&self) -> Option<InterfaceHandle> {
+            if !self.head_present {
+                return None;
+            }
+            // SAFETY: `head_identity` stands in for a distinct, rooted
+            // HTMLHeadElement whose inherited Element facade reports HEAD.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    (&*self.head_identity as *const u8).cast::<c_void>(),
+                    ElementHostProbe {
+                        local_name: "head".to_owned(),
+                        tag_name: "HEAD".to_owned(),
+                        state: Rc::clone(&self.head_state),
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        unsafe fn get_element_by_id(
+            &self,
+            host_context: *mut c_void,
+            element_id: &str,
+        ) -> Option<InterfaceHandle> {
+            assert!(!host_context.is_null());
+            self.get_element_by_id_calls
+                .borrow_mut()
+                .push(element_id.to_owned());
+            if element_id != "target" {
+                return None;
+            }
+            // SAFETY: `id_element_identity` stands in for the rooted Element
+            // returned for the probe's one known id.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    (&*self.id_element_identity as *const u8).cast::<c_void>(),
+                    ElementHostProbe {
+                        local_name: "div".to_owned(),
+                        tag_name: "DIV".to_owned(),
+                        state: Rc::clone(&self.id_element_state),
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
         unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
             assert!(!host_context.is_null());
             self.bg_color_setter_calls
                 .set(self.bg_color_setter_calls.get() + 1);
             *self.bg_color.borrow_mut() = value.to_owned();
+            true
+        }
+
+        unsafe fn set_title(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            *self.title.borrow_mut() = value.to_owned();
             true
         }
     }
@@ -931,6 +2481,7 @@ mod tests {
                 .eval_bool("!Object.hasOwn(globalThis, 'shadowCompileMustNotExecute')")
                 .unwrap()
         );
+
         assert!(
             runtime
                 .compile("function syntax error {", "invalid.js", 7)
@@ -1000,6 +2551,47 @@ mod tests {
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
         drop(runtime);
         assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn generated_callbacks_reject_runtime_reentry_including_during_gc() {
+        let options = Options {
+            expose_gc: 1,
+            ..Options::default()
+        };
+        let mut runtime = Runtime::new(options).unwrap();
+        runtime
+            .install_engine_binding_smoke::<CallbackReentrySmoke>()
+            .unwrap();
+        let _reentry_config = CallbackReentryConfig::new(runtime.raw.as_ptr());
+
+        assert!(
+            runtime
+                .eval_bool(
+                    "globalThis.reentrySmoke = new EngineBindingSmoke(4); \
+                     reentrySmoke.value = 9; \
+                     reentrySmoke.value === 9 && reentrySmoke.add(1) === 10"
+                )
+                .unwrap()
+        );
+        // The live wrapper makes cppgc invoke the Rust trace callback.
+        runtime.collect_garbage_for_testing();
+        assert!(runtime.eval_bool("delete globalThis.reentrySmoke").unwrap());
+        // With no JS root, sweeping invokes the Rust destructor.
+        runtime.collect_garbage_for_testing();
+
+        let attempts = CALLBACK_REENTRY_ATTEMPTS.with(|attempts| attempts.borrow().clone());
+        for expected_phase in ["constructor", "getter", "setter", "method", "trace", "drop"] {
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == expected_phase),
+                "missing hostile {expected_phase} callback: {attempts:?}"
+            );
+        }
+        assert!(attempts.iter().all(|(_, status, error)| {
+            *status == 0 && error.contains("re-entered from a Rust host callback")
+        }));
     }
 
     #[test]
@@ -1138,7 +2730,162 @@ mod tests {
                 .unwrap()
         );
 
+        // The explicit checkpoint is what Servo calls at the HTML task
+        // boundary, so it must drain a retained script's jobs without any
+        // diagnostic eval running first.
+        let explicit = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.explicitMicrotaskRan = false; \
+                 Promise.resolve().then(() => explicitMicrotaskRan = true);",
+            "explicit-microtask.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, explicit).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "explicitMicrotaskRan")
+                .unwrap()
+        );
+        // Draining an empty queue is not an error, so Servo may checkpoint at
+        // every task boundary without tracking whether jobs exist.
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+
+        // One checkpoint drains to exhaustion, including jobs enqueued by
+        // jobs. HTML's checkpoint runs until the queue is empty, so a promise
+        // chain must complete within a single task boundary.
+        let nested = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.nestedMicrotaskDepth = 0; \
+                 Promise.resolve() \
+                   .then(() => nestedMicrotaskDepth++) \
+                   .then(() => nestedMicrotaskDepth++) \
+                   .then(() => nestedMicrotaskDepth++);",
+            "nested-microtask.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, nested).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "nestedMicrotaskDepth === 3")
+                .unwrap()
+        );
+
+        // A reaction that throws rejects its derived promise rather than
+        // reaching a TryCatch at the checkpoint boundary, so this is the
+        // channel an ordinary `Promise.then` failure takes. It must be
+        // observable, and one failure must not cancel the rest of the drain.
+        let throwing_job = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.jobAfterThrowRan = false; \
+                 Promise.resolve().then(() => { throw new Error('job boom'); }); \
+                 Promise.resolve().then(() => { jobAfterThrowRan = true; });",
+            "throwing-job.js",
+            4,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, throwing_job).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        let job_errors = runtime.take_pending_job_errors().unwrap();
+        assert_eq!(job_errors.len(), 1);
+        assert!(job_errors[0].exception.message.contains("job boom"));
+        assert_eq!(job_errors[0].exception.resource_name, "throwing-job.js");
+        // The failure must name the realm that produced it, or Servo has no
+        // global to fire the event on.
+        assert_eq!(job_errors[0].realm_id, Some(first));
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "jobAfterThrowRan")
+                .unwrap()
+        );
+        // Pulling is destructive, so a second pull reports nothing.
+        assert!(runtime.take_pending_job_errors().unwrap().is_empty());
+
+        // A rejection that gains a handler later must be revoked rather than
+        // reported, which is why the promise identity is tracked.
+        let handled_late = compiled(runtime.compile_script_in_realm(
+            first,
+            "globalThis.lateHandlerRan = false; \
+                 const rejected = Promise.reject(new Error('handled later')); \
+                 Promise.resolve().then(() => { \
+                   rejected.catch(() => { lateHandlerRan = true; }); \
+                 });",
+            "handled-late.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(first, handled_late).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(runtime.eval_bool_in_realm(first, "lateHandlerRan").unwrap());
+        assert!(runtime.take_pending_job_errors().unwrap().is_empty());
+
+        // The queue is isolate-wide, so one checkpoint drains every realm.
+        let across_realms = compiled(runtime.compile_script_in_realm(
+            second,
+            "globalThis.secondRealmMicrotaskRan = false; \
+                 Promise.resolve().then(() => secondRealmMicrotaskRan = true);",
+            "second-realm-microtask.js",
+            1,
+        ));
+        assert_eq!(
+            runtime.run_script_in_realm(second, across_realms).unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert_eq!(
+            runtime.perform_microtask_checkpoint().unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(second, "secondRealmMicrotaskRan")
+                .unwrap()
+        );
+
+        // A rejection is retained through a v8::Global<Promise> until it is
+        // handled or reported. Destroying its realm before the next checkpoint
+        // must release that handle and discard the now-unreportable error,
+        // rather than pinning the dead context until runtime teardown.
+        let abandoned_rejection = compiled(runtime.compile_script_in_realm(
+            first,
+            "Promise.reject(new Error('realm is going away'));",
+            "abandoned-rejection.js",
+            1,
+        ));
+        assert_eq!(
+            runtime
+                .run_script_in_realm(first, abandoned_rejection)
+                .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+
         runtime.destroy_realm(first).unwrap();
+        assert!(runtime.take_pending_job_errors().unwrap().is_empty());
         let compile_error = runtime
             .compile_in_realm(first, "1;", "destroyed-realm.js", 1)
             .unwrap_err()
@@ -1185,6 +2932,778 @@ mod tests {
         assert_eq!(outcome, ScriptRunOutcome::Terminated);
         drop(runtime);
         assert!(!interrupt.terminate_execution());
+    }
+
+    #[test]
+    fn major_gc_prunes_dead_wrapper_cache_entries() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+        let realm = runtime.create_realm().unwrap();
+        let element_drops = Rc::new(Cell::new(0));
+        let mut host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        host.element_drops = Rc::clone(&element_drops);
+        runtime.install_document_host(realm, host).unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.kept = document.documentElement; kept.tagName === 'HTML'",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+
+        // A major collection must retain both the live wrapper and its cache
+        // entry while JavaScript still reaches it.
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+        assert_eq!(element_drops.get(), 0);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "globalThis.kept = null; true")
+                .unwrap()
+        );
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 0);
+        assert_eq!(element_drops.get(), 1);
+
+        // The same DOM address can be wrapped again after pruning without a
+        // stale entry colliding with the new cell.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.recreated = document.documentElement; \
+                     recreated.tagName === 'HTML'",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(element_drops.get(), 2);
+        assert!(runtime.wrapper_cache_size_for_testing(realm).is_err());
+    }
+
+    #[test]
+    fn timer_host_retains_invokes_clears_and_drops_callbacks() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let _reentry = CallbackReentryConfig::new(runtime.raw.as_ptr());
+        let realm = runtime.create_realm().unwrap();
+        let functions = Rc::new(RefCell::new(Vec::new()));
+        let strings = Rc::new(RefCell::new(Vec::new()));
+        let clears = Rc::new(RefCell::new(Vec::new()));
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .install_timer_host(
+                realm,
+                TimerHostProbe::new(
+                    Rc::clone(&functions),
+                    Rc::clone(&strings),
+                    Rc::clone(&clears),
+                    Rc::clone(&drops),
+                ),
+            )
+            .unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => {\n\
+                       const names = ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'];\n\
+                       const expectedLengths = [1, 0, 1, 0];\n\
+                       if (!names.every((name, index) => {\n\
+                         const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);\n\
+                         return descriptor && !descriptor.enumerable && descriptor.writable &&\n\
+                           descriptor.configurable && descriptor.value.name === name &&\n\
+                           descriptor.value.length === expectedLengths[index];\n\
+                       })) return false;\n\
+                       globalThis.timerHandle = setTimeout((left, right) => {\n\
+                         globalThis.timerResult = left + right;\n\
+                       }, 12, 40, 2);\n\
+                       return timerHandle === 1;\n\
+                     })()",
+                )
+                .unwrap()
+        );
+        let one_shot = functions.borrow()[0].clone();
+        assert_eq!(one_shot.timeout_ms, 12);
+        assert!(!one_shot.is_interval);
+        assert_eq!(one_shot.host_context, 0);
+
+        // The callback and arbitrary argument values are strong while active,
+        // so a major V8 collection cannot collect them before Servo fires it.
+        runtime.collect_garbage_for_testing();
+        assert_eq!(
+            runtime
+                .run_timer_callback_in_realm(realm, one_shot.callback_id)
+                .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "timerResult === 42")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, one_shot.callback_id)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown or cleared Servo V8 timer callback")
+        );
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.intervalCount = 0;\n\
+                     globalThis.intervalHandle = setInterval(\n\
+                       increment => intervalCount += increment, 7, 3);\n\
+                     intervalHandle === 2",
+                )
+                .unwrap()
+        );
+        let interval = functions.borrow()[1].clone();
+        assert!(interval.is_interval);
+        for _ in 0..2 {
+            assert_eq!(
+                runtime
+                    .run_timer_callback_in_realm(realm, interval.callback_id)
+                    .unwrap(),
+                ScriptRunOutcome::Completed
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "intervalCount === 6")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "clearTimeout(intervalHandle); true")
+                .unwrap()
+        );
+        assert_eq!(&*clears.borrow(), &[2]);
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, interval.callback_id)
+                .is_err()
+        );
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "setTimeout('globalThis.stringTimerRan = \"\u{2713}\"', -9) === 3",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            &*strings.borrow(),
+            &[ScheduledTimerString {
+                source: "globalThis.stringTimerRan = \"\u{2713}\"".to_owned(),
+                timeout_ms: -9,
+                is_interval: false,
+                host_context: 0,
+                handle: 3,
+            }]
+        );
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.externalClearHandle = setInterval(() => {}, 5);\n\
+                     externalClearHandle === 4",
+                )
+                .unwrap()
+        );
+        let external_clear = functions.borrow()[2].clone();
+        runtime
+            .clear_timer_callback_in_realm(realm, external_clear.callback_id)
+            .unwrap();
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, external_clear.callback_id)
+                .is_err()
+        );
+
+        let schedule_with_context = compiled(runtime.compile_script_in_realm(
+            realm,
+            "setTimeout(() => {}, 0);",
+            "timer-host-context.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token stays live for the synchronous run and the probe
+        // records its address but never dereferences or retains it for use.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    schedule_with_context,
+                    (&mut host_context_token as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        let with_context = functions.borrow()[3].clone();
+        assert_eq!(
+            with_context.host_context,
+            (&mut host_context_token as *mut u8) as usize
+        );
+        runtime
+            .clear_timer_callback_in_realm(realm, with_context.callback_id)
+            .unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => {\n\
+                       let missing = false, symbol = false, delay = false;\n\
+                       try { setTimeout(); } catch (error) { missing = error instanceof TypeError; }\n\
+                       try { setTimeout(Symbol('handler')); }\n\
+                       catch (error) { symbol = error instanceof TypeError; }\n\
+                       const sentinel = new Error('delay sentinel');\n\
+                       try { setTimeout(() => {}, { valueOf() { throw sentinel; } }); }\n\
+                       catch (error) { delay = error === sentinel; }\n\
+                       return missing && symbol && delay;\n\
+                     })()",
+                )
+                .unwrap()
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(drops.get(), 1);
+        assert!(
+            runtime
+                .run_timer_callback_in_realm(realm, interval.callback_id)
+                .is_err()
+        );
+        CALLBACK_REENTRY_ATTEMPTS.with(|attempts| {
+            let attempts = attempts.borrow();
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "timer schedule function")
+            );
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "timer schedule string")
+            );
+            assert!(attempts.iter().any(|(phase, _, _)| *phase == "timer clear"));
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "timer host drop")
+            );
+            assert!(attempts.iter().all(|(_, status, error)| {
+                *status == 0 && error.contains("re-entered from a Rust host callback")
+            }));
+        });
+    }
+
+    #[test]
+    fn console_host_formats_routes_guards_and_drops_messages() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let _reentry = CallbackReentryConfig::new(runtime.raw.as_ptr());
+        let realm = runtime.create_realm().unwrap();
+
+        // The facade exists as soon as the realm does, but cannot silently
+        // discard output before an embedder host is installed.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { console.log('lost'); } catch (error) { \
+                       return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap()
+        );
+
+        let messages = Rc::new(RefCell::new(Vec::new()));
+        let drops = Rc::new(Cell::new(0));
+        runtime
+            .install_console_host(
+                realm,
+                ConsoleHostProbe {
+                    messages: Rc::clone(&messages),
+                    drops: Rc::clone(&drops),
+                    attempt_reentry: true,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => {\n\
+                       const globalDescriptor = Object.getOwnPropertyDescriptor(\n\
+                         globalThis, 'console');\n\
+                       const names = ['debug', 'error', 'info', 'log', 'trace', 'warn'];\n\
+                       if (!globalDescriptor || globalDescriptor.enumerable ||\n\
+                           !globalDescriptor.writable || !globalDescriptor.configurable ||\n\
+                           Object.prototype.toString.call(console) !== '[object Console]' ||\n\
+                           Object.keys(console).join(',') !== names.join(',') ||\n\
+                           typeof console.assert !== 'undefined' ||\n\
+                           !names.every(name => {\n\
+                             const descriptor = Object.getOwnPropertyDescriptor(console, name);\n\
+                             return descriptor && descriptor.enumerable && descriptor.writable &&\n\
+                               descriptor.configurable && descriptor.value.name === name &&\n\
+                               descriptor.value.length === 0;\n\
+                           })) return false;\n\
+                       console.debug('debug', 1);\n\
+                       console.error('error', false);\n\
+                       console.info();\n\
+                       let touched = false;\n\
+                       console.log('log', null, undefined, 7n, Symbol('s'), {\n\
+                         toString() { touched = true; throw new Error('must not run'); }\n\
+                       });\n\
+                       console.trace('trace');\n\
+                       console.warn('warn', '✓');\n\
+                       Promise.resolve().then(() => console.log('microtask'));\n\
+                       return !touched;\n\
+                     })()",
+                )
+                .unwrap()
+        );
+
+        let messages = messages.borrow();
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[0], (ConsoleLevel::Debug, "debug 1".to_owned()));
+        assert_eq!(messages[1], (ConsoleLevel::Error, "error false".to_owned()));
+        assert_eq!(messages[2], (ConsoleLevel::Info, String::new()));
+        assert_eq!(messages[3].0, ConsoleLevel::Log);
+        assert!(messages[3].1.starts_with("log null undefined 7 Symbol(s) "));
+        assert_eq!(messages[4].0, ConsoleLevel::Trace);
+        assert!(messages[4].1.starts_with("trace\n    at "));
+        assert_eq!(messages[5], (ConsoleLevel::Warn, "warn ✓".to_owned()));
+        assert_eq!(messages[6], (ConsoleLevel::Log, "microtask".to_owned()));
+        drop(messages);
+
+        // A rejected second transfer stays Rust-owned and is dropped here.
+        assert!(
+            runtime
+                .install_console_host(
+                    realm,
+                    ConsoleHostProbe {
+                        messages: Rc::new(RefCell::new(Vec::new())),
+                        drops: Rc::clone(&drops),
+                        attempt_reentry: false,
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(drops.get(), 1);
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(drops.get(), 2);
+        CALLBACK_REENTRY_ATTEMPTS.with(|attempts| {
+            let attempts = attempts.borrow();
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "console write")
+            );
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(phase, _, _)| *phase == "console host drop")
+            );
+            assert!(attempts.iter().all(|(_, status, error)| {
+                *status == 0 && error.contains("re-entered from a Rust host callback")
+            }));
+        });
+    }
+
+    #[test]
+    fn interface_returns_preserve_wrapper_identity() {
+        let options = Options {
+            expose_gc: 1,
+            ..Options::default()
+        };
+        let mut runtime = Runtime::new(options).unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+        // Type-level, so a second install is a misuse rather than a no-op.
+        assert!(runtime.install_element_host::<ElementHostProbe>().is_err());
+
+        let realm = runtime.create_realm().unwrap();
+        let element_drops = Rc::new(Cell::new(0));
+        let mut host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        host.element_drops = Rc::clone(&element_drops);
+        let get_element_by_id_calls = Rc::clone(&host.get_element_by_id_calls);
+        let drop_reentry_attempts = Rc::new(RefCell::new(Vec::new()));
+        host.element_drop_reentry = Some(ElementDropReentryProbe {
+            runtime: runtime.raw.as_ptr(),
+            realm,
+            attempts: Rc::clone(&drop_reentry_attempts),
+        });
+        runtime.install_document_host(realm, host).unwrap();
+
+        // The point of the wrapper cache: the same DOM object read twice must
+        // be the same JavaScript object, not merely an equal one.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.documentElement === document.documentElement",
+                )
+                .unwrap()
+        );
+
+        let operation_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               const descriptor = Object.getOwnPropertyDescriptor(\n\
+                 Object.getPrototypeOf(document), 'getElementById');\n\
+               globalThis.getElementByIdWrongBrandStringified = false;\n\
+               let rejectsWrongBrand = false;\n\
+               try { descriptor.value.call({}, { toString() {\n\
+                 getElementByIdWrongBrandStringified = true; return 'target';\n\
+               }}); } catch (error) { rejectsWrongBrand = error instanceof TypeError; }\n\
+               const conversionError = new Error('conversion sentinel');\n\
+               let preservesConversionError = false;\n\
+               try { document.getElementById({ toString() { throw conversionError; }}); }\n\
+               catch (error) { preservesConversionError = error === conversionError; }\n\
+               let rejectsSymbol = false;\n\
+               try { document.getElementById(Symbol('target')); }\n\
+               catch (error) { rejectsSymbol = error instanceof TypeError; }\n\
+               let rejectsMissing = false;\n\
+               try { document.getElementById(); }\n\
+               catch (error) { rejectsMissing = error instanceof TypeError; }\n\
+               const found = document.getElementById({\n\
+                 toString() { return 'target'; }\n\
+               });\n\
+               found.marker = 29;\n\
+               const elementPrototype = Object.getPrototypeOf(found);\n\
+               const localNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'localName');\n\
+               const tagNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'tagName');\n\
+               const idDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'id');\n\
+               const classNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'className');\n\
+               const hasAttributesDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'hasAttributes');\n\
+               const getAttributeDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'getAttribute');\n\
+               const hasAttributeDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 elementPrototype, 'hasAttribute');\n\
+               const nodePrototype = Object.getPrototypeOf(elementPrototype);\n\
+               const nodeTypeDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'nodeType');\n\
+               const nodeNameDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'nodeName');\n\
+               const isConnectedDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'isConnected');\n\
+               const textContentDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'textContent');\n\
+               const hasChildNodesDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 nodePrototype, 'hasChildNodes');\n\
+               const initialNodeValues = found.nodeType === 1 &&\n\
+                 found.nodeName === 'DIV' && found.isConnected === true &&\n\
+                 found.textContent === 'probe text' && found.hasChildNodes();\n\
+               globalThis.elementWrongBrandStringified = false;\n\
+               let elementRejectsWrongBrand = false;\n\
+               try { getAttributeDescriptor.value.call({}, { toString() {\n\
+                 elementWrongBrandStringified = true; return 'id';\n\
+               }}); } catch (error) { elementRejectsWrongBrand = error instanceof TypeError; }\n\
+               let setterRejectsWrongBrand = false;\n\
+               try { idDescriptor.set.call({}, { toString() {\n\
+                 elementWrongBrandStringified = true; return 'changed';\n\
+               }}); } catch (error) { setterRejectsWrongBrand = error instanceof TypeError; }\n\
+               const elementConversionError = new Error('element conversion sentinel');\n\
+               let preservesElementConversionError = false;\n\
+               try { found.getAttribute({ toString() { throw elementConversionError; }}); }\n\
+               catch (error) { preservesElementConversionError = error === elementConversionError; }\n\
+               let elementRejectsSymbol = false;\n\
+               try { found.hasAttribute(Symbol('id')); }\n\
+               catch (error) { elementRejectsSymbol = error instanceof TypeError; }\n\
+               let elementRejectsMissing = false;\n\
+               try { found.getAttribute(); }\n\
+               catch (error) { elementRejectsMissing = error instanceof TypeError; }\n\
+               const convertedAttribute = found.getAttribute({\n\
+                 toString() { return 'DATA-PROOF'; }\n\
+               });\n\
+               globalThis.nodeWrongBrandStringified = false;\n\
+               let nodeRejectsWrongBrand = false;\n\
+               try { textContentDescriptor.set.call({}, { toString() {\n\
+                 nodeWrongBrandStringified = true; return 'bad';\n\
+               }}); } catch (error) { nodeRejectsWrongBrand = error instanceof TypeError; }\n\
+               const nodeConversionError = new Error('node conversion sentinel');\n\
+               let preservesNodeConversionError = false;\n\
+               try { textContentDescriptor.set.call(found, {\n\
+                 toString() { throw nodeConversionError; }\n\
+               }); } catch (error) { preservesNodeConversionError = error === nodeConversionError; }\n\
+               let nodeRejectsSymbol = false;\n\
+               try { found.textContent = Symbol('text'); }\n\
+               catch (error) { nodeRejectsSymbol = error instanceof TypeError; }\n\
+               const textSetterResult = textContentDescriptor.set.call(found, {\n\
+                 toString() { return 'changed text'; }\n\
+               });\n\
+               const textMutationWorked = textSetterResult === undefined &&\n\
+                 found.textContent === 'changed text' && found.hasChildNodes();\n\
+               found.textContent = undefined;\n\
+               const undefinedTextWorked = found.textContent === '' &&\n\
+                 !found.hasChildNodes();\n\
+               found.textContent = 'missing argument reset';\n\
+               const missingTextSetterResult = textContentDescriptor.set.call(found);\n\
+               const missingTextWorked = missingTextSetterResult === undefined &&\n\
+                 found.textContent === '' && !found.hasChildNodes();\n\
+               found.textContent = 'null reset';\n\
+               found.textContent = null;\n\
+               const nullTextWorked = found.textContent === '' && !found.hasChildNodes();\n\
+               found.id = { toString() { return 'changed-id'; }};\n\
+               found.className = null;\n\
+               globalThis.getElementByIdBindingProof =\n\
+                 !Object.hasOwn(document, 'getElementById') && descriptor &&\n\
+                 descriptor.writable && descriptor.enumerable &&\n\
+                 descriptor.configurable && descriptor.value.length === 1 &&\n\
+                 descriptor.value.name === 'getElementById' &&\n\
+                 rejectsWrongBrand && !getElementByIdWrongBrandStringified &&\n\
+                 preservesConversionError && rejectsSymbol && rejectsMissing &&\n\
+                 found.tagName === 'DIV' &&\n\
+                 found.localName === 'div' && found.id === 'changed-id' &&\n\
+                 found.className === 'null' && found.hasAttributes() === true &&\n\
+                 found.getAttribute('id') === 'changed-id' &&\n\
+                 found.getAttribute('class') === 'null' &&\n\
+                 found.getAttribute('missing') === null &&\n\
+                 found.hasAttribute('ID') && !found.hasAttribute('missing') &&\n\
+                 convertedAttribute === 'present' &&\n\
+                 initialNodeValues && textMutationWorked && undefinedTextWorked &&\n\
+                 missingTextWorked && nullTextWorked &&\n\
+                 Object.getPrototypeOf(nodePrototype) === Object.prototype &&\n\
+                 !Object.hasOwn(found, 'localName') &&\n\
+                 !Object.hasOwn(found, 'tagName') && !Object.hasOwn(found, 'id') &&\n\
+                 !Object.hasOwn(found, 'className') &&\n\
+                 !Object.hasOwn(found, 'hasAttributes') &&\n\
+                 !Object.hasOwn(found, 'getAttribute') &&\n\
+                 !Object.hasOwn(found, 'hasAttribute') &&\n\
+                 !Object.hasOwn(found, 'nodeType') &&\n\
+                 !Object.hasOwn(found, 'nodeName') &&\n\
+                 !Object.hasOwn(found, 'isConnected') &&\n\
+                 !Object.hasOwn(found, 'textContent') &&\n\
+                 !Object.hasOwn(found, 'hasChildNodes') &&\n\
+                 localNameDescriptor && localNameDescriptor.get.length === 0 &&\n\
+                 localNameDescriptor.set === undefined &&\n\
+                 tagNameDescriptor && tagNameDescriptor.get.length === 0 &&\n\
+                 tagNameDescriptor.set === undefined &&\n\
+                 idDescriptor && idDescriptor.get.length === 0 &&\n\
+                 idDescriptor.set.length === 1 &&\n\
+                 classNameDescriptor && classNameDescriptor.get.length === 0 &&\n\
+                 classNameDescriptor.set.length === 1 &&\n\
+                 [localNameDescriptor, tagNameDescriptor, idDescriptor,\n\
+                  classNameDescriptor].every(d => d.enumerable && d.configurable) &&\n\
+                 hasAttributesDescriptor.value.name === 'hasAttributes' &&\n\
+                 hasAttributesDescriptor.value.length === 0 &&\n\
+                 getAttributeDescriptor.value.name === 'getAttribute' &&\n\
+                 getAttributeDescriptor.value.length === 1 &&\n\
+                 hasAttributeDescriptor.value.name === 'hasAttribute' &&\n\
+                 hasAttributeDescriptor.value.length === 1 &&\n\
+                 [hasAttributesDescriptor, getAttributeDescriptor,\n\
+                  hasAttributeDescriptor].every(d => d.writable &&\n\
+                    d.enumerable && d.configurable) &&\n\
+                 [nodeTypeDescriptor, nodeNameDescriptor,\n\
+                  isConnectedDescriptor].every(d => d && d.get.length === 0 &&\n\
+                    d.set === undefined && d.enumerable && d.configurable) &&\n\
+                 textContentDescriptor && textContentDescriptor.get.length === 0 &&\n\
+                 textContentDescriptor.set.length === 1 &&\n\
+                 textContentDescriptor.enumerable && textContentDescriptor.configurable &&\n\
+                 hasChildNodesDescriptor.value.name === 'hasChildNodes' &&\n\
+                 hasChildNodesDescriptor.value.length === 0 &&\n\
+                 hasChildNodesDescriptor.writable &&\n\
+                 hasChildNodesDescriptor.enumerable &&\n\
+                 hasChildNodesDescriptor.configurable &&\n\
+                 elementRejectsWrongBrand && setterRejectsWrongBrand &&\n\
+                 !elementWrongBrandStringified && preservesElementConversionError &&\n\
+                 elementRejectsSymbol && elementRejectsMissing &&\n\
+                 nodeRejectsWrongBrand && !nodeWrongBrandStringified &&\n\
+                 preservesNodeConversionError && nodeRejectsSymbol &&\n\
+                 found !== document.documentElement && found !== document.head &&\n\
+                 document.getElementById('target') === found &&\n\
+                 document.getElementById('target').marker === 29 &&\n\
+                 document.getElementById('missing') === null &&\n\
+                 document.getElementById('') === null &&\n\
+                 document.getElementById('a\\0b') === null &&\n\
+                 document.getElementById('\\uD800') === null;\n\
+             })();",
+            "get-element-by-id-binding.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token remains live for this synchronous run, and the
+        // probe validates but does not dereference or retain it.
+        let operation_outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                operation_script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(operation_outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "getElementByIdBindingProof")
+                .unwrap()
+        );
+        assert_eq!(
+            &*get_element_by_id_calls.borrow(),
+            &[
+                "target", "target", "target", "missing", "", "a\0b", "\u{fffd}",
+            ]
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "document.documentElement.tagName === 'HTML'")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.head.tagName === 'HEAD' && \
+                     document.head !== document.documentElement && \
+                     document.head === document.head",
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.head.marker = 23; document.head.marker === 23",
+                )
+                .unwrap()
+        );
+        // A property set on the wrapper survives a re-read, which an
+        // equal-but-distinct object would not manage.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.documentElement.marker = 17; \
+                     document.documentElement.marker === 17"
+                )
+                .unwrap()
+        );
+        // The wrapper is an object of its own, not the document facade.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "document.documentElement !== document && \
+                     typeof document.documentElement === 'object'"
+                )
+                .unwrap()
+        );
+        // Reading tagName off a foreign receiver must not reach a host. The
+        // WebIDL accessor belongs to the shared Element prototype.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { \
+                       const descriptor = Object.getOwnPropertyDescriptor( \
+                         Object.getPrototypeOf(document.documentElement), 'tagName'); \
+                       try { descriptor.get.call({}); } \
+                       catch (error) { return error instanceof TypeError; } \
+                       return false; \
+                     })()"
+                )
+                .unwrap()
+        );
+
+        // Realm destruction must release every element host synchronously,
+        // not whenever the next collection happens. Each host roots its
+        // element, and through it the tree, so waiting for a GC would pin a
+        // destroyed pipeline's DOM for as long as the isolate stays idle.
+        // Every read past the first hits the cache, and each hit drops the
+        // host that read speculatively allocated -- so those drops have
+        // already happened, and exactly three live hosts remain.
+        let dropped_on_cache_hits = element_drops.get();
+        assert!(
+            dropped_on_cache_hits > 0,
+            "cache hits must drop the surplus host they allocated"
+        );
+        assert_eq!(drop_reentry_attempts.borrow().len(), dropped_on_cache_hits);
+        assert!(
+            drop_reentry_attempts
+                .borrow()
+                .iter()
+                .all(|(status, error)| {
+                    *status == 0 && error.contains("re-entered from a Rust host callback")
+                })
+        );
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(
+            element_drops.get(),
+            dropped_on_cache_hits + 3,
+            "realm destruction must release all three cached hosts, synchronously"
+        );
+        assert_eq!(drop_reentry_attempts.borrow().len(), element_drops.get());
+        assert!(
+            drop_reentry_attempts
+                .borrow()
+                .iter()
+                .all(|(status, error)| {
+                    *status == 0 && error.contains("re-entered from a Rust host callback")
+                })
+        );
+
+        let nullable_realm = runtime.create_realm().unwrap();
+        let mut nullable_host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        nullable_host.document_element_present = false;
+        nullable_host.head_present = false;
+        runtime
+            .install_document_host(nullable_realm, nullable_host)
+            .unwrap();
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    nullable_realm,
+                    "document.documentElement === null && document.head === null",
+                )
+                .unwrap()
+        );
+        runtime.destroy_realm(nullable_realm).unwrap();
+        drop(runtime);
     }
 
     #[test]
@@ -1285,12 +3804,116 @@ mod tests {
                 .unwrap()
         );
 
+        let missing_title_context = compiled(runtime.compile_script_in_realm(
+            first,
+            "document.title = 'must-not-set';",
+            "missing-title-host-context.js",
+            1,
+        ));
+        let ScriptRunOutcome::Thrown(missing_title_context_error) = runtime
+            .run_script_in_realm(first, missing_title_context)
+            .unwrap()
+        else {
+            panic!("Document.title setter ran without a host context");
+        };
+        assert!(
+            missing_title_context_error
+                .message
+                .contains("Document.title host callback failed")
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(first, "document.title === 'probe title'")
+                .unwrap()
+        );
+
+        // Document.URL is the first read-only member added through the shape
+        // manifest. It shares the owned-UTF-8 transfer with bgColor's getter
+        // but has no setter, so the descriptor must expose a getter alone, and
+        // assigning to it must be silently ignored rather than mutate anything.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.URL === 'https://example.com/probe?q=\u{2713}'"
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.documentURI === document.URL && \
+                     document.compatMode === 'CSS1Compat' && \
+                     document.characterSet === 'UTF-8' && \
+                     document.charset === document.characterSet && \
+                     document.inputEncoding === document.characterSet && \
+                     document.contentType === 'text/html' && \
+                     document.referrer === '' && \
+                     document.lastModified === '01/02/2026 03:04:05'",
+                )
+                .unwrap()
+        );
+        // The enum crosses the ABI as a string, so the host must only ever
+        // produce a value the selector pinned.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "['visible', 'hidden'].includes(document.visibilityState)"
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.readyState === 'complete' && \
+                     ['loading', 'interactive', 'complete'].includes(document.readyState)",
+                )
+                .unwrap()
+        );
+        // Document inherits Node, so nodeType is served by the same facade and
+        // must arrive as a number rather than a string.
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "document.nodeType === 9 && typeof document.nodeType === 'number'"
+                )
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    first,
+                    "(() => {\n\
+                       const descriptor = Object.getOwnPropertyDescriptor(\n\
+                         Object.getPrototypeOf(document), 'URL');\n\
+                       if (typeof descriptor.get !== 'function') return false;\n\
+                       if (descriptor.set !== undefined) return false;\n\
+                       if (!descriptor.enumerable || !descriptor.configurable) return false;\n\
+                       let rejectsWrongBrand = false;\n\
+                       try {\n\
+                         descriptor.get.call({});\n\
+                       } catch (error) {\n\
+                         rejectsWrongBrand = error instanceof TypeError;\n\
+                       }\n\
+                       return rejectsWrongBrand;\n\
+                     })()"
+                )
+                .unwrap()
+        );
+
         let bg_color_script = compiled(runtime.compile_script_in_realm(
             first,
             "(() => {\n\
                const descriptor = Object.getOwnPropertyDescriptor(\n\
                  Object.getPrototypeOf(document), 'bgColor');\n\
+               const titleDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 Object.getPrototypeOf(document), 'title');\n\
                globalThis.bgColorBrandStringified = false;\n\
+               globalThis.titleBrandStringified = false;\n\
                let rejectsWrongBrand = false;\n\
                try {\n\
                  descriptor.set.call({}, { toString() {\n\
@@ -1305,6 +3928,38 @@ mod tests {
                let rejectsSymbol = false;\n\
                try { document.bgColor = Symbol('color'); }\n\
                catch (error) { rejectsSymbol = error instanceof TypeError; }\n\
+               let titleRejectsWrongBrand = false;\n\
+               try {\n\
+                 titleDescriptor.set.call({}, { toString() {\n\
+                   titleBrandStringified = true; return 'bad';\n\
+                 }});\n\
+               } catch (error) { titleRejectsWrongBrand = error instanceof TypeError; }\n\
+               let titlePreservesConversionError = false;\n\
+               try {\n\
+                 titleDescriptor.set.call(document, {\n\
+                   toString() { throw conversionError; }\n\
+                 });\n\
+               } catch (error) {\n\
+                 titlePreservesConversionError = error === conversionError;\n\
+               }\n\
+               let titleRejectsSymbol = false;\n\
+               try { document.title = Symbol('title'); }\n\
+               catch (error) { titleRejectsSymbol = error instanceof TypeError; }\n\
+               document.title = null;\n\
+               const titleNullBecameString = document.title === 'null';\n\
+               let titleConversions = 0;\n\
+               document.title = { toString() {\n\
+                 titleConversions++; return 'V8 title ✓';\n\
+               }};\n\
+               globalThis.titleBindingProof =\n\
+                 !Object.hasOwn(document, 'title') && titleDescriptor &&\n\
+                 titleDescriptor.enumerable && titleDescriptor.configurable &&\n\
+                 titleDescriptor.get.length === 0 && titleDescriptor.set.length === 1 &&\n\
+                 titleDescriptor.get.name === 'get title' &&\n\
+                 titleDescriptor.set.name === 'set title' && titleRejectsWrongBrand &&\n\
+                 !titleBrandStringified && titlePreservesConversionError &&\n\
+                 titleRejectsSymbol &&\n\
+                 titleNullBecameString && titleConversions === 1;\n\
                document.bgColor = null;\n\
                const nullBecameEmpty = document.bgColor === '';\n\
                document.bgColor = 'grü\\0n';\n\
@@ -1336,7 +3991,8 @@ mod tests {
             runtime
                 .eval_bool_in_realm(
                     first,
-                    "bgColorBindingProof && document.bgColor === 'grü\\0n'",
+                    "bgColorBindingProof && titleBindingProof && \
+                     document.bgColor === 'grü\\0n' && document.title === 'V8 title ✓'",
                 )
                 .unwrap()
         );
@@ -1349,6 +4005,78 @@ mod tests {
         runtime.destroy_realm(second).unwrap();
         assert_eq!(first_drops.get(), 1);
         assert_eq!(second_drops.get(), 1);
+    }
+
+    #[test]
+    fn document_host_operation_thunk_validates_abi_inputs() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let drops = Rc::new(Cell::new(0));
+        let mut host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&drops),
+        );
+        host.get_element_by_id_calls = Rc::clone(&calls);
+        let native = Box::into_raw(Box::new(host)).cast::<c_void>();
+        let vtable = DocumentHostVTable::for_type::<DocumentHostProbe>();
+        let callback = vtable.get_element_by_id.unwrap();
+        let mut host_context = 0_u8;
+        let host_context = (&mut host_context as *mut u8).cast::<c_void>();
+        let mut output = RawInterfaceValue {
+            is_null: 0,
+            key: std::ptr::null(),
+            native: std::ptr::null_mut(),
+        };
+        let invalid_utf8 = [0xff];
+
+        // SAFETY: Each pointer is either deliberately invalid in the precise
+        // way the thunk must reject, or remains live for the synchronous call.
+        unsafe {
+            assert_eq!(
+                callback(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut output,
+                ),
+                0,
+            );
+            assert_eq!(
+                callback(native, host_context, std::ptr::null(), 1, &mut output,),
+                0,
+            );
+            assert_eq!(
+                callback(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut output,
+                ),
+                0,
+            );
+            assert_eq!(
+                callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                0,
+            );
+            // Null plus zero length is the valid ABI spelling of an empty
+            // borrowed byte slice and reaches the host as an empty DOMString.
+            assert_eq!(
+                callback(native, host_context, std::ptr::null(), 0, &mut output,),
+                1,
+            );
+            assert_eq!(output.is_null, 1);
+            vtable.drop.unwrap()(native);
+        }
+        assert_eq!(&*calls.borrow(), &[""]);
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]

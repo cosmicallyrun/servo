@@ -1,0 +1,183 @@
+<!doctype html>
+<!--
+Runtime proof for inherited scalar Node behavior on Element wrappers.
+
+The test pins the Element -> Node -> Object prototype chain, WebIDL property
+descriptors, receiver-brand ordering, nullable DOMString conversion, and live
+Servo text mutation. A following SpiderMonkey script independently verifies
+that V8 changed the real DOM rather than wrapper-local state.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Node scalar proof</title>
+  </head>
+  <body bgcolor="red">
+    <div id="target"><span>hello</span> world</div>
+    <script data-servo-v8="authoritative">
+      var target = document.getElementById("target");
+      var elementPrototype = Object.getPrototypeOf(target);
+      var nodePrototype = Object.getPrototypeOf(elementPrototype);
+      if (
+        nodePrototype === null ||
+        Object.getPrototypeOf(nodePrototype) !== Object.prototype
+      ) {
+        throw new Error("Element did not inherit from one Node prototype");
+      }
+
+      var readonlyNames = ["nodeType", "nodeName", "isConnected"];
+      for (var name of readonlyNames) {
+        var descriptor = Object.getOwnPropertyDescriptor(nodePrototype, name);
+        if (
+          Object.hasOwn(target, name) ||
+          !descriptor ||
+          typeof descriptor.get !== "function" ||
+          descriptor.get.name !== "get " + name ||
+          descriptor.get.length !== 0 ||
+          descriptor.set !== undefined ||
+          !descriptor.enumerable ||
+          !descriptor.configurable
+        ) {
+          throw new Error(name + " Node accessor descriptor is wrong");
+        }
+      }
+
+      var textDescriptor = Object.getOwnPropertyDescriptor(
+        nodePrototype,
+        "textContent",
+      );
+      var childDescriptor = Object.getOwnPropertyDescriptor(
+        nodePrototype,
+        "hasChildNodes",
+      );
+      if (
+        Object.hasOwn(target, "textContent") ||
+        Object.hasOwn(target, "hasChildNodes") ||
+        !textDescriptor ||
+        textDescriptor.get.name !== "get textContent" ||
+        textDescriptor.get.length !== 0 ||
+        textDescriptor.set.name !== "set textContent" ||
+        textDescriptor.set.length !== 1 ||
+        !textDescriptor.enumerable ||
+        !textDescriptor.configurable ||
+        !childDescriptor ||
+        childDescriptor.value.name !== "hasChildNodes" ||
+        childDescriptor.value.length !== 0 ||
+        !childDescriptor.writable ||
+        !childDescriptor.enumerable ||
+        !childDescriptor.configurable
+      ) {
+        throw new Error("mutable Node descriptor is wrong");
+      }
+
+      var wrongBrandStringified = false;
+      var rejectedWrongBrand = false;
+      try {
+        textDescriptor.set.call({}, {
+          toString() {
+            wrongBrandStringified = true;
+            return "bad";
+          },
+        });
+      } catch (error) {
+        rejectedWrongBrand = error instanceof TypeError;
+      }
+      var childRejectedWrongBrand = false;
+      try {
+        childDescriptor.value.call({});
+      } catch (error) {
+        childRejectedWrongBrand = error instanceof TypeError;
+      }
+      if (
+        !rejectedWrongBrand ||
+        !childRejectedWrongBrand ||
+        wrongBrandStringified
+      ) {
+        throw new Error("Node receiver brand check ordering is wrong");
+      }
+
+      var conversionError = new Error("Node conversion sentinel");
+      var preservedConversionError = false;
+      try {
+        textDescriptor.set.call(target, {
+          toString() {
+            throw conversionError;
+          },
+        });
+      } catch (error) {
+        preservedConversionError = error === conversionError;
+      }
+      var rejectedSymbol = false;
+      try {
+        target.textContent = Symbol("text");
+      } catch (error) {
+        rejectedSymbol = error instanceof TypeError;
+      }
+      if (!preservedConversionError || !rejectedSymbol) {
+        throw new Error("Node nullable DOMString conversion is wrong");
+      }
+
+      if (
+        target.nodeType !== 1 ||
+        target.nodeName !== "DIV" ||
+        target.isConnected !== true ||
+        target.textContent !== "hello world" ||
+        !target.hasChildNodes()
+      ) {
+        throw new Error("initial inherited Node values are wrong");
+      }
+
+      var conversions = 0;
+      var setterResult = textDescriptor.set.call(target, {
+        toString() {
+          conversions++;
+          return "changed ✓";
+        },
+      });
+      if (
+        setterResult !== undefined ||
+        conversions !== 1 ||
+        target.textContent !== "changed ✓" ||
+        !target.hasChildNodes()
+      ) {
+        throw new Error("Node.textContent string mutation failed");
+      }
+
+      target.textContent = undefined;
+      if (target.textContent !== "" || target.hasChildNodes()) {
+        throw new Error("Node.textContent undefined mutation failed");
+      }
+
+      target.textContent = "missing argument reset";
+      var missingSetterResult = textDescriptor.set.call(target);
+      if (
+        missingSetterResult !== undefined ||
+        target.textContent !== "" ||
+        target.hasChildNodes()
+      ) {
+        throw new Error("Node.textContent missing-argument mutation failed");
+      }
+
+      target.textContent = "null reset";
+      target.textContent = null;
+      if (
+        target.textContent !== "" ||
+        target.hasChildNodes() ||
+        target.isConnected !== true
+      ) {
+        throw new Error("Node.textContent null mutation failed");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // This executes on SpiderMonkey and independently observes Servo's DOM.
+      const target = document.getElementById("target");
+      if (target.textContent !== "" || target.hasChildNodes()) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

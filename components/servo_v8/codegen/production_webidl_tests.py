@@ -30,17 +30,214 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
 
     def test_selects_real_document_bg_color(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            _, attribute = production_webidl.select_document_host_attributes(
+            attributes = production_webidl.select_document_host_members(
                 Path(temporary_directory) / "cache",
                 environment={},
             )
 
+        attribute = attributes[production_webidl.DOCUMENT_BG_COLOR]
         self.assertEqual(attribute.identifier.name, "bgColor")
         self.assertFalse(attribute.readonly)
         self.assertFalse(attribute.type.nullable())
         self.assertTrue(attribute.type.isDOMString())
         self.assertTrue(attribute.getExtendedAttribute("CEReactions"))
         self.assertTrue(attribute.type.getExtendedAttribute("LegacyNullToEmptyString"))
+
+    def test_selects_real_document_title_with_ordinary_domstring_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        attribute = attributes[production_webidl.DOCUMENT_TITLE]
+        self.assertEqual(attribute.identifier.name, "title")
+        self.assertFalse(attribute.readonly)
+        self.assertFalse(attribute.type.nullable())
+        self.assertTrue(attribute.type.isDOMString())
+        self.assertTrue(attribute.getExtendedAttribute("CEReactions"))
+        self.assertFalse(attribute.type.getExtendedAttribute("LegacyNullToEmptyString"))
+
+    def test_selects_real_document_string_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertTrue(attributes[production_webidl.DOCUMENT_URI].type.isUSVString())
+        domstring_members = (
+            production_webidl.DOCUMENT_COMPAT_MODE,
+            production_webidl.DOCUMENT_CHARACTER_SET,
+            production_webidl.DOCUMENT_CHARSET,
+            production_webidl.DOCUMENT_INPUT_ENCODING,
+            production_webidl.DOCUMENT_CONTENT_TYPE,
+            production_webidl.DOCUMENT_REFERRER,
+            production_webidl.DOCUMENT_LAST_MODIFIED,
+        )
+        for qualified_name in domstring_members:
+            with self.subTest(member=qualified_name):
+                attribute = attributes[qualified_name]
+                self.assertTrue(attribute.readonly)
+                self.assertFalse(attribute.type.nullable())
+                self.assertTrue(attribute.type.isDOMString())
+
+    def test_selects_the_slice_keyed_in_manifest_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            list(attributes),
+            [member.qualified_name for member in production_webidl.DOCUMENT_HOST],
+        )
+
+    def test_pins_each_real_interface_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attributes = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            attributes[production_webidl.DOCUMENT_DOCUMENT_ELEMENT].type.inner.name,
+            "Element",
+        )
+        self.assertEqual(
+            attributes[production_webidl.DOCUMENT_HEAD].type.inner.name,
+            "HTMLHeadElement",
+        )
+        method = attributes[production_webidl.DOCUMENT_GET_ELEMENT_BY_ID]
+        return_type, arguments = method.signatures()[0]
+        self.assertEqual(return_type.inner.name, "Element")
+        self.assertEqual(arguments[0].identifier.name, "elementId")
+        self.assertTrue(arguments[0].type.isDOMString())
+
+    def test_pins_each_real_enum_value_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_document_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            tuple(
+                members[
+                    production_webidl.DOCUMENT_VISIBILITY_STATE
+                ].type.inner.values()
+            ),
+            production_webidl.DOCUMENT_VISIBILITY_STATE_VALUES,
+        )
+        self.assertEqual(
+            tuple(
+                members[
+                    production_webidl.DOCUMENT_READY_STATE
+                ].type.inner.values()
+            ),
+            production_webidl.DOCUMENT_READY_STATE_VALUES,
+        )
+
+
+class ProductionTimerTests(unittest.TestCase):
+    def test_pins_all_four_real_timer_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_timer_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.TIMER_HOST))
+        for qualified_name in (
+            production_webidl.WINDOW_OR_WORKER_SET_TIMEOUT,
+            production_webidl.WINDOW_OR_WORKER_SET_INTERVAL,
+        ):
+            method = members[qualified_name]
+            return_type, arguments = method.signatures()[0]
+            self.assertEqual(return_type.prettyName(), "long")
+            self.assertEqual(
+                [part.prettyName() for part in arguments[0].type.memberTypes],
+                ["TrustedScript", "DOMString", "Function"],
+            )
+            self.assertEqual(arguments[1].defaultValue.value, 0)
+            self.assertTrue(arguments[2].variadic)
+            self.assertTrue(arguments[2].type.isAny())
+
+        for qualified_name in (
+            production_webidl.WINDOW_OR_WORKER_CLEAR_TIMEOUT,
+            production_webidl.WINDOW_OR_WORKER_CLEAR_INTERVAL,
+        ):
+            return_type, arguments = members[qualified_name].signatures()[0]
+            self.assertEqual(return_type.prettyName(), "undefined")
+            self.assertEqual(arguments[0].defaultValue.value, 0)
+
+
+class ProductionConsoleTests(unittest.TestCase):
+    def test_pins_the_real_console_logging_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_console_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.CONSOLE_HOST))
+        for qualified_name, method in members.items():
+            with self.subTest(member=qualified_name):
+                return_type, arguments = method.signatures()[0]
+                self.assertEqual(return_type.prettyName(), "undefined")
+                self.assertEqual(len(arguments), 1)
+                self.assertTrue(arguments[0].variadic)
+                self.assertTrue(arguments[0].type.isAny())
+                expected_name = (
+                    "data"
+                    if qualified_name == production_webidl.CONSOLE_TRACE
+                    else "messages"
+                )
+                self.assertEqual(arguments[0].identifier.name, expected_name)
+
+
+class ProductionElementTests(unittest.TestCase):
+    def test_pins_the_real_scalar_element_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_element_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.ELEMENT_HOST))
+        self.assertTrue(members[production_webidl.ELEMENT_LOCAL_NAME].readonly)
+        self.assertTrue(members[production_webidl.ELEMENT_TAG_NAME].readonly)
+        self.assertFalse(members[production_webidl.ELEMENT_ID].readonly)
+        self.assertFalse(members[production_webidl.ELEMENT_CLASS_NAME].readonly)
+        return_type, arguments = members[
+            production_webidl.ELEMENT_GET_ATTRIBUTE
+        ].signatures()[0]
+        self.assertTrue(return_type.nullable())
+        self.assertTrue(return_type.inner.isDOMString())
+        self.assertEqual(arguments[0].identifier.name, "name")
+
+
+class ProductionNodeTests(unittest.TestCase):
+    def test_pins_the_real_scalar_node_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_node_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.NODE_HOST))
+        self.assertTrue(members[production_webidl.NODE_NODE_TYPE].readonly)
+        self.assertTrue(members[production_webidl.NODE_NODE_NAME].readonly)
+        self.assertTrue(members[production_webidl.NODE_IS_CONNECTED].readonly)
+        text_content = members[production_webidl.NODE_TEXT_CONTENT]
+        self.assertFalse(text_content.readonly)
+        self.assertTrue(text_content.type.nullable())
+        return_type, arguments = members[
+            production_webidl.NODE_HAS_CHILD_NODES
+        ].signatures()[0]
+        self.assertTrue(return_type.isBoolean())
+        self.assertEqual(arguments, [])
 
 
 class SyntheticSelectionTests(unittest.TestCase):
@@ -144,6 +341,18 @@ class SyntheticSelectionTests(unittest.TestCase):
             "`Document.hidden` must use `boolean`, got `long`",
         )
 
+    def test_rejects_unexpected_extended_attribute(self) -> None:
+        self.assert_rejected(
+            "interface Document { [Throws] readonly attribute boolean hidden; };",
+            "`Document.hidden` carries extended attributes that are not implemented: Throws",
+        )
+
+    def test_reports_every_unexpected_extended_attribute(self) -> None:
+        self.assert_rejected(
+            'interface Document { [Throws, Pref="dom.hidden"] readonly attribute boolean hidden; };',
+            "`Document.hidden` carries extended attributes that are not implemented: Pref, Throws",
+        )
+
     def test_rejects_malformed_qualified_name(self) -> None:
         parser_results = self.parse({"Document.webidl": "interface Document { readonly attribute boolean hidden; };"})
         with self.assertRaisesRegex(
@@ -191,6 +400,486 @@ class SyntheticSelectionTests(unittest.TestCase):
         self.assert_bg_color_rejected(
             "[CEReactions] attribute DOMString bgColor;",
             "`Document.bgColor` must carry `[LegacyNullToEmptyString]` on its type",
+        )
+
+    def assert_title_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": f"interface Document {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_writable_domstring_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_TITLE,
+            )
+
+    def test_rejects_title_without_ce_reactions(self) -> None:
+        self.assert_title_rejected(
+            "attribute DOMString title;",
+            "`Document.title` must carry `[CEReactions]`",
+        )
+
+    def test_rejects_readonly_title(self) -> None:
+        self.assert_title_rejected(
+            "readonly attribute DOMString title;",
+            "`Document.title` must be writable",
+        )
+
+    def test_rejects_nullable_title(self) -> None:
+        self.assert_title_rejected(
+            "[CEReactions] attribute DOMString? title;",
+            "`Document.title` must be non-nullable",
+        )
+
+    def test_rejects_non_domstring_title(self) -> None:
+        self.assert_title_rejected(
+            "[CEReactions] attribute USVString title;",
+            "`Document.title` must use `DOMString`, got `USVString`",
+        )
+
+    def test_rejects_title_with_legacy_null_conversion(self) -> None:
+        self.assert_title_rejected(
+            "[CEReactions] attribute [LegacyNullToEmptyString] DOMString title;",
+            "`Document.title` must not carry `[LegacyNullToEmptyString]` on its type",
+        )
+
+    def assert_compat_mode_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": f"interface Document {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_readonly_domstring_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_COMPAT_MODE,
+            )
+
+    def test_rejects_writable_readonly_domstring(self) -> None:
+        self.assert_compat_mode_rejected(
+            "attribute DOMString compatMode;",
+            "`Document.compatMode` must be readonly",
+        )
+
+    def test_rejects_nullable_readonly_domstring(self) -> None:
+        self.assert_compat_mode_rejected(
+            "readonly attribute DOMString? compatMode;",
+            "`Document.compatMode` must be non-nullable",
+        )
+
+    def test_rejects_usvstring_for_readonly_domstring(self) -> None:
+        self.assert_compat_mode_rejected(
+            "readonly attribute USVString compatMode;",
+            "`Document.compatMode` must use `DOMString`, got `USVString`",
+        )
+
+    def test_rejects_unimplemented_readonly_domstring_attribute(self) -> None:
+        self.assert_compat_mode_rejected(
+            "[Throws] readonly attribute DOMString compatMode;",
+            "`Document.compatMode` carries extended attributes that are not implemented: Throws",
+        )
+
+    def test_rejects_bg_color_with_extended_attribute_beyond_ce_reactions(self) -> None:
+        self.assert_bg_color_rejected(
+            "[CEReactions, Throws] attribute [LegacyNullToEmptyString] DOMString bgColor;",
+            "`Document.bgColor` carries extended attributes that are not implemented: Throws",
+        )
+
+    def test_rejects_the_wrong_nullable_interface_return(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface Element {};
+                    interface HTMLHeadElement : Element {};
+                    interface Document { readonly attribute Element? head; };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape("`Document.head` must return `HTMLHeadElement`, got `Element`"),
+        ):
+            production_webidl.select_readonly_nullable_interface_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_HEAD,
+                "HTMLHeadElement",
+            )
+
+    def test_rejects_a_nonnullable_interface_return(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface HTMLHeadElement {};
+                    interface Document { readonly attribute HTMLHeadElement head; };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape("`Document.head` must be nullable"),
+        ):
+            production_webidl.select_readonly_nullable_interface_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_HEAD,
+                "HTMLHeadElement",
+            )
+
+    def assert_get_element_by_id_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": f"""
+                    interface Element {{}};
+                    interface Document {{ {declaration} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_pure_domstring_to_nullable_interface_operation(
+                parser_results,
+                production_webidl.DOCUMENT_GET_ELEMENT_BY_ID,
+                "Element",
+            )
+
+    def test_selects_the_exact_get_element_by_id_operation(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface Element {};
+                    interface Document {
+                      [Pure] Element? getElementById(DOMString elementId);
+                    };
+                """,
+            }
+        )
+
+        method = production_webidl.select_pure_domstring_to_nullable_interface_operation(
+            parser_results,
+            production_webidl.DOCUMENT_GET_ELEMENT_BY_ID,
+            "Element",
+        )
+
+        self.assertTrue(method.isMethod())
+        self.assertTrue(method.getExtendedAttribute("Pure"))
+
+    def test_rejects_get_element_by_id_without_pure(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "Element? getElementById(DOMString elementId);",
+            "`Document.getElementById` must carry `[Pure]`",
+        )
+
+    def test_rejects_unimplemented_get_element_by_id_extended_attribute(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure, Throws] Element? getElementById(DOMString elementId);",
+            "`Document.getElementById` carries extended attributes that are not implemented: Throws",
+        )
+
+    def test_rejects_overloaded_get_element_by_id(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            """
+              [Pure] Element? getElementById(DOMString elementId);
+              [Pure] Element? getElementById(DOMString elementId, DOMString extra);
+            """,
+            "`Document.getElementById` must have exactly one signature, found 2",
+        )
+
+    def test_rejects_nonnullable_get_element_by_id_return(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure] Element getElementById(DOMString elementId);",
+            "`Document.getElementById` must return a nullable interface",
+        )
+
+    def test_rejects_optional_get_element_by_id_argument(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure] Element? getElementById(optional DOMString elementId);",
+            "`Document.getElementById` argument `elementId` must be required and non-variadic",
+        )
+
+    def test_rejects_wrong_get_element_by_id_argument_type(self) -> None:
+        self.assert_get_element_by_id_rejected(
+            "[Pure] Element? getElementById(USVString elementId);",
+            "`Document.getElementById` argument `elementId` must use non-nullable `DOMString`, got `USVString`",
+        )
+
+    def test_rejects_changed_ready_state_enum_values(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    enum DocumentReadyState { "loading", "complete" };
+                    interface Document {
+                      readonly attribute DocumentReadyState readyState;
+                    };
+                """,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(
+                "`Document.readyState` must have the values "
+                "['loading', 'interactive', 'complete'], got ['loading', 'complete']"
+            ),
+        ):
+            production_webidl.select_readonly_enum_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_READY_STATE,
+                production_webidl.DOCUMENT_READY_STATE_VALUES,
+            )
+
+    def assert_timer_rejected(self, declarations: str, member: str, expected: str) -> None:
+        parser_results = self.parse(
+            {
+                "Timers.webidl": f"""
+                    interface TrustedScript {{}};
+                    callback Function = any (any... arguments);
+                    typedef (TrustedScript or DOMString or Function) TimerHandler;
+                    interface mixin WindowOrWorkerGlobalScope {{ {declarations} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_timer_operation(
+                parser_results,
+                f"WindowOrWorkerGlobalScope.{member}",
+            )
+
+    def test_selects_timer_operation_from_interface_mixin(self) -> None:
+        parser_results = self.parse(
+            {
+                "Timers.webidl": """
+                    interface TrustedScript {};
+                    callback Function = any (any... arguments);
+                    typedef (TrustedScript or DOMString or Function) TimerHandler;
+                    interface mixin WindowOrWorkerGlobalScope {
+                      [Throws] long setTimeout(
+                        TimerHandler handler, optional long timeout = 0, any... arguments);
+                    };
+                """,
+            }
+        )
+        method = production_webidl._select_timer_operation(
+            parser_results,
+            production_webidl.WINDOW_OR_WORKER_SET_TIMEOUT,
+        )
+        self.assertEqual(method.identifier.name, "setTimeout")
+
+    def test_rejects_timer_without_throws(self) -> None:
+        self.assert_timer_rejected(
+            "long setTimeout(TimerHandler handler, optional long timeout = 0, any... arguments);",
+            "setTimeout",
+            "`WindowOrWorkerGlobalScope.setTimeout` must carry exactly ['Throws'], got []",
+        )
+
+    def test_rejects_changed_timer_handler_union(self) -> None:
+        self.assert_timer_rejected(
+            "[Throws] long setTimeout((DOMString or Function) handler, optional long timeout = 0, any... arguments);",
+            "setTimeout",
+            "`WindowOrWorkerGlobalScope.setTimeout` handler union must be "
+            "['TrustedScript', 'DOMString', 'Function'], got ['DOMString', 'Function']",
+        )
+
+    def test_rejects_changed_timer_default(self) -> None:
+        self.assert_timer_rejected(
+            "[Throws] long setInterval(TimerHandler handler, optional long timeout = 1, any... arguments);",
+            "setInterval",
+            "`WindowOrWorkerGlobalScope.setInterval` argument `timeout` must be optional "
+            "non-nullable `long` with default 0",
+        )
+
+    def test_rejects_nonvariadic_timer_arguments(self) -> None:
+        self.assert_timer_rejected(
+            "[Throws] long setTimeout(TimerHandler handler, optional long timeout = 0, any arguments);",
+            "setTimeout",
+            "`WindowOrWorkerGlobalScope.setTimeout` must end with variadic `any... arguments`",
+        )
+
+    def test_rejects_changed_clear_signature(self) -> None:
+        self.assert_timer_rejected(
+            "undefined clearTimeout(optional unsigned long handle = 0);",
+            "clearTimeout",
+            "`WindowOrWorkerGlobalScope.clearTimeout` argument `handle` must be optional "
+            "non-nullable `long` with default 0",
+        )
+
+    def assert_console_rejected(
+        self,
+        declaration: str,
+        member: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse(
+            {
+                "Console.webidl": f'''[ClassString="Console", Exposed=*]
+                    namespace console {{ {declaration} }};''',
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_console_log_operation(
+                parser_results,
+                f"console.{member}",
+            )
+
+    def test_selects_console_log_from_namespace(self) -> None:
+        parser_results = self.parse(
+            {
+                "Console.webidl": '''[ClassString="Console", Exposed=*]
+                    namespace console { undefined log(any... messages); };''',
+            }
+        )
+        method = production_webidl._select_console_log_operation(
+            parser_results,
+            production_webidl.CONSOLE_LOG,
+        )
+        self.assertEqual(method.identifier.name, "log")
+
+    def test_rejects_console_logging_return_type_drift(self) -> None:
+        self.assert_console_rejected(
+            "boolean log(any... messages);",
+            "log",
+            "`console.log` must return non-nullable `undefined`, got `boolean`",
+        )
+
+    def test_rejects_nonvariadic_console_logging_arguments(self) -> None:
+        self.assert_console_rejected(
+            "undefined warn(any messages);",
+            "warn",
+            "`console.warn` must take variadic `any... messages`",
+        )
+
+    def test_rejects_console_trace_argument_name_drift(self) -> None:
+        self.assert_console_rejected(
+            "undefined trace(any... messages);",
+            "trace",
+            "`console.trace` must take variadic `any... data`",
+        )
+
+    def test_rejects_console_logging_extended_attributes(self) -> None:
+        self.assert_console_rejected(
+            "[Throws] undefined error(any... messages);",
+            "error",
+            "`console.error` carries extended attributes that are not implemented: Throws",
+        )
+
+    def assert_element_rejected(
+        self,
+        declaration: str,
+        member: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse(
+            {"Element.webidl": f"interface Element {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_element_host_member(
+                parser_results,
+                f"Element.{member}",
+            )
+
+    def test_selects_exact_writable_element_id(self) -> None:
+        parser_results = self.parse(
+            {
+                "Element.webidl": """interface Element {
+                    [CEReactions, Pure] attribute DOMString id;
+                };""",
+            }
+        )
+        member = production_webidl._select_element_host_member(
+            parser_results,
+            production_webidl.ELEMENT_ID,
+        )
+        self.assertFalse(member.readonly)
+
+    def test_rejects_element_id_without_ce_reactions(self) -> None:
+        self.assert_element_rejected(
+            "[Pure] attribute DOMString id;",
+            "id",
+            "`Element.id` must carry exactly ['CEReactions', 'Pure'], got ['Pure']",
+        )
+
+    def test_rejects_nonnullable_get_attribute_return(self) -> None:
+        self.assert_element_rejected(
+            "[Pure] DOMString getAttribute(DOMString name);",
+            "getAttribute",
+            "`Element.getAttribute` must return nullable `DOMString`, got `DOMString`",
+        )
+
+    def test_rejects_optional_has_attribute_name(self) -> None:
+        self.assert_element_rejected(
+            "boolean hasAttribute(optional DOMString name);",
+            "hasAttribute",
+            "`Element.hasAttribute` must take required non-nullable `DOMString name`",
+        )
+
+    def assert_node_rejected(
+        self,
+        declaration: str,
+        member: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse(
+            {"Node.webidl": f"interface Node {{ {declaration} }};"}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_node_host_member(
+                parser_results,
+                f"Node.{member}",
+            )
+
+    def test_selects_exact_nullable_node_text_content(self) -> None:
+        parser_results = self.parse(
+            {
+                "Node.webidl": """interface Node {
+                    [CEReactions, Pure, SetterThrows]
+                    attribute DOMString? textContent;
+                };""",
+            }
+        )
+        member = production_webidl._select_node_host_member(
+            parser_results,
+            production_webidl.NODE_TEXT_CONTENT,
+        )
+        self.assertFalse(member.readonly)
+        self.assertTrue(member.type.nullable())
+
+    def test_rejects_node_text_content_without_setter_throws(self) -> None:
+        self.assert_node_rejected(
+            "[CEReactions, Pure] attribute DOMString? textContent;",
+            "textContent",
+            "`Node.textContent` must carry exactly ['CEReactions', 'Pure', 'SetterThrows'], "
+            "got ['CEReactions', 'Pure']",
+        )
+
+    def test_rejects_nullable_node_name(self) -> None:
+        self.assert_node_rejected(
+            "[Pure] readonly attribute DOMString? nodeName;",
+            "nodeName",
+            "`Node.nodeName` must use non-nullable `DOMString`, got `DOMString?`",
+        )
+
+    def test_rejects_has_child_nodes_arguments(self) -> None:
+        self.assert_node_rejected(
+            "[Pure] boolean hasChildNodes(boolean unexpected);",
+            "hasChildNodes",
+            "`Node.hasChildNodes` must take no arguments, found 1",
         )
 
 

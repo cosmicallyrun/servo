@@ -149,6 +149,52 @@ pub(crate) enum OneshotTimerCallback {
     },
 }
 
+/// The prologue directive that opts a SpiderMonkey-created string timer into V8.
+///
+/// A timer handler is a bare source string with no element to carry the
+/// `data-servo-v8` attribute the other authoritative routes use, so the marker
+/// has to travel inside the source. A prologue directive is the one construct
+/// that already does that in JavaScript, and like `"use strict"` it evaluates
+/// to a harmless expression statement in engines that do not recognise it.
+/// Strings scheduled through V8's native timer host use their originating V8
+/// realm directly and do not need this marker.
+#[cfg(feature = "v8-classic-script-authoritative")]
+const V8_TIMER_DIRECTIVE: &str = "use servo-v8";
+
+/// Chooses the engine for a string timer handler.
+///
+/// SpiderMonkey-scheduled string handlers keep this explicit directive route.
+/// A handler scheduled through V8's own timer globals uses a distinct callback
+/// variant below, so it stays in its originating engine without a marker.
+#[cfg(feature = "v8-classic-script-authoritative")]
+fn classic_timer_engine(handler: &str) -> ClassicScriptEngine {
+    let prologue = handler.trim_start();
+    let opts_in = [
+        format!("\"{V8_TIMER_DIRECTIVE}\""),
+        format!("'{V8_TIMER_DIRECTIVE}'"),
+    ]
+    .iter()
+    .any(|directive| {
+        // Only a genuine prologue directive counts, so a longer string merely
+        // starting with these characters cannot opt in by accident.
+        prologue.strip_prefix(directive.as_str()).is_some_and(|rest| {
+            rest.trim_start()
+                .starts_with([';', '\n', '\r'].as_slice()) ||
+                rest.trim().is_empty()
+        })
+    });
+    if opts_in {
+        ClassicScriptEngine::V8Authoritative
+    } else {
+        ClassicScriptEngine::SpiderMonkey
+    }
+}
+
+#[cfg(not(feature = "v8-classic-script-authoritative"))]
+fn classic_timer_engine(_handler: &str) -> ClassicScriptEngine {
+    ClassicScriptEngine::SpiderMonkey
+}
+
 impl OneshotTimerCallback {
     fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers, cx: &mut JSContext) {
         match self {
@@ -570,6 +616,10 @@ pub(crate) struct JsTimers {
 #[derive(JSTraceable, MallocSizeOf)]
 struct JsTimerEntry {
     oneshot_handle: OneshotTimerHandle,
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    #[no_trace]
+    #[ignore_malloc_size_of = "opaque V8 realm and callback IDs"]
+    v8_callback: Option<(servo_v8::RealmId, servo_v8::TimerCallbackId)>,
 }
 
 // Holder for the various JS values associated with setTimeout
@@ -598,6 +648,10 @@ pub(crate) enum IsInterval {
 pub(crate) enum TimerCallback {
     StringTimerCallback(TrustedScriptOrString),
     FunctionTimerCallback(Rc<Function>),
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    V8StringTimerCallback(TrustedScriptOrString),
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    V8FunctionTimerCallback(servo_v8::RealmId, servo_v8::TimerCallbackId),
 }
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
@@ -608,6 +662,27 @@ enum InternalTimerCallback {
         #[conditional_malloc_size_of] Rc<Function>,
         #[ignore_malloc_size_of = "mozjs"] Rc<Box<[Heap<JSVal>]>>,
     ),
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    V8StringTimerCallback(DOMString, InitiatingScriptFetchInfo),
+    #[cfg(feature = "v8-classic-script-authoritative")]
+    V8FunctionTimerCallback(
+        #[no_trace]
+        #[ignore_malloc_size_of = "opaque V8 realm ID"]
+        servo_v8::RealmId,
+        #[no_trace]
+        #[ignore_malloc_size_of = "opaque V8 callback ID"]
+        servo_v8::TimerCallbackId,
+    ),
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+impl InternalTimerCallback {
+    fn v8_function_id(&self) -> Option<(servo_v8::RealmId, servo_v8::TimerCallbackId)> {
+        match self {
+            Self::V8FunctionTimerCallback(realm_id, callback_id) => Some((*realm_id, *callback_id)),
+            _ => None,
+        }
+    }
 }
 
 impl Default for JsTimers {
@@ -637,45 +712,31 @@ impl JsTimers {
     ) -> Fallible<i32> {
         let callback = match callback {
             TimerCallback::StringTimerCallback(trusted_script_or_string) => {
-                // Step 9.6.1.1. Let globalName be "Window" if global is a Window object; "WorkerGlobalScope" otherwise.
-                let global_name = if global.is::<Window>() {
-                    "Window"
-                } else {
-                    "WorkerGlobalScope"
-                };
-                // Step 9.6.1.2. Let methodName be "setInterval" if repeat is true; "setTimeout" otherwise.
-                let method_name = if is_interval == IsInterval::Interval {
-                    "setInterval"
-                } else {
-                    "setTimeout"
-                };
-                // Step 9.6.1.3. Let sink be a concatenation of globalName, U+0020 SPACE, and methodName.
-                let sink = format!("{} {}", global_name, method_name);
-                // Step 9.6.1.4. Set handler to the result of invoking the
-                // Get Trusted Type compliant string algorithm with TrustedScript, global, handler, sink, and "script".
-                let code_str = TrustedScript::get_trusted_type_compliant_string(
+                let Some(callback) = self.prepare_string_timer_callback(
                     cx,
                     global,
                     trusted_script_or_string,
-                    &sink,
-                )?;
-
-                let initiating_script_fetch_info = active_script_fetch_info(cx, global);
-
-                // Step 9.6.3. Perform EnsureCSPDoesNotBlockStringCompilation(realm, « », handler, handler, timer, « », handler).
-                // If this throws an exception, catch it, report it for global, and abort these steps.
-                if global
-                    .get_csp_list()
-                    .is_js_evaluation_allowed(cx, global, &code_str.str())
-                {
-                    // Step 9.6.2. Assert: handler is a string.
-                    InternalTimerCallback::StringTimerCallback(
-                        code_str,
-                        initiating_script_fetch_info,
-                    )
-                } else {
+                    is_interval,
+                    false,
+                )?
+                else {
                     return Ok(0);
-                }
+                };
+                callback
+            },
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            TimerCallback::V8StringTimerCallback(trusted_script_or_string) => {
+                let Some(callback) = self.prepare_string_timer_callback(
+                    cx,
+                    global,
+                    trusted_script_or_string,
+                    is_interval,
+                    true,
+                )?
+                else {
+                    return Ok(0);
+                };
+                callback
             },
             TimerCallback::FunctionTimerCallback(function) => {
                 // This is a bit complicated, but this ensures that the vector's
@@ -693,6 +754,11 @@ impl JsTimers {
                     function,
                     Rc::new(args.into_boxed_slice()),
                 )
+            },
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            TimerCallback::V8FunctionTimerCallback(realm_id, callback_id) => {
+                debug_assert!(arguments.is_empty());
+                InternalTimerCallback::V8FunctionTimerCallback(realm_id, callback_id)
             },
         };
 
@@ -724,11 +790,75 @@ impl JsTimers {
         Ok(new_handle)
     }
 
+    fn prepare_string_timer_callback(
+        &self,
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        trusted_script_or_string: TrustedScriptOrString,
+        is_interval: IsInterval,
+        #[cfg_attr(
+            not(feature = "v8-classic-script-authoritative"),
+            expect(unused_variables)
+        )]
+        force_v8: bool,
+    ) -> Fallible<Option<InternalTimerCallback>> {
+        // Step 9.6.1.1. Let globalName be "Window" if global is a Window object; "WorkerGlobalScope" otherwise.
+        let global_name = if global.is::<Window>() {
+            "Window"
+        } else {
+            "WorkerGlobalScope"
+        };
+        // Step 9.6.1.2. Let methodName be "setInterval" if repeat is true; "setTimeout" otherwise.
+        let method_name = if is_interval == IsInterval::Interval {
+            "setInterval"
+        } else {
+            "setTimeout"
+        };
+        // Step 9.6.1.3. Let sink be a concatenation of globalName, U+0020 SPACE, and methodName.
+        let sink = format!("{} {}", global_name, method_name);
+        // Step 9.6.1.4. Set handler to the result of invoking the
+        // Get Trusted Type compliant string algorithm with TrustedScript, global, handler, sink, and "script".
+        let code_str = TrustedScript::get_trusted_type_compliant_string(
+            cx,
+            global,
+            trusted_script_or_string,
+            &sink,
+        )?;
+
+        let initiating_script_fetch_info = active_script_fetch_info(cx, global);
+
+        // Step 9.6.3. Perform EnsureCSPDoesNotBlockStringCompilation(realm, « », handler, handler, timer, « », handler).
+        // If this throws an exception, catch it, report it for global, and abort these steps.
+        if !global
+            .get_csp_list()
+            .is_js_evaluation_allowed(cx, global, &code_str.str())
+        {
+            return Ok(None);
+        }
+
+        // Step 9.6.2. Assert: handler is a string.
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        if force_v8 {
+            return Ok(Some(InternalTimerCallback::V8StringTimerCallback(
+                code_str,
+                initiating_script_fetch_info,
+            )));
+        }
+        Ok(Some(InternalTimerCallback::StringTimerCallback(
+            code_str,
+            initiating_script_fetch_info,
+        )))
+    }
+
     pub(crate) fn clear_timeout_or_interval(&self, global: &GlobalScope, handle: i32) {
         let mut active_timers = self.active_timers.borrow_mut();
 
         if let Some(entry) = active_timers.remove(&JsTimerHandle(handle)) {
             global.unschedule_callback(entry.oneshot_handle);
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            if let Some((realm_id, callback_id)) = entry.v8_callback {
+                ScriptThread::clear_authoritative_v8_timer_callback(realm_id, callback_id);
+            }
         }
     }
 
@@ -751,6 +881,8 @@ impl JsTimers {
     /// <https://html.spec.whatwg.org/multipage/#timer-initialisation-steps>
     fn initialize_and_schedule(&self, global: &GlobalScope, mut task: JsTimerTask) {
         let handle = task.handle;
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        let v8_callback = task.callback.v8_function_id();
         let mut active_timers = self.active_timers.borrow_mut();
 
         // Step 3. If the surrounding agent's event loop's currently running task
@@ -769,9 +901,11 @@ impl JsTimers {
         let oneshot_handle = global.schedule_callback(callback, duration);
 
         // Step 14. Set global's map of setTimeout and setInterval IDs[id] to uniqueHandle.
-        let entry = active_timers
-            .entry(handle)
-            .or_insert(JsTimerEntry { oneshot_handle });
+        let entry = active_timers.entry(handle).or_insert(JsTimerEntry {
+            oneshot_handle,
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            v8_callback,
+        });
         entry.oneshot_handle = oneshot_handle;
     }
 }
@@ -793,43 +927,66 @@ impl JsTimerTask {
         // prep for step ? in nested set_timeout_or_interval calls
         timers.nesting_level.set(self.nesting_level);
 
+        // A one-shot is no longer active before its callback runs. Apart from
+        // matching HTML, this releases its cross-engine bookkeeping even when
+        // the callback clears its own already-fired handle.
+        if self.is_interval == IsInterval::NonInterval {
+            timers.active_timers.borrow_mut().remove(&self.handle);
+        }
+
         let _guard = ScriptThread::user_interacting_guard();
-        match self.callback {
-            InternalTimerCallback::StringTimerCallback(ref code_str, ref fetch_info) => {
-                // Step 6.4. Let settings object be global's relevant settings object.
-                // Step 6. Let realm be global's relevant realm.
-                let global = this.global();
-
-                // Note: the steps to retrieve *fetch options* and *base URL* are performed in
-                // `active_script_fetch_info`.
-                let InitiatingScriptFetchInfo {
-                    fetch_options,
-                    base_url,
-                } = fetch_info.clone();
-
-                // Step 9.6.8. Let script be the result of creating a classic script given handler,
-                // settings object, base URL, and fetch options.
-                let script = global.create_a_classic_script(
+        match &self.callback {
+            InternalTimerCallback::StringTimerCallback(code_str, fetch_info) => {
+                self.invoke_string(
+                    this,
                     cx,
-                    (*code_str.str()).into(),
-                    base_url,
-                    fetch_options,
-                    ErrorReporting::Unmuted,
-                    Some(IntroductionType::DOM_TIMER),
-                    1,
-                    false,
-                    ClassicScriptEngine::SpiderMonkey,
+                    code_str,
+                    fetch_info,
+                    classic_timer_engine(&code_str.str()),
                 );
-
-                // Step 9.6.9. Run the classic script script.
-                _ = global.run_a_classic_script(cx, script, RethrowErrors::No);
+            },
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            InternalTimerCallback::V8StringTimerCallback(code_str, fetch_info) => {
+                self.invoke_string(
+                    this,
+                    cx,
+                    code_str,
+                    fetch_info,
+                    ClassicScriptEngine::V8Authoritative,
+                );
             },
             // Step 9.5. If handler is a Function, then invoke handler given arguments and
             // "report", and with callback this value set to thisArg.
-            InternalTimerCallback::FunctionTimerCallback(ref function, ref arguments) => {
+            InternalTimerCallback::FunctionTimerCallback(function, arguments) => {
                 let arguments = self.collect_heap_args(arguments);
                 rooted!(&in(cx) let mut value: JSVal);
                 let _ = function.Call_(cx, this, arguments, value.handle_mut(), Report);
+            },
+            #[cfg(feature = "v8-classic-script-authoritative")]
+            InternalTimerCallback::V8FunctionTimerCallback(realm_id, callback_id) => {
+                let global = this.global();
+                let TimerSource::FromWindow(pipeline_id) = self.source else {
+                    unreachable!("V8 timer callbacks are currently Window-only")
+                };
+                match ScriptThread::run_authoritative_v8_timer_callback(
+                    pipeline_id,
+                    *realm_id,
+                    *callback_id,
+                    cx,
+                ) {
+                    Ok(servo_v8::ScriptRunOutcome::Completed) => {},
+                    Ok(servo_v8::ScriptRunOutcome::Thrown(exception)) => {
+                        _ = global.report_v8_classic_script_error(
+                            cx,
+                            exception,
+                            ErrorReporting::Unmuted,
+                        );
+                    },
+                    Ok(servo_v8::ScriptRunOutcome::Terminated) => {
+                        warn!("authoritative V8 timer callback was terminated")
+                    },
+                    Err(error) => warn!("authoritative V8 timer callback could not run: {error}"),
+                }
             },
         };
 
@@ -850,6 +1007,38 @@ impl JsTimerTask {
 
     fn collect_heap_args<'b>(&self, args: &'b [Heap<JSVal>]) -> Vec<HandleValue<'b>> {
         args.iter().map(|arg| arg.as_handle_value()).collect()
+    }
+
+    fn invoke_string<T: DomObject>(
+        &self,
+        this: &T,
+        cx: &mut JSContext,
+        code_str: &DOMString,
+        fetch_info: &InitiatingScriptFetchInfo,
+        engine: ClassicScriptEngine,
+    ) {
+        // Step 6.4. Let settings object be global's relevant settings object.
+        // Step 6. Let realm be global's relevant realm.
+        let global = this.global();
+        let InitiatingScriptFetchInfo {
+            fetch_options,
+            base_url,
+        } = fetch_info.clone();
+        // Step 9.6.8. Let script be the result of creating a classic script given handler,
+        // settings object, base URL, and fetch options.
+        let script = global.create_a_classic_script(
+            cx,
+            (*code_str.str()).into(),
+            base_url,
+            fetch_options,
+            ErrorReporting::Unmuted,
+            Some(IntroductionType::DOM_TIMER),
+            1,
+            false,
+            engine,
+        );
+        // Step 9.6.9. Run the classic script script.
+        _ = global.run_a_classic_script(cx, script, RethrowErrors::No);
     }
 }
 

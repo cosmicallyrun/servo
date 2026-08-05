@@ -1,0 +1,34 @@
+<!doctype html>
+<!--
+Runtime proof that the authoritative route already covers EXTERNAL
+parser-blocking classic scripts, not only inline ones.
+
+The gate in HTMLScriptElement keys on ExternalScriptKind::ParsingBlocking,
+which classifies inline and external parser-blocking scripts alike, and the
+selected engine is carried on the fetch context to the external creation site.
+So no additional wiring was needed for this case.
+
+Same counting argument as authoritative_bgcolor_proof.html: the body starts red
+and the script toggles document.bgColor once per execution, so lime is only
+reachable when V8 alone executed it.
+
+Build and run:
+
+  cargo build -p servoshell --features v8-classic-script-authoritative
+  RUST_LOG=warn,script::script_thread=debug \
+    target/debug/servoshell -z -x --hard-fail \
+      -o /tmp/authoritative_external_proof.png \
+      support/v8/authoritative_external_proof.html
+
+Every pixel must be lime, and realm teardown must report exactly one bgColor
+getter and one bgColor setter host call.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative external classic-script proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative" src="authoritative_external.js"></script>
+  </body>
+</html>

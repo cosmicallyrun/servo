@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+Runtime proof that an async authoritative classic script runs on V8.
+
+Async scripts run unordered, off the parser's critical path, whenever their
+fetch completes.
+
+Same counting argument as authoritative_bgcolor_proof.html: the body starts red
+and the script toggles document.bgColor once per execution, so lime is only
+reachable when V8 alone executed it exactly once.
+
+Run via support/v8/run_proofs.sh, or directly:
+
+  RUST_LOG=warn,script::script_thread=debug \
+    target/debug/servoshell -z -x --hard-fail -o /tmp/proof.png \
+      support/v8/authoritative_async_proof.html
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative async proof</title>
+    <script data-servo-v8="authoritative" async src="authoritative_external.js"></script>
+  </head>
+  <body bgcolor="red">
+
+  </body>
+</html>
