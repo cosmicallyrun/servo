@@ -75,7 +75,8 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Node.nodeType`, `Document.documentElement`, `Document.head`, and
 `Document.firstElementChild`, `Document.lastElementChild`,
 `Document.childElementCount`, `Document.getElementById`, and
-`Document.querySelector`, plus `Element.closest`, `Element.matches`, and
+`Document.querySelector`, `Document.querySelectorAll`, plus
+`Element.querySelectorAll`, `Element.closest`, `Element.matches`, and
 `Element.webkitMatchesSelector`, declarations in
 Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
@@ -138,8 +139,19 @@ SpiderMonkey exception while V8 is executing. Each realm instead retains its
 own V8-native `DOMException` constructor and prototype. Invalid selectors
 throw a V8-owned native error with the production name, message and legacy
 code, while successful `closest` results reuse the same weak wrapper cache as
-the other Element-returning paths. ABI v26 adds the boolean outcome and the
-three Element selector-method callbacks.
+the other Element-returning paths.
+
+`Document.querySelectorAll` and `Element.querySelectorAll` reuse that parser
+without constructing an unused SpiderMonkey `NodeList`. Servo first roots the
+matched `Element` vector as a static snapshot, then ABI v27 transfers one
+fresh, uncached NodeList host to V8. The wrapper exposes `length`, `item`,
+enumerable indexed values, and Web IDL's realm-local Array iterator/forEach
+intrinsics. Its items still converge on the Element wrapper cache, while the
+collection host itself is weakly tracked for GC and synchronously released on
+realm teardown. The current indexed surface is deliberately a facade: ordinary
+read-only numeric properties reproduce lookup, enumeration and iteration, but
+not every `LegacyPlatformObject` edge case involving deletion, redefinition or
+`preventExtensions`.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -385,6 +397,9 @@ The proof suite uses that same counting argument:
 | `authoritative_element_scalar_proof.html` | common Element scalar reads and mutations use the live Servo DOM with WebIDL prototype semantics |
 | `authoritative_node_scalar_proof.html` | Element wrappers inherit common Node scalars and text mutation through a real Node prototype |
 | `authoritative_parent_node_proof.html` | Document and Element traversal share stable wrappers and update after live child mutation |
+| `authoritative_query_selector_proof.html` | Document and Element selector queries use Servo's parser, V8 DOMException, and stable wrappers |
+| `authoritative_element_selector_methods_proof.html` | Element matching and closest operations preserve conversion, SyntaxError, and identity semantics |
+| `authoritative_query_selector_all_proof.html` | static rooted NodeLists survive real tree mutation and expose indexed/iterable WebIDL behavior |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -408,7 +423,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 26 and remains experimental. The original
+The current exported C ABI is version 27 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

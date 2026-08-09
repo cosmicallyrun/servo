@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 26u
+#define SERVO_V8_ABI_VERSION 27u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -153,8 +153,24 @@ typedef struct ServoV8ElementHostVTable {
                                      const uint8_t* selectors,
                                      size_t selectors_length,
                                      ServoV8SelectorBooleanOutcome* output);
+  uint8_t (*query_selector_all)(void* native,
+                                void* host_context,
+                                const uint8_t* selectors,
+                                size_t selectors_length,
+                                ServoV8SelectorNodeListOutcome* output);
   ServoV8DropCallback drop;
 } ServoV8ElementHostVTable;
+
+/* One static NodeList returned by querySelectorAll. The host owns strong Servo
+ * roots for the result snapshot; item() transfers a fresh Element host whose
+ * wrapper is deduplicated by the realm cache. */
+typedef struct ServoV8NodeListHostVTable {
+  uint8_t (*get_length)(void* native, uint32_t* output);
+  uint8_t (*item)(void* native,
+                  uint32_t index,
+                  ServoV8InterfaceValue* output);
+  ServoV8DropCallback drop;
+} ServoV8NodeListHostVTable;
 
 /* A realm-owned host for HTML's timer scheduling algorithms.
  *
@@ -340,6 +356,12 @@ int32_t servo_v8_realm_document_hidden(ServoV8Runtime* runtime,
 int32_t servo_v8_install_element_host(
     ServoV8Runtime* runtime,
     const ServoV8ElementHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Registers the type-level static NodeList host vtable for this runtime. */
+int32_t servo_v8_install_node_list_host(
+    ServoV8Runtime* runtime,
+    const ServoV8NodeListHostVTable* vtable,
     ServoV8ErrorBuffer* error);
 
 int32_t servo_v8_install_engine_binding_smoke(

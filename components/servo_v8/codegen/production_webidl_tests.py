@@ -128,6 +128,11 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertEqual(return_type.inner.name, "Element")
         self.assertEqual(arguments[0].identifier.name, "elementId")
         self.assertTrue(arguments[0].type.isDOMString())
+        query_all = attributes[production_webidl.DOCUMENT_QUERY_SELECTOR_ALL]
+        return_type, arguments = query_all.signatures()[0]
+        self.assertEqual(return_type.name, "NodeList")
+        self.assertEqual(arguments[0].identifier.name, "selectors")
+        self.assertEqual(set(query_all._extendedAttrDict), {"NewObject", "Throws"})
 
     def test_pins_each_real_enum_value_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -258,6 +263,11 @@ class ProductionElementTests(unittest.TestCase):
                 self.assertTrue(return_type.isBoolean())
                 self.assertEqual(arguments[0].identifier.name, "selectors")
                 self.assertEqual(set(method._extendedAttrDict), {"Pure", "Throws"})
+        query_all_return, query_all_arguments = members[
+            production_webidl.ELEMENT_QUERY_SELECTOR_ALL
+        ].signatures()[0]
+        self.assertEqual(query_all_return.name, "NodeList")
+        self.assertEqual(query_all_arguments[0].identifier.name, "selectors")
 
 
 class ProductionNodeTests(unittest.TestCase):
@@ -807,6 +817,101 @@ class SyntheticSelectionTests(unittest.TestCase):
             "[Pure, Throws] boolean matches(optional DOMString selectors);",
             "matches",
             "`Element.matches` argument `selectors` must be required and non-variadic",
+        )
+
+    def assert_query_selector_all_rejected(
+        self, declaration: str, expected: str
+    ) -> None:
+        parser_results = self.parse(
+            {
+                "ParentNode.webidl": f"""
+                    interface NodeList {{}};
+                    interface Document {{ {declaration} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_newobject_throws_domstring_to_interface_operation(
+                parser_results,
+                production_webidl.DOCUMENT_QUERY_SELECTOR_ALL,
+                "NodeList",
+            )
+
+    def test_selects_exact_query_selector_all(self) -> None:
+        parser_results = self.parse(
+            {
+                "ParentNode.webidl": """
+                    interface NodeList {};
+                    interface Document {
+                      [NewObject, Throws] NodeList querySelectorAll(DOMString selectors);
+                    };
+                """,
+            }
+        )
+        method = production_webidl.select_newobject_throws_domstring_to_interface_operation(
+            parser_results,
+            production_webidl.DOCUMENT_QUERY_SELECTOR_ALL,
+            "NodeList",
+        )
+        self.assertEqual(set(method._extendedAttrDict), {"NewObject", "Throws"})
+
+    def test_rejects_query_selector_all_without_newobject(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[Throws] NodeList querySelectorAll(DOMString selectors);",
+            "`Document.querySelectorAll` must carry exactly ['NewObject', 'Throws'], got ['Throws']",
+        )
+
+    def test_rejects_query_selector_all_without_throws(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject] NodeList querySelectorAll(DOMString selectors);",
+            "`Document.querySelectorAll` must carry exactly ['NewObject', 'Throws'], got ['NewObject']",
+        )
+
+    def test_rejects_query_selector_all_extra_attributes(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject, SecureContext, Throws] NodeList querySelectorAll(DOMString selectors);",
+            "`Document.querySelectorAll` must carry exactly ['NewObject', 'Throws'], "
+            "got ['NewObject', 'SecureContext', 'Throws']",
+        )
+
+    def test_rejects_query_selector_all_nullable_return(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject, Throws] NodeList? querySelectorAll(DOMString selectors);",
+            "`Document.querySelectorAll` must return a non-nullable interface, got `NodeList?`",
+        )
+
+    def test_rejects_query_selector_all_argument_drift(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject, Throws] NodeList querySelectorAll(optional DOMString selectors);",
+            "`Document.querySelectorAll` argument `selectors` must be required and non-variadic",
+        )
+
+    def test_rejects_query_selector_all_wrong_interface(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject, Throws] Document querySelectorAll(DOMString selectors);",
+            "`Document.querySelectorAll` must return `NodeList`, got `Document`",
+        )
+
+    def test_rejects_query_selector_all_wrong_argument_type(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject, Throws] NodeList querySelectorAll(long selectors);",
+            "`Document.querySelectorAll` argument `selectors` must use non-nullable "
+            "`DOMString`, got `long`",
+        )
+
+    def test_rejects_query_selector_all_extra_argument(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject, Throws] NodeList querySelectorAll(DOMString selectors, boolean extra);",
+            "`Document.querySelectorAll` must take exactly one argument, found 2",
+        )
+
+    def test_rejects_static_query_selector_all(self) -> None:
+        self.assert_query_selector_all_rejected(
+            "[NewObject, Throws] static NodeList querySelectorAll(DOMString selectors);",
+            "`Document.querySelectorAll` must be an ordinary instance operation",
         )
 
     def test_rejects_changed_ready_state_enum_values(self) -> None:

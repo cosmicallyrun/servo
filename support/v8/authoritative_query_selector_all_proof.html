@@ -1,0 +1,256 @@
+<!doctype html>
+<!--
+Runtime proof for Document/Element querySelectorAll() and the static NodeList
+facade. The authoritative V8 script keeps a result across a real Servo DOM
+mutation; SpiderMonkey then verifies that the native tree was actually changed.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative querySelectorAll proof</title>
+    <style>
+      .fixture {
+        display: none;
+      }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="target" class="fixture pick">
+      <span id="first" class="pick">first</span>
+      <em id="second" class="pick">second</em>
+    </section>
+    <script data-servo-v8="authoritative">
+      const target = document.querySelector("#target");
+      const firstBeforeMutation = document.querySelector("#first");
+      const documentList = document.querySelectorAll(".pick");
+      const freshDocumentList = document.querySelectorAll(".pick");
+      const descendants = target.querySelectorAll(".pick");
+
+      const documentDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document),
+        "querySelectorAll",
+      );
+      const elementDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(target),
+        "querySelectorAll",
+      );
+      if (
+        !documentDescriptor ||
+        !elementDescriptor ||
+        documentDescriptor.value.name !== "querySelectorAll" ||
+        elementDescriptor.value.name !== "querySelectorAll" ||
+        documentDescriptor.value.length !== 1 ||
+        elementDescriptor.value.length !== 1 ||
+        !documentDescriptor.writable ||
+        !documentDescriptor.enumerable ||
+        !documentDescriptor.configurable ||
+        !elementDescriptor.writable ||
+        !elementDescriptor.enumerable ||
+        !elementDescriptor.configurable ||
+        Object.hasOwn(document, "querySelectorAll") ||
+        Object.hasOwn(target, "querySelectorAll")
+      ) {
+        throw new Error("bad querySelectorAll descriptors");
+      }
+
+      let wrongBrandStringified = false;
+      for (const descriptor of [documentDescriptor, elementDescriptor]) {
+        let rejected = false;
+        try {
+          descriptor.value.call({}, {
+            toString() {
+              wrongBrandStringified = true;
+              return ".pick";
+            },
+          });
+        } catch (error) {
+          rejected = error instanceof TypeError;
+        }
+        if (!rejected) {
+          throw new Error("querySelectorAll accepted the wrong receiver");
+        }
+      }
+      if (wrongBrandStringified) {
+        throw new Error("querySelectorAll converted before its brand check");
+      }
+
+      const conversionError = new Error("querySelectorAll conversion sentinel");
+      for (const receiver of [document, target]) {
+        let preserved = false;
+        try {
+          receiver.querySelectorAll({
+            toString() {
+              throw conversionError;
+            },
+          });
+        } catch (error) {
+          preserved = error === conversionError;
+        }
+        let missingRejected = false;
+        let symbolRejected = false;
+        try {
+          receiver.querySelectorAll();
+        } catch (error) {
+          missingRejected = error instanceof TypeError;
+        }
+        try {
+          receiver.querySelectorAll(Symbol("pick"));
+        } catch (error) {
+          symbolRejected = error instanceof TypeError;
+        }
+        if (!preserved || !missingRejected || !symbolRejected) {
+          throw new Error("bad querySelectorAll WebIDL conversion");
+        }
+      }
+
+      const prototype = NodeList.prototype;
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(prototype, "length");
+      const itemDescriptor = Object.getOwnPropertyDescriptor(prototype, "item");
+      const iterableNames = ["values", "keys", "entries", "forEach"];
+      if (
+        documentList === freshDocumentList ||
+        !(documentList instanceof NodeList) ||
+        Object.getPrototypeOf(documentList) !== prototype ||
+        Object.prototype.toString.call(documentList) !== "[object NodeList]" ||
+        NodeList.name !== "NodeList" ||
+        NodeList.length !== 0 ||
+        prototype.constructor !== NodeList ||
+        !lengthDescriptor ||
+        lengthDescriptor.set !== undefined ||
+        !lengthDescriptor.enumerable ||
+        !lengthDescriptor.configurable ||
+        !itemDescriptor ||
+        itemDescriptor.value.name !== "item" ||
+        itemDescriptor.value.length !== 1 ||
+        !itemDescriptor.writable ||
+        !itemDescriptor.enumerable ||
+        !itemDescriptor.configurable ||
+        iterableNames.some((name) => {
+          const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+          return (
+            !descriptor ||
+            descriptor.value !== Array.prototype[name] ||
+            !descriptor.writable ||
+            !descriptor.enumerable ||
+            !descriptor.configurable
+          );
+        }) ||
+        prototype.values !== prototype[Symbol.iterator]
+      ) {
+        throw new Error("bad NodeList interface surface");
+      }
+
+      let illegalCall = false;
+      let illegalConstruction = false;
+      try {
+        NodeList();
+      } catch (error) {
+        illegalCall = error instanceof TypeError;
+      }
+      try {
+        new NodeList();
+      } catch (error) {
+        illegalConstruction = error instanceof TypeError;
+      }
+      if (!illegalCall || !illegalConstruction) {
+        throw new Error("NodeList constructor was not illegal");
+      }
+
+      if (
+        documentList.length !== 3 ||
+        descendants.length !== 2 ||
+        documentList[0] !== target ||
+        documentList[1] !== firstBeforeMutation ||
+        documentList.item(1) !== documentList[1] ||
+        documentList.item(99) !== null ||
+        descendants[0] !== firstBeforeMutation ||
+        target.querySelectorAll("#target").length !== 0 ||
+        Object.keys(documentList).join(",") !== "0,1,2"
+      ) {
+        throw new Error("bad static NodeList contents, scope, or identity");
+      }
+
+      const indexDescriptor = Object.getOwnPropertyDescriptor(documentList, "0");
+      const iterated = Array.from(documentList);
+      const keys = Array.from(documentList.keys());
+      const entries = Array.from(documentList.entries());
+      let forEachGood = true;
+      let forEachCount = 0;
+      documentList.forEach((value, index, receiver) => {
+        forEachGood &&= receiver === documentList && value === documentList[index];
+        forEachCount++;
+      });
+      const genericValue = prototype.values
+        .call({ 0: "generic", length: 1 })
+        .next().value;
+      if (
+        !indexDescriptor ||
+        indexDescriptor.writable ||
+        !indexDescriptor.enumerable ||
+        !indexDescriptor.configurable ||
+        iterated.length !== 3 ||
+        !iterated.every((value, index) => value === documentList[index]) ||
+        keys.join(",") !== "0,1,2" ||
+        !entries.every(
+          (entry, index) => entry[0] === index && entry[1] === documentList[index],
+        ) ||
+        !forEachGood ||
+        forEachCount !== 3 ||
+        genericValue !== "generic"
+      ) {
+        throw new Error("bad NodeList indexing or iteration");
+      }
+
+      const syntaxMessage = "The string did not match the expected pattern.";
+      for (const callback of [
+        () => document.querySelectorAll("["),
+        () => target.querySelectorAll("["),
+      ]) {
+        let syntaxError;
+        try {
+          callback();
+        } catch (error) {
+          syntaxError = error;
+        }
+        if (
+          !(syntaxError instanceof DOMException) ||
+          syntaxError.name !== "SyntaxError" ||
+          syntaxError.message !== syntaxMessage ||
+          syntaxError.code !== 12
+        ) {
+          throw new Error("bad querySelectorAll SyntaxError DOMException");
+        }
+      }
+
+      const firstSnapshot = descendants[0];
+      const secondSnapshot = descendants[1];
+      target.textContent = "";
+      if (
+        target.childElementCount !== 0 ||
+        descendants.length !== 2 ||
+        descendants[0] !== firstSnapshot ||
+        descendants.item(1) !== secondSnapshot ||
+        firstSnapshot.tagName !== "SPAN" ||
+        secondSnapshot.tagName !== "EM" ||
+        firstSnapshot.isConnected ||
+        secondSnapshot.isConnected ||
+        documentList.length !== 3 ||
+        documentList[1] !== firstSnapshot ||
+        document.querySelectorAll("#first").length !== 0
+      ) {
+        throw new Error("querySelectorAll result was not a static rooted snapshot");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      if (
+        document.getElementById("target").childElementCount !== 0 ||
+        document.getElementById("first") !== null ||
+        document.getElementById("second") !== null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

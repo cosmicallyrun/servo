@@ -228,13 +228,23 @@ struct ServoV8DomCell final : public v8::Object::Wrappable {
 // The cell holds the only cross-heap edge: strong into SpiderMonkey, via a
 // Trusted<T> inside the native host. Nothing in the SpiderMonkey heap points
 // back, so no cross-heap cycle can form.
+enum class ServoV8HostKind : uint8_t {
+  kElement,
+  kNodeList,
+};
+
 struct ServoV8HostCell final : public v8::Object::Wrappable {
  public:
   ServoV8HostCell(ServoV8Runtime* runtime,
                   void* native,
                   ServoV8DropCallback drop,
-                  const void* key)
-      : runtime_(runtime), native_(native), drop_(drop), key_(key) {}
+                  const void* key,
+                  ServoV8HostKind kind)
+      : runtime_(runtime),
+        native_(native),
+        drop_(drop),
+        key_(key),
+        kind_(kind) {}
 
   ~ServoV8HostCell() override {
     wrapper_.Reset();
@@ -270,6 +280,7 @@ struct ServoV8HostCell final : public v8::Object::Wrappable {
 
   void* native() const { return native_; }
   const void* key() const { return key_; }
+  ServoV8HostKind kind() const { return kind_; }
 
  private:
   static constexpr v8::Object::WrapperTypeInfo kTypeInfo{2};
@@ -279,6 +290,7 @@ struct ServoV8HostCell final : public v8::Object::Wrappable {
   // The DOM object's address. Safe as an identity only because this cell keeps
   // that object alive for exactly as long as the cache entry can be hit.
   const void* key_;
+  const ServoV8HostKind kind_;
   v8::TracedReference<v8::Object> wrapper_;
 };
 
@@ -324,9 +336,15 @@ struct ServoV8RealmState {
   // pinned for the life of the realm along with the element behind it.
   std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
       wrappers;
+  // NewObject-returning collection wrappers have no DOM identity cache entry,
+  // but realm teardown must still release their Servo roots synchronously.
+  std::vector<cppgc::WeakPersistent<ServoV8HostCell>> uncached_hosts;
   v8::Global<v8::ObjectTemplate> element_template;
   v8::Global<v8::Object> element_prototype;
   v8::Global<v8::Object> node_prototype;
+  v8::Global<v8::ObjectTemplate> node_list_template;
+  v8::Global<v8::Object> node_list_prototype;
+  v8::Global<v8::Function> node_list_constructor;
   v8::Global<v8::Function> dom_exception_constructor;
   v8::Global<v8::Object> dom_exception_prototype;
   ServoV8DocumentHostState document_host;
@@ -375,6 +393,8 @@ struct ServoV8Runtime {
   bool engine_binding_smoke_installed = false;
   ServoV8ElementHostVTable element_host_vtable{};
   bool element_host_installed = false;
+  ServoV8NodeListHostVTable node_list_host_vtable{};
+  bool node_list_host_installed = false;
   bool expose_gc = false;
 };
 
@@ -645,7 +665,8 @@ void PruneDeadWrapperCacheEntries(v8::Isolate* isolate,
     return;
   }
   for (auto& realm_entry : runtime->realms) {
-    auto& wrappers = realm_entry.second->wrappers;
+    ServoV8RealmState* realm = realm_entry.second.get();
+    auto& wrappers = realm->wrappers;
     for (auto entry = wrappers.begin(); entry != wrappers.end();) {
       if (entry->second.Get()) {
         ++entry;
@@ -653,6 +674,13 @@ void PruneDeadWrapperCacheEntries(v8::Isolate* isolate,
         entry = wrappers.erase(entry);
       }
     }
+    auto& uncached_hosts = realm->uncached_hosts;
+    uncached_hosts.erase(
+        std::remove_if(uncached_hosts.begin(), uncached_hosts.end(),
+                       [](const cppgc::WeakPersistent<ServoV8HostCell>& host) {
+                         return !host.Get();
+                       }),
+        uncached_hosts.end());
   }
 }
 
@@ -701,6 +729,12 @@ void DropUnownedElementHost(ServoV8Runtime* runtime,
   if (!native || !drop) return;
   RustCallbackScope callback_scope(runtime);
   drop(native);
+}
+
+void DropUnownedNodeListHost(ServoV8Runtime* runtime, void* native) {
+  if (!runtime || !native || !runtime->node_list_host_vtable.drop) return;
+  RustCallbackScope callback_scope(runtime);
+  runtime->node_list_host_vtable.drop(native);
 }
 
 v8::Local<v8::Private> DomExceptionBrandKey(v8::Isolate* isolate) {
@@ -1004,6 +1038,11 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
     v8::Local<v8::Context> context,
     const ServoV8InterfaceValue& value);
 
+v8::Local<v8::Object> WrapperForNodeListHost(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    void* native);
+
 void ReturnSelectorElementOutcome(
     ServoV8RealmState* realm,
     v8::Local<v8::Context> context,
@@ -1072,6 +1111,47 @@ void ReturnSelectorBooleanOutcome(
   return_value.Set(outcome.value != 0);
 }
 
+void ReturnSelectorNodeListOutcome(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    const ServoV8SelectorNodeListOutcome& outcome,
+    const char* member_name,
+    v8::ReturnValue<v8::Value> return_value) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  const bool returned_without_host =
+      outcome.status == SERVO_V8_SELECTOR_RETURNED && !outcome.native;
+  const bool error_has_host =
+      outcome.status != SERVO_V8_SELECTOR_RETURNED && outcome.native;
+  if (outcome.status > SERVO_V8_SELECTOR_HOST_FAILURE ||
+      returned_without_host || error_has_host) {
+    DropUnownedNodeListHost(realm->runtime, outcome.native);
+    ThrowTypeError(isolate, "invalid selector NodeList outcome");
+    return;
+  }
+  if (outcome.status == SERVO_V8_SELECTOR_SYNTAX_ERROR) {
+    ThrowSyntaxErrorDomException(realm, context);
+    return;
+  }
+  if (outcome.status == SERVO_V8_SELECTOR_HOST_FAILURE) {
+    ThrowTypeError(isolate, member_name);
+    return;
+  }
+  if (!realm->runtime->node_list_host_installed ||
+      !realm->runtime->element_host_installed ||
+      realm->node_list_template.IsEmpty() || realm->element_template.IsEmpty()) {
+    DropUnownedNodeListHost(realm->runtime, outcome.native);
+    ThrowTypeError(isolate, "NodeList host is not installed in this realm");
+    return;
+  }
+  v8::Local<v8::Object> wrapper =
+      WrapperForNodeListHost(realm, context, outcome.native);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(isolate, "selector NodeList wrapper could not be created");
+    return;
+  }
+  return_value.Set(wrapper);
+}
+
 #include "servo_v8_generated.inc"
 #include "servo_v8_document_host_generated.inc"
 
@@ -1115,7 +1195,8 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
 
   v8::CppHeap* cpp_heap = isolate->GetCppHeap();
   auto* cell = cppgc::MakeGarbageCollected<ServoV8HostCell>(
-      cpp_heap->GetAllocationHandle(), runtime, value.native, drop, value.key);
+      cpp_heap->GetAllocationHandle(), runtime, value.native, drop, value.key,
+      ServoV8HostKind::kElement);
   // Keep the cell reachable across the Wrap call, which can allocate.
   cppgc::Persistent<ServoV8HostCell> pending(cell);
   v8::Object::Wrap<kServoHostTag>(isolate, wrapper, cell);
@@ -1125,12 +1206,195 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
   return wrapper;
 }
 
+v8::Local<v8::Object> WrapperForNodeListHost(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    void* native) {
+  ServoV8Runtime* runtime = realm->runtime;
+  v8::Isolate* isolate = runtime->isolate;
+  const ServoV8NodeListHostVTable& vtable = runtime->node_list_host_vtable;
+  auto fail = [&]() {
+    DropUnownedNodeListHost(runtime, native);
+    return v8::Local<v8::Object>();
+  };
+
+  if (!native || !runtime->node_list_host_installed || !vtable.get_length ||
+      !vtable.item || !vtable.drop || realm->node_list_template.IsEmpty() ||
+      realm->node_list_prototype.IsEmpty()) {
+    return fail();
+  }
+
+  v8::Local<v8::Object> wrapper;
+  if (!realm->node_list_template.Get(isolate)
+           ->NewInstance(context)
+           .ToLocal(&wrapper) ||
+      !wrapper
+           ->SetPrototype(context, realm->node_list_prototype.Get(isolate))
+           .FromMaybe(false)) {
+    return fail();
+  }
+
+  v8::CppHeap* cpp_heap = isolate->GetCppHeap();
+  auto* cell = cppgc::MakeGarbageCollected<ServoV8HostCell>(
+      cpp_heap->GetAllocationHandle(), runtime, native, vtable.drop, nullptr,
+      ServoV8HostKind::kNodeList);
+  cppgc::Persistent<ServoV8HostCell> pending(cell);
+  v8::Object::Wrap<kServoHostTag>(isolate, wrapper, cell);
+  cell->SetWrapper(isolate, wrapper);
+
+  uint32_t length = 0;
+  {
+    RustCallbackScope callback_scope(runtime);
+    if (!vtable.get_length(native, &length)) {
+      cell->ReleaseHost();
+      pending.Clear();
+      return v8::Local<v8::Object>();
+    }
+  }
+  for (uint32_t index = 0; index < length; ++index) {
+    ServoV8InterfaceValue value{};
+    bool succeeded = false;
+    {
+      RustCallbackScope callback_scope(runtime);
+      succeeded = vtable.item(native, index, &value) != 0;
+    }
+    const bool malformed =
+        value.is_null > 1 ||
+        (value.is_null != 0 && (value.key || value.native)) ||
+        (value.is_null == 0 && (!value.key || !value.native));
+    if (!succeeded || malformed || value.is_null != 0) {
+      DropUnownedElementHost(runtime, value.native,
+                             runtime->element_host_vtable.drop);
+      cell->ReleaseHost();
+      pending.Clear();
+      return v8::Local<v8::Object>();
+    }
+    v8::Local<v8::Object> item =
+        WrapperForInterfaceValue(realm, isolate, context, value);
+    const std::string property_name = std::to_string(index);
+    if (item.IsEmpty() ||
+        !wrapper
+             ->DefineOwnProperty(context,
+                                 V8String(isolate, property_name.c_str()), item,
+                                 v8::ReadOnly)
+             .FromMaybe(false)) {
+      cell->ReleaseHost();
+      pending.Clear();
+      return v8::Local<v8::Object>();
+    }
+  }
+
+  realm->uncached_hosts.emplace_back(cell);
+  pending.Clear();
+  return wrapper;
+}
+
+ServoV8HostCell* UnwrapNodeListHostCell(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Local<v8::Value> receiver = info.This();
+  if (!receiver->IsObject()) return nullptr;
+  auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(
+      info.GetIsolate(), receiver.As<v8::Object>());
+  return cell && cell->kind() == ServoV8HostKind::kNodeList ? cell : nullptr;
+}
+
+bool NodeListHostCallbackState(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ServoV8RealmState** realm_output,
+    void** native_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  auto* realm = static_cast<ServoV8RealmState*>(
+      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  ServoV8HostCell* cell = UnwrapNodeListHostCell(info);
+  if (!realm || realm->tearing_down || !realm->runtime ||
+      realm->runtime->isolate != isolate || realm->context.IsEmpty() ||
+      realm->context.Get(isolate) != isolate->GetCurrentContext() || !cell ||
+      !cell->native() || !realm->runtime->node_list_host_installed) {
+    ThrowTypeError(isolate, "invalid NodeList host state");
+    return false;
+  }
+  if (realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "re-entrant NodeList host callback");
+    return false;
+  }
+  *realm_output = realm;
+  *native_output = cell->native();
+  return true;
+}
+
+void NodeListHostGetLength(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!NodeListHostCallbackState(info, &realm, &native)) return;
+  uint32_t length = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->node_list_host_vtable.get_length(native, &length)) {
+      ThrowTypeError(isolate, "NodeList.length host callback failed");
+      return;
+    }
+  }
+  info.GetReturnValue().Set(length);
+}
+
+void NodeListHostItem(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!NodeListHostCallbackState(info, &realm, &native)) return;
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, "NodeList.item requires 1 argument");
+    return;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Maybe<uint32_t> maybe_index = info[0]->Uint32Value(context);
+  if (maybe_index.IsNothing()) return;
+
+  ServoV8InterfaceValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->node_list_host_vtable.item(
+                    native, maybe_index.FromJust(), &value) != 0;
+  }
+  const bool malformed =
+      value.is_null > 1 ||
+      (value.is_null != 0 && (value.key || value.native)) ||
+      (value.is_null == 0 && (!value.key || !value.native));
+  if (!succeeded || malformed) {
+    DropUnownedElementHost(realm->runtime, value.native,
+                           realm->runtime->element_host_vtable.drop);
+    ThrowTypeError(isolate, "NodeList.item host callback failed");
+    return;
+  }
+  if (value.is_null != 0) {
+    info.GetReturnValue().SetNull();
+    return;
+  }
+  v8::Local<v8::Object> item =
+      WrapperForInterfaceValue(realm, isolate, context, value);
+  if (item.IsEmpty()) {
+    ThrowTypeError(isolate, "NodeList item wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(item);
+}
+
+void NodeListIllegalConstructor(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ThrowTypeError(info.GetIsolate(), "Illegal constructor");
+}
+
 void* UnwrapElementHostNative(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Local<v8::Value> receiver = info.This();
   if (!receiver->IsObject()) return nullptr;
   auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(
       info.GetIsolate(), receiver.As<v8::Object>());
-  return cell ? cell->native() : nullptr;
+  return cell && cell->kind() == ServoV8HostKind::kElement ? cell->native()
+                                                           : nullptr;
 }
 
 bool ElementHostCallbackState(
@@ -1435,6 +1699,42 @@ void ElementHostQuerySelector(
       "Element.querySelector host callback failed");
 }
 
+void ElementHostQuerySelectorAll(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  v8::Local<v8::String> selectors_string;
+  if (!ElementHostOperationName(info,
+                                "Element.querySelectorAll requires 1 argument",
+                                &realm, &native, &selectors_string)) {
+    return;
+  }
+  if (!realm->runtime->node_list_host_installed ||
+      realm->node_list_template.IsEmpty()) {
+    ThrowTypeError(isolate, "NodeList host is not installed in this realm");
+    return;
+  }
+  v8::String::Utf8Value selectors(isolate, selectors_string);
+  if (!*selectors && selectors.length() != 0) return;
+  ServoV8SelectorNodeListOutcome outcome{};
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.query_selector_all(
+            native, realm->document_host.active_host_context,
+            reinterpret_cast<const uint8_t*>(*selectors), selectors.length(),
+            &outcome)) {
+      DropUnownedNodeListHost(realm->runtime, outcome.native);
+      ThrowTypeError(isolate,
+                     "Element.querySelectorAll host callback failed");
+      return;
+    }
+  }
+  ReturnSelectorNodeListOutcome(
+      realm, isolate->GetCurrentContext(), outcome,
+      "Element.querySelectorAll host callback failed", info.GetReturnValue());
+}
+
 void ElementHostClosest(const v8::FunctionCallbackInfo<v8::Value>& info) {
   ElementHostCallSelectorElement(info, &ServoV8ElementHostVTable::closest,
                                  "Element.closest requires 1 argument",
@@ -1719,6 +2019,113 @@ void NodeHostSetTextContent(
             static_cast<size_t>(utf8.length()));
 }
 
+bool InstallNodeListInterface(ServoV8RealmState* realm,
+                              v8::Local<v8::Context> context,
+                              v8::Local<v8::Object> global) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::Local<v8::Value> array_value;
+  v8::Local<v8::Value> array_prototype_value;
+  if (!global->Get(context, V8String(isolate, "Array")).ToLocal(&array_value) ||
+      !array_value->IsFunction() ||
+      !array_value.As<v8::Function>()
+           ->Get(context, V8String(isolate, "prototype"))
+           .ToLocal(&array_prototype_value) ||
+      !array_prototype_value->IsObject()) {
+    return false;
+  }
+  v8::Local<v8::Object> array_prototype =
+      array_prototype_value.As<v8::Object>();
+  auto get_intrinsic = [&](const char* name,
+                           v8::Local<v8::Function>* output) -> bool {
+    v8::Local<v8::Value> value;
+    if (!array_prototype->Get(context, V8String(isolate, name)).ToLocal(&value) ||
+        !value->IsFunction()) {
+      return false;
+    }
+    *output = value.As<v8::Function>();
+    return true;
+  };
+  v8::Local<v8::Function> values_intrinsic;
+  v8::Local<v8::Function> keys_intrinsic;
+  v8::Local<v8::Function> entries_intrinsic;
+  v8::Local<v8::Function> for_each_intrinsic;
+  if (!get_intrinsic("values", &values_intrinsic) ||
+      !get_intrinsic("keys", &keys_intrinsic) ||
+      !get_intrinsic("entries", &entries_intrinsic) ||
+      !get_intrinsic("forEach", &for_each_intrinsic)) {
+    return false;
+  }
+
+  v8::Local<v8::FunctionTemplate> constructor_template =
+      v8::FunctionTemplate::New(isolate, NodeListIllegalConstructor);
+  constructor_template->SetClassName(V8String(isolate, "NodeList"));
+  v8::Local<v8::ObjectTemplate> instance_template =
+      constructor_template->InstanceTemplate();
+  v8::Local<v8::Function> constructor;
+  if (!constructor_template->GetFunction(context).ToLocal(&constructor)) {
+    return false;
+  }
+  v8::Local<v8::Value> prototype_value;
+  if (!constructor->Get(context, V8String(isolate, "prototype"))
+           .ToLocal(&prototype_value) ||
+      !prototype_value->IsObject()) {
+    return false;
+  }
+  v8::Local<v8::Object> prototype = prototype_value.As<v8::Object>();
+
+  v8::Local<v8::Function> length_getter;
+  if (!v8::Function::New(context, NodeListHostGetLength, {}, 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&length_getter)) {
+    return false;
+  }
+  length_getter->SetName(V8String(isolate, "get length"));
+  prototype->SetAccessorProperty(V8String(isolate, "length"), length_getter,
+                                 v8::Local<v8::Function>(), v8::None);
+
+  v8::Local<v8::Function> item_function;
+  if (!v8::Function::New(context, NodeListHostItem, {}, 1,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&item_function)) {
+    return false;
+  }
+  item_function->SetName(V8String(isolate, "item"));
+  auto define_operation = [&](const char* name,
+                              v8::Local<v8::Function> function) -> bool {
+    return prototype
+        ->DefineOwnProperty(context, V8String(isolate, name), function, v8::None)
+        .FromMaybe(false);
+  };
+  if (!define_operation("item", item_function) ||
+      !define_operation("values", values_intrinsic) ||
+      !define_operation("keys", keys_intrinsic) ||
+      !define_operation("entries", entries_intrinsic) ||
+      !define_operation("forEach", for_each_intrinsic) ||
+      !prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetIterator(isolate),
+                               values_intrinsic, v8::DontEnum)
+           .FromMaybe(false) ||
+      !prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "NodeList"),
+                               static_cast<v8::PropertyAttribute>(
+                                   v8::ReadOnly | v8::DontEnum))
+           .FromMaybe(false) ||
+      !global
+           ->DefineOwnProperty(context, V8String(isolate, "NodeList"),
+                               constructor, v8::DontEnum)
+           .FromMaybe(false)) {
+    return false;
+  }
+
+  realm->node_list_template.Reset(isolate, instance_template);
+  realm->node_list_prototype.Reset(isolate, prototype);
+  realm->node_list_constructor.Reset(isolate, constructor);
+  return true;
+}
+
 bool InstallNodePrototype(ServoV8RealmState* realm,
                           v8::Local<v8::Context> context,
                           v8::Local<v8::Object> prototype) {
@@ -1828,6 +2235,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
        v8::SideEffectType::kHasSideEffect},
       {"querySelector", &ElementHostQuerySelector, 1,
        v8::SideEffectType::kHasNoSideEffect},
+      {"querySelectorAll", &ElementHostQuerySelectorAll, 1,
+       v8::SideEffectType::kHasSideEffect},
       {"closest", &ElementHostClosest, 1,
        v8::SideEffectType::kHasNoSideEffect},
       {"matches", &ElementHostMatches, 1,
@@ -2302,9 +2711,16 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
     if (ServoV8HostCell* cell = entry.second.Get()) cell->ReleaseHost();
   }
   realm->wrappers.clear();
+  for (auto& host : realm->uncached_hosts) {
+    if (ServoV8HostCell* cell = host.Get()) cell->ReleaseHost();
+  }
+  realm->uncached_hosts.clear();
   realm->element_template.Reset();
   realm->element_prototype.Reset();
   realm->node_prototype.Reset();
+  realm->node_list_template.Reset();
+  realm->node_list_prototype.Reset();
+  realm->node_list_constructor.Reset();
   realm->dom_exception_constructor.Reset();
   realm->dom_exception_prototype.Reset();
   realm->document.Reset();
@@ -2612,7 +3028,8 @@ extern "C" int32_t servo_v8_realm_create(
       element_constructor->InstanceTemplate();
   v8::Local<v8::Object> node_prototype = v8::Object::New(isolate);
   v8::Local<v8::Object> element_prototype = v8::Object::New(isolate);
-  if (!InstallNodePrototype(realm.get(), context, node_prototype) ||
+  if (!InstallNodeListInterface(realm.get(), context, global) ||
+      !InstallNodePrototype(realm.get(), context, node_prototype) ||
       !InstallElementPrototype(realm.get(), context, element_prototype) ||
       !element_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
       !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
@@ -3156,7 +3573,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
       !vtable->get_child_element_count || !vtable->query_selector ||
       !vtable->closest || !vtable->matches ||
-      !vtable->webkit_matches_selector ||
+      !vtable->webkit_matches_selector || !vtable->query_selector_all ||
       !vtable->drop) {
     WriteError(error, "Element host vtable is incomplete");
     return 0;
@@ -3169,6 +3586,25 @@ extern "C" int32_t servo_v8_install_element_host(
   // Element host, while the hosts themselves are per object.
   runtime->element_host_vtable = *vtable;
   runtime->element_host_installed = true;
+  return 1;
+}
+
+extern "C" int32_t servo_v8_install_node_list_host(
+    ServoV8Runtime* runtime,
+    const ServoV8NodeListHostVTable* vtable,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!vtable || !vtable->get_length || !vtable->item || !vtable->drop) {
+    WriteError(error, "NodeList host vtable is incomplete");
+    return 0;
+  }
+  if (runtime->node_list_host_installed) {
+    WriteError(error, "NodeList host is already installed");
+    return 0;
+  }
+  runtime->node_list_host_vtable = *vtable;
+  runtime->node_list_host_installed = true;
   return 1;
 }
 

@@ -383,12 +383,17 @@ def _cpp_member_installation(members: Sequence[Member]) -> Block:
                 )
         else:
             _, arguments = member.attribute.signatures()[0]
+            side_effect_type = (
+                "kHasNoSideEffect"
+                if "Pure" in member.attribute._extendedAttrDict
+                else "kHasSideEffect"
+            )
             lines.extend(
                 [
                     f"  if (!v8::Function::New(context, DocumentHostCall{callback},",
                     f"                         v8::Local<v8::Data>(), {len(arguments)},",
                     "                         v8::ConstructorBehavior::kThrow,",
-                    "                         v8::SideEffectType::kHasNoSideEffect)",
+                    f"                         v8::SideEffectType::{side_effect_type})",
                     f"           .ToLocal(&{local}_method)) {{",
                     "    return false;",
                     "  }",
@@ -1360,6 +1365,11 @@ _SELECTOR_OUTCOME_C_TYPES: Block = [
     "  uint32_t status;",
     "  uint8_t value;",
     "} ServoV8SelectorBooleanOutcome;",
+    "",
+    "typedef struct ServoV8SelectorNodeListOutcome {",
+    "  uint32_t status;",
+    "  void* native;",
+    "} ServoV8SelectorNodeListOutcome;",
 ]
 
 _SELECTOR_OUTCOME_RUST_TYPES: Block = [
@@ -1377,6 +1387,12 @@ _SELECTOR_OUTCOME_RUST_TYPES: Block = [
     "pub struct RawSelectorBooleanOutcome {",
     "    pub status: u32,",
     "    pub value: u8,",
+    "}",
+    "",
+    "#[repr(C)]",
+    "pub struct RawSelectorNodeListOutcome {",
+    "    pub status: u32,",
+    "    pub native: *mut c_void,",
     "}",
 ]
 
@@ -1552,6 +1568,176 @@ def _pure_throws_domstring_to_nullable_interface_cpp_bodies(
 
 
 def _pure_throws_domstring_to_nullable_interface_cpp_vtable_terms(
+    member: Member,
+) -> list[str]:
+    return [f"vtable.{_rust_member_name(member.attribute)}"]
+
+
+def _newobject_throws_domstring_to_interface_header_slots(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    return [
+        f"  uint8_t (*{name})(void* native, void* host_context,",
+        f"{C_SIGNATURE_INDENT}const uint8_t* {argument},",
+        f"{C_SIGNATURE_INDENT}size_t {argument}_length,",
+        f"{C_SIGNATURE_INDENT}ServoV8SelectorNodeListOutcome* output);",
+    ]
+
+
+def _newobject_throws_domstring_to_interface_rust_trait_members(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    return [
+        "    /// Returns a new static NodeList, a selector SyntaxError, or a host failure.",
+        "    /// `host_context` is borrowed only for this synchronous call.",
+        f"    unsafe fn {name}(",
+        "        &self,",
+        "        host_context: *mut c_void,",
+        f"        {argument}: &str,",
+        "    ) -> SelectorNodeListResult;",
+    ]
+
+
+def _newobject_throws_domstring_to_interface_rust_vtable_fields(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"    pub {name}: Option<",
+        "        unsafe extern \"C\" fn(",
+        "            *mut c_void,",
+        "            *mut c_void,",
+        "            *const u8,",
+        "            usize,",
+        "            *mut RawSelectorNodeListOutcome,",
+        "        ) -> u8,",
+        "    >,",
+    ]
+
+
+def _newobject_throws_domstring_to_interface_rust_thunks(
+    member: Member,
+) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{name}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    host_context: *mut c_void,",
+            f"    {argument}: *const u8,",
+            f"    {argument}_length: usize,",
+            "    output: *mut RawSelectorNodeListOutcome,",
+            ") -> u8 {",
+            "    if native.is_null() || host_context.is_null() || output.is_null() ||",
+            f"        ({argument}.is_null() && {argument}_length != 0)",
+            "    {",
+            "        return 0;",
+            "    }",
+            f"    let {argument}_bytes = if {argument}_length == 0 {{",
+            "        &[]",
+            "    } else {",
+            "        // SAFETY: The ABI contract lends this byte range for the callback.",
+            f"        unsafe {{ std::slice::from_raw_parts({argument}, {argument}_length) }}",
+            "    };",
+            f"    let Ok({argument}) = std::str::from_utf8({argument}_bytes) else {{",
+            "        return 0;",
+            "    };",
+            "    // SAFETY: The vtable contract supplies a live Box<T> and lends the",
+            "    // non-null host context only for this callback.",
+            "    let result = unsafe {",
+            f"        (&*native.cast::<T>()).{name}(host_context, {argument})",
+            "    };",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe { *output = raw_selector_node_list_outcome(result) };",
+            "    1",
+            "}",
+        ],
+    )
+
+
+def _newobject_throws_domstring_to_interface_rust_vtable_init(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [f"            {name}: Some(document_host_{name}::<T>),"]
+
+
+def _newobject_throws_domstring_to_interface_cpp_bodies(
+    member: Member,
+) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    callback = _cpp_member_name(member.attribute)
+    argument = _rust_member_name(
+        _pure_domstring_to_nullable_interface_argument(member)
+    )
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostCall{callback}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->active_host_context ||",
+            f"      !state->vtable.{name}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->node_list_host_installed ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->node_list_template.IsEmpty() ||",
+            "      realm->element_template.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "NodeList host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  if (info.Length() < 1) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} requires one argument");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            f"  v8::Local<v8::String> {argument}_value;",
+            f"  if (!info[0]->ToString(context).ToLocal(&{argument}_value)) return;",
+            f"  v8::String::Utf8Value {argument}_utf8(isolate, {argument}_value);",
+            f"  if (!*{argument}_utf8 && {argument}_utf8.length() != 0) return;",
+            "  ServoV8SelectorNodeListOutcome outcome{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{name}(",
+            "                    state->native, state->active_host_context,",
+            f"                    reinterpret_cast<const uint8_t*>(*{argument}_utf8),",
+            f"                    static_cast<size_t>({argument}_utf8.length()),",
+            "                    &outcome) != 0;",
+            "  }",
+            "  if (!succeeded) {",
+            "    DropUnownedNodeListHost(state->runtime, outcome.native);",
+            f'    ThrowTypeError(isolate, "{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            f'  ReturnSelectorNodeListOutcome(realm, context, outcome, "{qualified_name}",',
+            "                            info.GetReturnValue());",
+            "}",
+        ],
+    )
+
+
+def _newobject_throws_domstring_to_interface_cpp_vtable_terms(
     member: Member,
 ) -> list[str]:
     return [f"vtable.{_rust_member_name(member.attribute)}"]
@@ -1748,6 +1934,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(),
         cpp_bodies=_pure_throws_domstring_to_nullable_interface_cpp_bodies,
         cpp_vtable_terms=_pure_throws_domstring_to_nullable_interface_cpp_vtable_terms,
+    ),
+    production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE: ShapeEmitter(
+        header_type_blocks=(_SELECTOR_OUTCOME_C_TYPES,),
+        header_slots=_newobject_throws_domstring_to_interface_header_slots,
+        rust_type_blocks=(_SELECTOR_OUTCOME_RUST_TYPES,),
+        rust_trait_members=_newobject_throws_domstring_to_interface_rust_trait_members,
+        rust_vtable_fields=_newobject_throws_domstring_to_interface_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_newobject_throws_domstring_to_interface_rust_thunks,
+        rust_vtable_init=_newobject_throws_domstring_to_interface_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_newobject_throws_domstring_to_interface_cpp_bodies,
+        cpp_vtable_terms=_newobject_throws_domstring_to_interface_cpp_vtable_terms,
     ),
 }
 

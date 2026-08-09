@@ -244,6 +244,41 @@ struct V8ElementHost {
     element: Trusted<Element>,
 }
 
+/// One static querySelectorAll snapshot. Each Trusted root is independent of
+/// later tree mutation and is released when V8 collects the NodeList or tears
+/// down its realm.
+#[cfg(feature = "v8-shadow")]
+struct V8StaticNodeListHost {
+    elements: Vec<Trusted<Element>>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: The host and its Trusted roots stay on the originating script
+// thread. Neither the accessors nor Drop enter V8 or pump an event loop, and
+// every item returns the runtime's installed V8ElementHost type.
+unsafe impl servo_v8::NodeListHostBinding for V8StaticNodeListHost {
+    fn length(&self) -> u32 {
+        self.elements.len().min(u32::MAX as usize) as u32
+    }
+
+    fn item(&self, index: u32) -> Option<servo_v8::InterfaceHandle> {
+        let element = self.elements.get(index as usize)?.root();
+        Some(v8_element_interface_handle(&element))
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
+fn v8_node_list_handle(elements: Vec<DomRoot<Element>>) -> servo_v8::NodeListHandle {
+    let elements = elements
+        .into_iter()
+        .map(|element| Trusted::new(&*element))
+        .collect();
+    // SAFETY: ScriptThread installs V8StaticNodeListHost as the runtime's
+    // single type-level NodeList host before any realm can return this handle.
+    unsafe { servo_v8::NodeListHandle::new(V8StaticNodeListHost { elements }) }
+}
+
 #[cfg(feature = "v8-shadow")]
 fn v8_element_interface_handle(element: &Element) -> servo_v8::InterfaceHandle {
     // SAFETY: The cache key is the address of the same Element allocation that
@@ -513,6 +548,35 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
             Err(_) => servo_v8::SelectorBooleanResult::HostFailure,
         }
     }
+
+    unsafe fn query_selector_all(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> servo_v8::SelectorNodeListResult {
+        if host_context.is_null() {
+            return servo_v8::SelectorNodeListResult::HostFailure;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context
+        // only for this synchronous scope-match call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let element = self.element.root();
+        let result = element.upcast::<Node>().query_selector_all_elements(
+            cx.no_gc(),
+            DOMString::from(selectors),
+        );
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::SelectorNodeListResult::HostFailure;
+        }
+        match result {
+            Ok(elements) => {
+                servo_v8::SelectorNodeListResult::Match(v8_node_list_handle(elements))
+            },
+            Err(Error::Syntax(_)) => servo_v8::SelectorNodeListResult::SyntaxError,
+            Err(_) => servo_v8::SelectorNodeListResult::HostFailure,
+        }
+    }
 }
 
 #[cfg(feature = "v8-shadow")]
@@ -704,6 +768,35 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             ),
             Err(Error::Syntax(_)) => servo_v8::SelectorElementResult::SyntaxError,
             Err(_) => servo_v8::SelectorElementResult::HostFailure,
+        }
+    }
+
+    unsafe fn query_selector_all(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> servo_v8::SelectorNodeListResult {
+        if host_context.is_null() {
+            return servo_v8::SelectorNodeListResult::HostFailure;
+        }
+        // SAFETY: The authoritative run API lends its live owner-thread
+        // context only for this synchronous scope-match call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let document = self.document.root();
+        let result = document.upcast::<Node>().query_selector_all_elements(
+            cx.no_gc(),
+            DOMString::from(selectors),
+        );
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::SelectorNodeListResult::HostFailure;
+        }
+        match result {
+            Ok(elements) => {
+                servo_v8::SelectorNodeListResult::Match(v8_node_list_handle(elements))
+            },
+            Err(Error::Syntax(_)) => servo_v8::SelectorNodeListResult::SyntaxError,
+            Err(_) => servo_v8::SelectorNodeListResult::HostFailure,
         }
     }
 
@@ -2395,6 +2488,9 @@ impl ScriptThread {
                 // can hand an Element to script.
                 if let Err(error) = runtime.install_element_host::<V8ElementHost>() {
                     panic!("V8 Element host installation failed: {error}");
+                }
+                if let Err(error) = runtime.install_node_list_host::<V8StaticNodeListHost>() {
+                    panic!("V8 NodeList host installation failed: {error}");
                 }
                 Some(V8ShadowState {
                     runtime,

@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 26;
+const ABI_VERSION: u32 = 27;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -204,6 +204,56 @@ pub enum SelectorBooleanResult {
     HostFailure,
 }
 
+/// One newly-created static NodeList host being transferred to V8.
+pub struct NodeListHandle {
+    pub native: *mut c_void,
+}
+
+impl NodeListHandle {
+    /// Transfers one collection host through the runtime's installed NodeList
+    /// vtable.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the exact type previously passed to
+    /// `Runtime::install_node_list_host` for the receiving runtime.
+    pub unsafe fn new<T: NodeListHostBinding>(host: T) -> Self {
+        Self {
+            native: Box::into_raw(Box::new(host)).cast(),
+        }
+    }
+}
+
+/// The complete result space for ParentNode.querySelectorAll.
+pub enum SelectorNodeListResult {
+    Match(NodeListHandle),
+    SyntaxError,
+    HostFailure,
+}
+
+/// A static NodeList created for one querySelectorAll call.
+///
+/// # Safety
+///
+/// Implementations stay on their originating script thread. `length`, `item`,
+/// and `Drop` must not unwind, re-enter V8 or cppgc, or pump an event loop.
+/// Every item must
+/// return a freshly-owned Element host whose cache key names the rooted Servo
+/// object and whose concrete type is the runtime's installed Element host type.
+pub unsafe trait NodeListHostBinding: Sized + 'static {
+    fn length(&self) -> u32;
+    fn item(&self, index: u32) -> Option<InterfaceHandle>;
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct NodeListHostVTable {
+    pub get_length: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
+    pub item:
+        Option<unsafe extern "C" fn(*mut c_void, u32, *mut RawInterfaceValue) -> u8>,
+    pub drop: Option<DropCallback>,
+}
+
 /// A host for one Servo `Element` reachable from V8.
 ///
 /// # Safety
@@ -247,6 +297,11 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
         host_context: *mut c_void,
         selectors: &str,
     ) -> SelectorBooleanResult;
+    unsafe fn query_selector_all(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> SelectorNodeListResult;
 }
 
 #[repr(C)]
@@ -322,6 +377,15 @@ pub struct ElementHostVTable {
             *const u8,
             usize,
             *mut RawSelectorBooleanOutcome,
+        ) -> u8,
+    >,
+    pub query_selector_all: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut RawSelectorNodeListOutcome,
         ) -> u8,
     >,
     pub drop: Option<DropCallback>,
@@ -670,6 +734,23 @@ fn raw_selector_boolean_outcome(result: SelectorBooleanResult) -> RawSelectorBoo
     }
 }
 
+fn raw_selector_node_list_outcome(result: SelectorNodeListResult) -> RawSelectorNodeListOutcome {
+    match result {
+        SelectorNodeListResult::Match(handle) => RawSelectorNodeListOutcome {
+            status: SELECTOR_RETURNED,
+            native: handle.native,
+        },
+        SelectorNodeListResult::SyntaxError => RawSelectorNodeListOutcome {
+            status: SELECTOR_SYNTAX_ERROR,
+            native: std::ptr::null_mut(),
+        },
+        SelectorNodeListResult::HostFailure => RawSelectorNodeListOutcome {
+            status: SELECTOR_HOST_FAILURE,
+            native: std::ptr::null_mut(),
+        },
+    }
+}
+
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -978,6 +1059,73 @@ unsafe extern "C" fn element_host_webkit_matches_selector<T: ElementHostBinding>
     1
 }
 
+unsafe extern "C" fn element_host_query_selector_all<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    selectors: *const u8,
+    selectors_length: usize,
+    output: *mut RawSelectorNodeListOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || output.is_null()
+        || (selectors.is_null() && selectors_length != 0)
+    {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(selectors) = (unsafe { element_host_utf8(selectors, selectors_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).query_selector_all(host_context, selectors) };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = raw_selector_node_list_outcome(result) };
+    1
+}
+
+unsafe extern "C" fn node_list_host_get_length<T: NodeListHostBinding>(
+    native: *mut c_void,
+    output: *mut u32,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    unsafe { *output = (&*native.cast::<T>()).length() };
+    1
+}
+
+unsafe extern "C" fn node_list_host_item<T: NodeListHostBinding>(
+    native: *mut c_void,
+    index: u32,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let item = unsafe { (&*native.cast::<T>()).item(index) };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, item) }
+}
+
+unsafe extern "C" fn node_list_host_drop<T: NodeListHostBinding>(native: *mut c_void) {
+    if native.is_null() {
+        return;
+    }
+    // SAFETY: The bridge returns the exact Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+fn node_list_host_vtable<T: NodeListHostBinding>() -> NodeListHostVTable {
+    NodeListHostVTable {
+        get_length: Some(node_list_host_get_length::<T>),
+        item: Some(node_list_host_item::<T>),
+        drop: Some(node_list_host_drop::<T>),
+    }
+}
+
 fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
     ElementHostVTable {
         get_local_name: Some(element_host_get_local_name::<T>),
@@ -1002,6 +1150,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         closest: Some(element_host_closest::<T>),
         matches: Some(element_host_matches::<T>),
         webkit_matches_selector: Some(element_host_webkit_matches_selector::<T>),
+        query_selector_all: Some(element_host_query_selector_all::<T>),
         drop: Some(element_host_drop::<T>),
     }
 }
@@ -1134,6 +1283,11 @@ unsafe extern "C" {
     fn servo_v8_install_element_host(
         runtime: *mut RawRuntime,
         vtable: *const ElementHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_install_node_list_host(
+        runtime: *mut RawRuntime,
+        vtable: *const NodeListHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_install_engine_binding_smoke(
@@ -1633,6 +1787,23 @@ impl Runtime {
         // remain valid for the duration of the call.
         let succeeded =
             unsafe { servo_v8_install_element_host(self.raw.as_ptr(), &vtable, &mut error) };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
+    /// Registers the type-level host for static NodeLists returned by
+    /// querySelectorAll. Each individual list is transferred separately.
+    pub fn install_node_list_host<T: NodeListHostBinding>(&mut self) -> Result<(), Error> {
+        let vtable = node_list_host_vtable::<T>();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The runtime is live and C++ copies the complete vtable
+        // synchronously before this method returns.
+        let succeeded = unsafe {
+            servo_v8_install_node_list_host(self.raw.as_ptr(), &vtable, &mut error)
+        };
         if succeeded == 0 {
             return Err(error_from(&storage, &error));
         }
@@ -2232,6 +2403,63 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct NodeListProbeItem {
+        local_name: String,
+        tag_name: String,
+        identity: *const c_void,
+        state: Rc<ElementProbeState>,
+        owned_identity: Option<Rc<u8>>,
+        element_drops: Rc<Cell<usize>>,
+        drop_reentry: Option<ElementDropReentryProbe>,
+    }
+
+    impl NodeListProbeItem {
+        fn interface_handle(&self) -> InterfaceHandle {
+            // SAFETY: The list snapshot either owns the Rc used as its key or
+            // shares the identity rooted by the realm's Document probe.
+            unsafe {
+                InterfaceHandle::new(
+                    self.identity,
+                    ElementHostProbe {
+                        local_name: self.local_name.clone(),
+                        tag_name: self.tag_name.clone(),
+                        identity: self.identity,
+                        state: Rc::clone(&self.state),
+                        _owned_identity: self.owned_identity.clone(),
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.drop_reentry.clone(),
+                    },
+                )
+            }
+        }
+    }
+
+    struct NodeListHostProbe {
+        items: Vec<NodeListProbeItem>,
+        drops: Option<Rc<Cell<usize>>>,
+    }
+
+    impl Drop for NodeListHostProbe {
+        fn drop(&mut self) {
+            if let Some(drops) = &self.drops {
+                drops.set(drops.get() + 1);
+            }
+        }
+    }
+
+    // SAFETY: The probe and every rooted snapshot item remain confined to the
+    // runtime's owner thread and neither item() nor Drop can enter V8.
+    unsafe impl NodeListHostBinding for NodeListHostProbe {
+        fn length(&self) -> u32 {
+            self.items.len() as u32
+        }
+
+        fn item(&self, index: u32) -> Option<InterfaceHandle> {
+            self.items.get(index as usize).map(|item| item.interface_handle())
+        }
+    }
+
+    #[derive(Clone)]
     struct ElementDropReentryProbe {
         runtime: *mut RawRuntime,
         realm: RealmId,
@@ -2412,6 +2640,44 @@ mod tests {
             // SAFETY: This historical alias has the exact same WebIDL and
             // host-context contract as matches().
             unsafe { self.matches(host_context, selectors) }
+        }
+
+        unsafe fn query_selector_all(
+            &self,
+            host_context: *mut c_void,
+            selectors: &str,
+        ) -> SelectorNodeListResult {
+            assert!(!host_context.is_null());
+            if selectors == "[" || selectors.is_empty() {
+                return SelectorNodeListResult::SyntaxError;
+            }
+            let items = self
+                .state
+                .element_children
+                .borrow()
+                .iter()
+                .filter(|child| {
+                    selectors == "*"
+                        || selectors.eq_ignore_ascii_case(&child.local_name)
+                        || selectors
+                            .strip_prefix('#')
+                            .is_some_and(|id| child.state.get("id").as_deref() == Some(id))
+                })
+                .map(|child| NodeListProbeItem {
+                    local_name: child.local_name.clone(),
+                    tag_name: child.tag_name.clone(),
+                    identity: Rc::as_ptr(&child.identity).cast(),
+                    state: Rc::clone(&child.state),
+                    owned_identity: Some(Rc::clone(&child.identity)),
+                    element_drops: Rc::clone(&self.drops),
+                    drop_reentry: self.drop_reentry.clone(),
+                })
+                .collect();
+            // SAFETY: Every test runtime that exposes this probe installs
+            // NodeListHostProbe as its one type-level collection host.
+            SelectorNodeListResult::Match(unsafe {
+                NodeListHandle::new(NodeListHostProbe { items, drops: None })
+            })
         }
     }
 
@@ -2622,6 +2888,7 @@ mod tests {
         head_present: bool,
         get_element_by_id_calls: Rc<RefCell<Vec<String>>>,
         element_drops: Rc<Cell<usize>>,
+        node_list_drops: Rc<Cell<usize>>,
         element_drop_reentry: Option<ElementDropReentryProbe>,
     }
 
@@ -2672,6 +2939,7 @@ mod tests {
                 head_present: true,
                 get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
                 element_drops: Rc::new(Cell::new(0)),
+                node_list_drops: Rc::new(Cell::new(0)),
                 element_drop_reentry: None,
             }
         }
@@ -2861,6 +3129,69 @@ mod tests {
                 "head" => SelectorElementResult::Match(self.head()),
                 _ => SelectorElementResult::Match(None),
             }
+        }
+
+        unsafe fn query_selector_all(
+            &self,
+            host_context: *mut c_void,
+            selectors: &str,
+        ) -> SelectorNodeListResult {
+            assert!(!host_context.is_null());
+            if selectors == "[" || selectors.is_empty() {
+                return SelectorNodeListResult::SyntaxError;
+            }
+            let mut items = Vec::new();
+            let mut push = |identity: *const c_void,
+                            local_name: &str,
+                            tag_name: &str,
+                            state: &Rc<ElementProbeState>| {
+                items.push(NodeListProbeItem {
+                    local_name: local_name.to_owned(),
+                    tag_name: tag_name.to_owned(),
+                    identity,
+                    state: Rc::clone(state),
+                    owned_identity: None,
+                    element_drops: Rc::clone(&self.element_drops),
+                    drop_reentry: self.element_drop_reentry.clone(),
+                });
+            };
+            if (selectors == "*" || selectors.eq_ignore_ascii_case("html"))
+                && self.document_element_present
+            {
+                push(
+                    (&*self.element_identity as *const u8).cast(),
+                    "html",
+                    "HTML",
+                    &self.element_state,
+                );
+            }
+            if (selectors == "*" || selectors.eq_ignore_ascii_case("head"))
+                && self.head_present
+            {
+                push(
+                    (&*self.head_identity as *const u8).cast(),
+                    "head",
+                    "HEAD",
+                    &self.head_state,
+                );
+            }
+            if selectors == "*" || selectors == "#target" || selectors.eq_ignore_ascii_case("div")
+            {
+                push(
+                    (&*self.id_element_identity as *const u8).cast(),
+                    "div",
+                    "DIV",
+                    &self.id_element_state,
+                );
+            }
+            // SAFETY: Every test runtime that exposes this probe installs
+            // NodeListHostProbe as its one type-level collection host.
+            SelectorNodeListResult::Match(unsafe {
+                NodeListHandle::new(NodeListHostProbe {
+                    items,
+                    drops: Some(Rc::clone(&self.node_list_drops)),
+                })
+            })
         }
 
         unsafe fn set_bg_color(&self, host_context: *mut c_void, value: &str) -> bool {
@@ -4553,6 +4884,240 @@ mod tests {
     }
 
     #[test]
+    fn query_selector_all_exposes_static_iterable_node_lists() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+
+        let mut incomplete = node_list_host_vtable::<NodeListHostProbe>();
+        incomplete.item = None;
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: This deliberately incomplete table is borrowed only for the
+        // validating install call and is never retained after rejection.
+        assert_eq!(
+            unsafe {
+                servo_v8_install_node_list_host(
+                    runtime.raw.as_ptr(),
+                    &incomplete,
+                    &mut error,
+                )
+            },
+            0
+        );
+        assert!(text_from(&storage, &error).contains("vtable is incomplete"));
+        runtime
+            .install_node_list_host::<NodeListHostProbe>()
+            .expect("NodeList host vtable installs once");
+        assert!(
+            runtime
+                .install_node_list_host::<NodeListHostProbe>()
+                .is_err()
+        );
+
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let element_drops = Rc::new(Cell::new(0));
+        let node_list_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        document.node_list_drops = Rc::clone(&node_list_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               const documentPrototype = Object.getPrototypeOf(document);\n\
+               const documentQsa = Object.getOwnPropertyDescriptor(\n\
+                 documentPrototype, 'querySelectorAll');\n\
+               let documentWrongBrandStringified = false;\n\
+               let documentWrongBrand = false;\n\
+               try { documentQsa.value.call({}, { toString() {\n\
+                 documentWrongBrandStringified = true; return '*';\n\
+               }}); } catch (error) { documentWrongBrand = error instanceof TypeError; }\n\
+               const conversionSentinel = new Error('qsa conversion');\n\
+               let conversionPreserved = false;\n\
+               try { document.querySelectorAll({ toString() { throw conversionSentinel; }}); }\n\
+               catch (error) { conversionPreserved = error === conversionSentinel; }\n\
+               let missingRejected = false;\n\
+               try { document.querySelectorAll(); }\n\
+               catch (error) { missingRejected = error instanceof TypeError; }\n\
+               let symbolRejected = false;\n\
+               try { document.querySelectorAll(Symbol('selector')); }\n\
+               catch (error) { symbolRejected = error instanceof TypeError; }\n\
+               let syntaxRejected = false;\n\
+               try { document.querySelectorAll('['); }\n\
+               catch (error) { syntaxRejected = error instanceof DOMException &&\n\
+                 error.name === 'SyntaxError' && error.code === 12; }\n\
+\n\
+               const all = document.querySelectorAll('*');\n\
+               const fresh = document.querySelectorAll('*');\n\
+               const target = document.querySelector('#target');\n\
+               const targetList = document.querySelectorAll('#target');\n\
+               const elementQsa = Object.getOwnPropertyDescriptor(\n\
+                 Object.getPrototypeOf(target), 'querySelectorAll');\n\
+               let elementWrongBrandStringified = false;\n\
+               let elementWrongBrand = false;\n\
+               try { elementQsa.value.call({}, { toString() {\n\
+                 elementWrongBrandStringified = true; return '*';\n\
+               }}); } catch (error) { elementWrongBrand = error instanceof TypeError; }\n\
+               let elementSyntaxRejected = false;\n\
+               try { target.querySelectorAll('['); }\n\
+               catch (error) { elementSyntaxRejected = error instanceof DOMException &&\n\
+                 error.name === 'SyntaxError'; }\n\
+               const descendants = target.querySelectorAll('*');\n\
+               const firstDescendant = descendants[0];\n\
+               const secondDescendant = descendants.item(1);\n\
+               target.textContent = '';\n\
+               const staticSnapshot = descendants.length === 2 &&\n\
+                 descendants[0] === firstDescendant &&\n\
+                 descendants.item(1) === secondDescendant &&\n\
+                 firstDescendant.tagName === 'SPAN' &&\n\
+                 secondDescendant.tagName === 'EM';\n\
+\n\
+               const listPrototype = NodeList.prototype;\n\
+               const lengthDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 listPrototype, 'length');\n\
+               const itemDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 listPrototype, 'item');\n\
+               const iterableNames = ['values', 'keys', 'entries', 'forEach'];\n\
+               const iterableDescriptors = iterableNames.every(name => {\n\
+                 const descriptor = Object.getOwnPropertyDescriptor(listPrototype, name);\n\
+                 return descriptor && descriptor.enumerable && descriptor.writable &&\n\
+                   descriptor.configurable && descriptor.value === Array.prototype[name];\n\
+               });\n\
+               const indexDescriptor = Object.getOwnPropertyDescriptor(all, '0');\n\
+               let illegalCall = false;\n\
+               let illegalConstruct = false;\n\
+               try { NodeList(); } catch (error) { illegalCall = error instanceof TypeError; }\n\
+               try { new NodeList(); } catch (error) { illegalConstruct = error instanceof TypeError; }\n\
+               let itemWrongBrandTouched = false;\n\
+               let itemWrongBrand = false;\n\
+               try { itemDescriptor.value.call({}, { valueOf() {\n\
+                 itemWrongBrandTouched = true; return 0;\n\
+               }}); } catch (error) { itemWrongBrand = error instanceof TypeError; }\n\
+               let itemMissing = false;\n\
+               let itemSymbol = false;\n\
+               try { all.item(); } catch (error) { itemMissing = error instanceof TypeError; }\n\
+               try { all.item(Symbol('index')); }\n\
+               catch (error) { itemSymbol = error instanceof TypeError; }\n\
+               let lengthWrongBrand = false;\n\
+               try { lengthDescriptor.get.call({}); }\n\
+               catch (error) { lengthWrongBrand = error instanceof TypeError; }\n\
+\n\
+               const iterated = Array.from(all);\n\
+               const keys = Array.from(all.keys());\n\
+               const entries = Array.from(all.entries());\n\
+               let forEachGood = true;\n\
+               const seen = [];\n\
+               all.forEach((value, index, receiver) => {\n\
+                 forEachGood &&= receiver === all && value === all[index];\n\
+                 seen.push(value);\n\
+               });\n\
+               const genericIterator = listPrototype.values.call({\n\
+                 0: 'generic', length: 1\n\
+               });\n\
+               globalThis.keptNodeList = all;\n\
+               globalThis.nodeListProof =\n\
+                 documentQsa && documentQsa.value.name === 'querySelectorAll' &&\n\
+                 documentQsa.value.length === 1 && documentQsa.enumerable &&\n\
+                 documentQsa.writable && documentQsa.configurable &&\n\
+                 elementQsa && elementQsa.value.length === 1 &&\n\
+                 documentWrongBrand && !documentWrongBrandStringified &&\n\
+                 elementWrongBrand && !elementWrongBrandStringified &&\n\
+                 conversionPreserved && missingRejected && symbolRejected &&\n\
+                 syntaxRejected && elementSyntaxRejected && staticSnapshot &&\n\
+                 all !== fresh && all instanceof NodeList &&\n\
+                 Object.getPrototypeOf(all) === listPrototype &&\n\
+                 Object.prototype.toString.call(all) === '[object NodeList]' &&\n\
+                 NodeList.name === 'NodeList' && NodeList.length === 0 &&\n\
+                 listPrototype.constructor === NodeList &&\n\
+                 illegalCall && illegalConstruct &&\n\
+                 lengthDescriptor && lengthDescriptor.enumerable &&\n\
+                 lengthDescriptor.configurable && lengthDescriptor.set === undefined &&\n\
+                 itemDescriptor && itemDescriptor.enumerable && itemDescriptor.writable &&\n\
+                 itemDescriptor.configurable && itemDescriptor.value.length === 1 &&\n\
+                 iterableDescriptors && listPrototype.values === listPrototype[Symbol.iterator] &&\n\
+                 all.length === 3 && Object.keys(all).join(',') === '0,1,2' &&\n\
+                 indexDescriptor && !indexDescriptor.writable &&\n\
+                 indexDescriptor.enumerable && indexDescriptor.configurable &&\n\
+                 all[0] === document.documentElement && all[2] === target &&\n\
+                 all.item(0) === all[0] && all.item(3) === null &&\n\
+                 targetList.length === 1 && targetList[0] === target &&\n\
+                 itemWrongBrand && !itemWrongBrandTouched && itemMissing && itemSymbol &&\n\
+                 lengthWrongBrand && iterated.length === 3 &&\n\
+                 iterated.every((value, index) => value === all[index]) &&\n\
+                 keys.join(',') === '0,1,2' && entries.length === 3 &&\n\
+                 entries.every((entry, index) => entry[0] === index &&\n\
+                   entry[1] === all[index]) && forEachGood && seen.length === 3 &&\n\
+                 genericIterator.next().value === 'generic';\n\
+             })();",
+            "query-selector-all.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token remains live for this one synchronous host entry.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(runtime.eval_bool_in_realm(realm, "nodeListProof").unwrap());
+
+        runtime.collect_garbage_for_testing();
+        let dropped_after_unreachable_lists = node_list_drops.get();
+        assert!(dropped_after_unreachable_lists > 0);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "keptNodeList.length === 3")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "globalThis.keptNodeList = null; true")
+                .unwrap()
+        );
+        runtime.collect_garbage_for_testing();
+        assert!(node_list_drops.get() > dropped_after_unreachable_lists);
+
+        let teardown_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "globalThis.teardownNodeList = document.querySelectorAll('#target');",
+            "query-selector-all-teardown.js",
+            1,
+        ));
+        // SAFETY: The token remains live for this one synchronous host entry.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    teardown_script,
+                    (&mut host_context_token as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        let before_teardown = node_list_drops.get();
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(node_list_drops.get(), before_teardown + 1);
+        assert_eq!(document_drops.get(), 1);
+    }
+
+    #[test]
     fn document_hosts_are_realm_local_live_and_dropped_synchronously() {
         let options = Options {
             expose_gc: 1,
@@ -4867,6 +5432,7 @@ mod tests {
         let vtable = DocumentHostVTable::for_type::<DocumentHostProbe>();
         let callback = vtable.get_element_by_id.unwrap();
         let query_callback = vtable.query_selector.unwrap();
+        let query_all_callback = vtable.query_selector_all.unwrap();
         let mut host_context = 0_u8;
         let host_context = (&mut host_context as *mut u8).cast::<c_void>();
         let mut output = RawInterfaceValue {
@@ -4982,6 +5548,77 @@ mod tests {
             );
             assert_eq!(query_output.status, SELECTOR_SYNTAX_ERROR);
             assert_eq!(query_output.value.is_null, 1);
+
+            let mut query_all_output = RawSelectorNodeListOutcome {
+                status: u32::MAX,
+                native: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                query_all_callback(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut query_all_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                query_all_callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    1,
+                    &mut query_all_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                query_all_callback(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut query_all_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                query_all_callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                0,
+            );
+            let target = b"#target";
+            assert_eq!(
+                query_all_callback(
+                    native,
+                    host_context,
+                    target.as_ptr(),
+                    target.len(),
+                    &mut query_all_output,
+                ),
+                1,
+            );
+            assert_eq!(query_all_output.status, SELECTOR_RETURNED);
+            assert!(!query_all_output.native.is_null());
+            node_list_host_drop::<NodeListHostProbe>(query_all_output.native);
+            assert_eq!(
+                query_all_callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    &mut query_all_output,
+                ),
+                1,
+            );
+            assert_eq!(query_all_output.status, SELECTOR_SYNTAX_ERROR);
+            assert!(query_all_output.native.is_null());
             vtable.drop.unwrap()(native);
         }
         assert_eq!(&*calls.borrow(), &[""]);
@@ -5006,6 +5643,7 @@ mod tests {
         let closest = element_host_closest::<ElementHostProbe>;
         let matches = element_host_matches::<ElementHostProbe>;
         let webkit_matches = element_host_webkit_matches_selector::<ElementHostProbe>;
+        let query_all = element_host_query_selector_all::<ElementHostProbe>;
         let invalid_utf8 = [0xff];
         let mut element_output = RawSelectorElementOutcome {
             status: u32::MAX,
@@ -5121,6 +5759,45 @@ mod tests {
             );
             assert_eq!(boolean_output.status, SELECTOR_SYNTAX_ERROR);
             assert_eq!(boolean_output.value, 0);
+
+            let mut node_list_output = RawSelectorNodeListOutcome {
+                status: u32::MAX,
+                native: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                query_all(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut node_list_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                query_all(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut node_list_output,
+                ),
+                0,
+            );
+            let all = b"*";
+            assert_eq!(
+                query_all(
+                    native,
+                    host_context,
+                    all.as_ptr(),
+                    all.len(),
+                    &mut node_list_output,
+                ),
+                1,
+            );
+            assert_eq!(node_list_output.status, SELECTOR_RETURNED);
+            assert!(!node_list_output.native.is_null());
+            node_list_host_drop::<NodeListHostProbe>(node_list_output.native);
             element_host_drop::<ElementHostProbe>(native);
         }
         assert_eq!(element_drops.get(), 2);

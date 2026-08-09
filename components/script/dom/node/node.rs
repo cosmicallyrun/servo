@@ -1647,28 +1647,40 @@ impl Node {
     ) -> Fallible<DomRoot<NodeList>> {
         // > The querySelectorAll(selectors) method steps are to return the static result of running scope-match
         // > a selectors string selectors against this.
+        let matching_elements = self.query_selector_all_elements(cx.no_gc(), selectors)?;
+        let iter = matching_elements.into_iter().map(DomRoot::upcast::<Node>);
+
+        Ok(NodeList::new_simple_list(cx, &self.owner_window(), iter))
+    }
+
+    /// Runs ParentNode scope-match without constructing SpiderMonkey's
+    /// NodeList wrapper. The returned roots are the static query snapshot used
+    /// by both the ordinary binding and the authoritative V8 sidecar.
+    #[allow(unsafe_code)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn query_selector_all_elements(
+        &self,
+        no_gc: &NoGC,
+        selectors: DOMString,
+    ) -> Fallible<Vec<DomRoot<Element>>> {
         let document_url = self.owner_document().url().get_arc();
 
         // If there are any duplicate ids, their targets may need to be updated in the id map before
         // layout runs, so that the map can gather their elements in DOM order.
         self.owner_document()
             .id_map()
-            .resolve_all(cx.no_gc(), self.owner_doc().upcast());
+            .resolve_all(no_gc, self.owner_doc().upcast());
 
-        let traced_node = UnrootedDom::from_dom(Dom::from_ref(self), cx.no_gc());
+        let traced_node = UnrootedDom::from_dom(Dom::from_ref(self), no_gc);
         let matching_elements = with_layout_state(|| {
             let layout_node: LayoutDom<'_, _> = unsafe { traced_node.to_layout() };
             ServoDangerousStyleNode::from(layout_node)
                 .scope_match_a_selectors_string::<QueryAll>(document_url, &selectors.str())
         })?;
-        let iter = matching_elements
+        Ok(matching_elements
             .into_iter()
             .map(ServoDangerousStyleElement::rooted)
-            .map(DomRoot::upcast::<Node>);
-
-        // NodeList::new_simple_list immediately collects the iterator, so we're not leaking LayoutDom
-        // elements here.
-        Ok(NodeList::new_simple_list(cx, &self.owner_window(), iter))
+            .collect())
     }
 
     pub(crate) fn ancestors(&self) -> impl Iterator<Item = DomRoot<Node>> + use<> {

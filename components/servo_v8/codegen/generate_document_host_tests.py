@@ -52,7 +52,10 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_element_by_id)(void* native, void* host_context,",
             "typedef struct ServoV8SelectorElementOutcome {",
             "typedef struct ServoV8SelectorBooleanOutcome {",
+            "typedef struct ServoV8SelectorNodeListOutcome {",
             "uint8_t (*query_selector)(void* native, void* host_context,",
+            "uint8_t (*query_selector_all)(void* native, void* host_context,",
+            "ServoV8SelectorNodeListOutcome* output);",
             "const uint8_t* element_id,",
             "ServoV8DropCallback drop;",
         )
@@ -82,13 +85,16 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "fn child_element_count(&self) -> u32;",
             "unsafe fn get_element_by_id(",
             "unsafe fn query_selector(",
+            "unsafe fn query_selector_all(",
             "pub struct RawSelectorElementOutcome {",
             "pub struct RawSelectorBooleanOutcome {",
+            "pub struct RawSelectorNodeListOutcome {",
             "std::slice::from_raw_parts(element_id, element_id_length)",
             "set_bg_color: Some(document_host_set_bg_color::<T>)",
             "set_title: Some(document_host_set_title::<T>)",
             "get_element_by_id: Some(document_host_get_element_by_id::<T>)",
             "query_selector: Some(document_host_query_selector::<T>)",
+            "query_selector_all: Some(document_host_query_selector_all::<T>)",
         )
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
@@ -115,6 +121,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "DocumentHostGetChildElementCount(",
             "DocumentHostCallGetElementById(",
             "DocumentHostCallQuerySelector(",
+            "DocumentHostCallQuerySelectorAll(",
             "auto* state = UnwrapDocumentHostState(info);",
             "if (info[0]->IsNull()) {",
             "info[0]->ToString(context)",
@@ -123,6 +130,8 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "state->vtable.get_ready_state(state->native, &value)",
             "value.is_null > 1",
             "Document.getElementById requires one argument",
+            "DropUnownedNodeListHost(state->runtime, outcome.native);",
+            "ReturnSelectorNodeListOutcome(realm, context, outcome, \"Document.querySelectorAll\"",
             "InstallDocumentHostMembers(",
         )
         for fragment in expected_fragments:
@@ -130,6 +139,18 @@ class DocumentHostGenerationTests(unittest.TestCase):
                 self.assertIn(fragment, output)
         self.assertNotIn("CallDocumentHostGet", output)
         self.assertNotIn("CallDocumentHostSet", output)
+
+    def test_marks_only_pure_selector_operations_as_side_effect_free(self) -> None:
+        output = self.outputs[generate_document_host.CPP_NAME]
+        query_selector_install = output.split(
+            "v8::Function::New(context, DocumentHostCallQuerySelector,", 1
+        )[1].split(".ToLocal", 1)[0]
+        query_selector_all_install = output.split(
+            "v8::Function::New(context, DocumentHostCallQuerySelectorAll,", 1
+        )[1].split(".ToLocal", 1)[0]
+
+        self.assertIn("v8::SideEffectType::kHasNoSideEffect", query_selector_install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", query_selector_all_install)
 
     def test_generates_distinct_ordinary_and_legacy_null_conversion(self) -> None:
         output = self.outputs[generate_document_host.CPP_NAME]
@@ -163,6 +184,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
                 operation_shapes = {
                     production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
                 }
                 if member.shape not in operation_shapes:
                     slot = f"get_{slot}"
@@ -179,6 +201,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
                 if member.shape in {
                     production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
                 }:
                     self.assertIn(f"DocumentHostCall{callback}", output)
                     self.assertIn(f"{local}_method, v8::None", output)

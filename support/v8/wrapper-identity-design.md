@@ -3,6 +3,8 @@
 Status: implemented, initially at exported C ABI version 19 and extended with a
 shared Element prototype at ABI version 22 and its inherited Node prototype at
 ABI version 23. ABI version 24 adds ParentNode Element traversal.
+ABI version 27 adds static querySelectorAll NodeLists whose items converge on
+the same Element cache while each collection wrapper remains `[NewObject]`.
 `Document.documentElement`, `Document.head`, `Document.getElementById()`, the
 Element/Node scalar slices, and ParentNode traversal are built on it.
 
@@ -151,6 +153,17 @@ rather than silent type erasure.
 The wrapper cache, cell, and per-realm `Element` template remain hand-written
 infrastructure in `bridge.cc`; member-specific code no longer lives there.
 
+`querySelectorAll` collections deliberately do not enter the identity map:
+WebIDL marks every result `[NewObject]`, so two calls must produce different
+NodeList wrappers even when their snapshots contain the same elements. They do
+reuse the same cell type with an explicit host-kind brand. Each realm keeps
+weak handles to these uncached cells solely so teardown can release their
+static `Trusted<Element>` vectors synchronously; the major-GC epilogue prunes
+cleared collection handles alongside cleared Element-cache entries. Calling
+`item()` or reading an indexed value still routes the returned Element through
+the ordinary cache, so collection and direct query paths preserve item
+identity.
+
 ## What this does not do
 
 The current scalar setters can mutate attributes and text, but nothing here
@@ -225,7 +238,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_get_element_by_id_proof.html`, and
 `authoritative_element_scalar_proof.html`,
 `authoritative_node_scalar_proof.html`, and
-`authoritative_parent_node_proof.html` cover runtime behaviour against real
+`authoritative_parent_node_proof.html`, and
+`authoritative_query_selector_all_proof.html` cover runtime behaviour against real
 Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by
