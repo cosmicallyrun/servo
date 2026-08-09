@@ -109,6 +109,11 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
             attributes[production_webidl.DOCUMENT_HEAD].type.inner.name,
             "HTMLHeadElement",
         )
+        children = attributes[production_webidl.DOCUMENT_CHILDREN]
+        self.assertTrue(children.readonly)
+        self.assertFalse(children.type.nullable())
+        self.assertEqual(children.type.name, "HTMLCollection")
+        self.assertEqual(set(children._extendedAttrDict), {"SameObject"})
         for qualified_name in (
             production_webidl.DOCUMENT_FIRST_ELEMENT_CHILD,
             production_webidl.DOCUMENT_LAST_ELEMENT_CHILD,
@@ -229,6 +234,11 @@ class ProductionElementTests(unittest.TestCase):
         self.assertTrue(members[production_webidl.ELEMENT_TAG_NAME].readonly)
         self.assertFalse(members[production_webidl.ELEMENT_ID].readonly)
         self.assertFalse(members[production_webidl.ELEMENT_CLASS_NAME].readonly)
+        children = members[production_webidl.ELEMENT_CHILDREN]
+        self.assertTrue(children.readonly)
+        self.assertFalse(children.type.nullable())
+        self.assertEqual(children.type.name, "HTMLCollection")
+        self.assertEqual(set(children._extendedAttrDict), {"SameObject"})
         return_type, arguments = members[
             production_webidl.ELEMENT_GET_ATTRIBUTE
         ].signatures()[0]
@@ -268,6 +278,48 @@ class ProductionElementTests(unittest.TestCase):
         ].signatures()[0]
         self.assertEqual(query_all_return.name, "NodeList")
         self.assertEqual(query_all_arguments[0].identifier.name, "selectors")
+
+
+class ProductionHTMLCollectionTests(unittest.TestCase):
+    def test_pins_the_complete_real_interface(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            interface = production_webidl.select_html_collection_interface(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(interface.identifier.name, "HTMLCollection")
+        self.assertEqual(
+            interface._extendedAttrDict,
+            {"Exposed": ["Window"], "LegacyUnenumerableNamedProperties": True},
+        )
+        self.assertIsNone(interface.ctor())
+        self.assertIsNone(interface.parent)
+        self.assertEqual(
+            [member.identifier.name for member in interface.members],
+            ["length", "item", "namedItem"],
+        )
+        length, item, named_item = interface.members
+        self.assertTrue(length.readonly)
+        self.assertEqual(length.type.prettyName(), "unsigned long")
+        self.assertEqual(set(length._extendedAttrDict), {"Pure"})
+        self.assertTrue(item.isGetter())
+        self.assertTrue(item.isIndexed())
+        self.assertFalse(item.isNamed())
+        self.assertTrue(named_item.isGetter())
+        self.assertTrue(named_item.isNamed())
+        self.assertFalse(named_item.isIndexed())
+        for member, argument_name, argument_type in (
+            (item, "index", "unsigned long"),
+            (named_item, "name", "DOMString"),
+        ):
+            with self.subTest(member=member.identifier.name):
+                return_type, arguments = member.signatures()[0]
+                self.assertTrue(return_type.nullable())
+                self.assertEqual(return_type.inner.name, "Element")
+                self.assertEqual(arguments[0].identifier.name, argument_name)
+                self.assertEqual(arguments[0].type.prettyName(), argument_type)
+                self.assertEqual(set(member._extendedAttrDict), {"Pure"})
 
 
 class ProductionNodeTests(unittest.TestCase):
@@ -317,6 +369,112 @@ class SyntheticSelectionTests(unittest.TestCase):
                 parser_results,
                 production_webidl.DOCUMENT_HIDDEN,
             )
+
+    def html_collection_source(
+        self,
+        *,
+        interface_attributes: str = (
+            "[Exposed=Window, LegacyUnenumerableNamedProperties]"
+        ),
+        constructor: str = "",
+        length: str = "[Pure] readonly attribute unsigned long length;",
+        item: str = "[Pure] getter Element? item(unsigned long index);",
+        named_item: str = "[Pure] getter Element? namedItem(DOMString name);",
+        extra: str = "",
+    ) -> str:
+        return f"""
+            [Global=Window, Exposed=Window] interface Window {{}};
+            [Exposed=Window] interface Element {{}};
+            {interface_attributes}
+            interface HTMLCollection {{
+              {constructor}
+              {length}
+              {item}
+              {named_item}
+              {extra}
+            }};
+        """
+
+    def assert_html_collection_rejected(self, expected: str, **changes: str) -> None:
+        parser_results = self.parse(
+            {"HTMLCollection.webidl": self.html_collection_source(**changes)}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_html_collection_interface(parser_results)
+
+    def test_rejects_html_collection_interface_attribute_drift(self) -> None:
+        self.assert_html_collection_rejected(
+            "`HTMLCollection` must carry exactly ['Exposed', "
+            "'LegacyUnenumerableNamedProperties'], got ['Exposed']",
+            interface_attributes="[Exposed=Window]",
+        )
+        self.assert_html_collection_rejected(
+            "`HTMLCollection` must carry exactly `[Exposed=Window]`",
+            interface_attributes=(
+                "[Exposed=*, LegacyUnenumerableNamedProperties]"
+            ),
+        )
+
+    def test_rejects_constructible_html_collection(self) -> None:
+        self.assert_html_collection_rejected(
+            "`HTMLCollection` must not be constructible",
+            constructor="constructor();",
+        )
+
+    def test_rejects_extra_html_collection_member(self) -> None:
+        self.assert_html_collection_rejected(
+            "`HTMLCollection` must declare exactly ['length', 'item', "
+            "'namedItem'], got ['length', 'item', 'namedItem', 'extra']",
+            extra="undefined extra();",
+        )
+
+    def test_rejects_html_collection_length_drift(self) -> None:
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.length` must carry exactly ['Pure'], got []",
+            length="readonly attribute unsigned long length;",
+        )
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.length` must be readonly",
+            length="[Pure] attribute unsigned long length;",
+        )
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.length` must use non-nullable `unsigned long`, "
+            "got `unsigned short`",
+            length="[Pure] readonly attribute unsigned short length;",
+        )
+
+    def test_rejects_html_collection_indexed_getter_drift(self) -> None:
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.item` must be an indexed instance getter",
+            item="[Pure] Element? item(unsigned long index);",
+        )
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.item` must carry exactly ['Pure'], got []",
+            item="getter Element? item(unsigned long index);",
+        )
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.item` must return nullable `Element`, got `Element`",
+            item="[Pure] getter Element item(unsigned long index);",
+        )
+
+    def test_rejects_html_collection_named_getter_drift(self) -> None:
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.namedItem` must carry exactly ['Pure'], got []",
+            named_item="getter Element? namedItem(DOMString name);",
+        )
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.namedItem` must take required non-nullable "
+            "`DOMString name`",
+            named_item="[Pure] getter Element? namedItem(DOMString key);",
+        )
+        self.assert_html_collection_rejected(
+            "`HTMLCollection.namedItem` must return nullable `Element`, "
+            "got `Element`",
+            named_item="[Pure] getter Element namedItem(DOMString name);",
+        )
 
     def test_selects_attribute_from_partial_interface(self) -> None:
         parser_results = self.parse(
@@ -579,6 +737,71 @@ class SyntheticSelectionTests(unittest.TestCase):
                 parser_results,
                 production_webidl.DOCUMENT_HEAD,
                 "HTMLHeadElement",
+            )
+
+    def assert_children_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": f"""
+                    interface Element {{}};
+                    interface HTMLCollection {{}};
+                    interface Document {{ {declaration} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_sameobject_readonly_interface_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_CHILDREN,
+                "HTMLCollection",
+            )
+
+    def test_rejects_children_without_sameobject(self) -> None:
+        self.assert_children_rejected(
+            "readonly attribute HTMLCollection children;",
+            "`Document.children` must carry exactly ['SameObject'], got []",
+        )
+
+    def test_rejects_nullable_children(self) -> None:
+        self.assert_children_rejected(
+            "[SameObject] readonly attribute HTMLCollection? children;",
+            "`Document.children` must be non-nullable",
+        )
+
+    def test_rejects_the_wrong_children_interface(self) -> None:
+        self.assert_children_rejected(
+            "[SameObject] readonly attribute Element children;",
+            "`Document.children` must return `HTMLCollection`, got `Element`",
+        )
+
+    def test_rejects_writable_children(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface HTMLCollection {};
+                    interface Document {
+                      [SameObject] readonly attribute HTMLCollection children;
+                    };
+                """,
+            }
+        )
+        document = next(
+            result
+            for result in parser_results
+            if result.isInterface() and result.identifier.name == "Document"
+        )
+        document.members[0].readonly = False
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape("`Document.children` must be readonly"),
+        ):
+            production_webidl.select_sameobject_readonly_interface_attribute(
+                parser_results,
+                production_webidl.DOCUMENT_CHILDREN,
+                "HTMLCollection",
             )
 
     def test_rejects_parent_node_interface_getter_without_pure(self) -> None:
@@ -1117,6 +1340,28 @@ class SyntheticSelectionTests(unittest.TestCase):
             "id",
             "`Element.id` must carry exactly ['CEReactions', 'Pure'], got ['Pure']",
         )
+
+    def test_rejects_element_children_without_sameobject(self) -> None:
+        parser_results = self.parse(
+            {
+                "Element.webidl": """
+                    interface HTMLCollection {};
+                    interface Element {
+                      readonly attribute HTMLCollection children;
+                    };
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(
+                "`Element.children` must carry exactly ['SameObject'], got []"
+            ),
+        ):
+            production_webidl._select_element_host_member(
+                parser_results,
+                production_webidl.ELEMENT_CHILDREN,
+            )
 
     def test_rejects_nonnullable_get_attribute_return(self) -> None:
         self.assert_element_rejected(

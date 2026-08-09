@@ -46,6 +46,10 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_title)(void* native, ServoV8OwnedUtf8* output);",
             "uint8_t (*set_title)(void* native, void* host_context,",
             "uint8_t (*get_head)(void* native, ServoV8InterfaceValue* output);",
+            "typedef struct ServoV8HTMLCollectionValue {",
+            "const void* key;",
+            "void* native;",
+            "uint8_t (*get_children)(void* native, ServoV8HTMLCollectionValue* output);",
             "uint8_t (*get_first_element_child)(void* native, ServoV8InterfaceValue* output);",
             "uint8_t (*get_last_element_child)(void* native, ServoV8InterfaceValue* output);",
             "uint32_t (*get_child_element_count)(void* native);",
@@ -80,6 +84,10 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "Box::from_raw(owner.cast::<Vec<u8>>())",
             "std::str::from_utf8(bytes)",
             "fn head(&self) -> Option<InterfaceHandle>;",
+            "fn children(&self) -> HTMLCollectionHandle;",
+            "pub struct RawHTMLCollectionValue {",
+            "output: *mut RawHTMLCollectionValue,",
+            "*output = RawHTMLCollectionValue {",
             "fn first_element_child(&self) -> Option<InterfaceHandle>;",
             "fn last_element_child(&self) -> Option<InterfaceHandle>;",
             "fn child_element_count(&self) -> u32;",
@@ -116,6 +124,11 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "DocumentHostSetTitle(",
             "DocumentHostGetDocumentElement(",
             "DocumentHostGetHead(",
+            "DocumentHostGetChildren(",
+            "ServoV8HTMLCollectionValue value{};",
+            "!realm->runtime->html_collection_host_installed",
+            "DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            "WrapperForHTMLCollectionValue(realm, context, value);",
             "DocumentHostGetFirstElementChild(",
             "DocumentHostGetLastElementChild(",
             "DocumentHostGetChildElementCount(",
@@ -213,15 +226,24 @@ class DocumentHostGenerationTests(unittest.TestCase):
     def test_cli_writes_exactly_the_three_document_host_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             out_dir = Path(temporary_directory) / "out"
-            with mock.patch.dict("os.environ", {}, clear=True):
-                generate_document_host.main(
-                    [str(production_webidl.PRODUCTION_WEBIDLS_DIR), str(out_dir)]
-                )
+            with mock.patch.object(
+                production_webidl,
+                "select_html_collection_interface",
+                wraps=production_webidl.select_html_collection_interface,
+            ) as html_collection_gate:
+                with mock.patch.dict("os.environ", {}, clear=True):
+                    generate_document_host.main(
+                        [
+                            str(production_webidl.PRODUCTION_WEBIDLS_DIR),
+                            str(out_dir),
+                        ]
+                    )
             written = {
                 path.name: path.read_text(encoding="utf-8")
                 for path in out_dir.iterdir()
             }
 
+        html_collection_gate.assert_called_once()
         self.assertEqual(written, self.outputs)
 
 

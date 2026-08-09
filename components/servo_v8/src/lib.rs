@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 27;
+const ABI_VERSION: u32 = 28;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -245,12 +245,64 @@ pub unsafe trait NodeListHostBinding: Sized + 'static {
     fn item(&self, index: u32) -> Option<InterfaceHandle>;
 }
 
+/// One live HTMLCollection host being transferred to V8.
+pub struct HTMLCollectionHandle {
+    pub key: *const c_void,
+    pub native: *mut c_void,
+}
+
+impl HTMLCollectionHandle {
+    /// Boxes `host` and transfers it through the runtime's installed
+    /// HTMLCollection vtable. `key` identifies the collection's owner for the
+    /// realm-local `[SameObject]` wrapper cache.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the exact type previously passed to
+    /// `Runtime::install_html_collection_host` for the receiving runtime.
+    /// `key` must remain a stable identity for as long as `host` keeps the
+    /// collection owner rooted.
+    pub unsafe fn new<T: HTMLCollectionHostBinding>(key: *const c_void, host: T) -> Self {
+        Self {
+            key,
+            native: Box::into_raw(Box::new(host)).cast(),
+        }
+    }
+}
+
+/// A live HTMLCollection returned by ParentNode.children.
+///
+/// # Safety
+///
+/// Implementations stay on their originating script thread. `length`, `item`,
+/// `named_item`, and `Drop` must not unwind, re-enter V8 or cppgc, or pump an
+/// event loop. Every returned item must be a freshly-owned host of the exact
+/// type installed through `Runtime::install_element_host` and must key the
+/// rooted Servo Element it represents.
+pub unsafe trait HTMLCollectionHostBinding: Sized + 'static {
+    fn length(&self) -> u32;
+    fn item(&self, index: u32) -> Option<InterfaceHandle>;
+    fn named_item(&self, name: &str) -> Option<InterfaceHandle>;
+    fn supported_names(&self) -> Vec<String>;
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct HTMLCollectionHostVTable {
+    pub get_length: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
+    pub item: Option<unsafe extern "C" fn(*mut c_void, u32, *mut RawInterfaceValue) -> u8>,
+    pub named_item:
+        Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut RawInterfaceValue) -> u8>,
+    pub get_supported_name_count: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
+    pub supported_name: Option<unsafe extern "C" fn(*mut c_void, u32, *mut OwnedUtf8) -> u8>,
+    pub drop: Option<DropCallback>,
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct NodeListHostVTable {
     pub get_length: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
-    pub item:
-        Option<unsafe extern "C" fn(*mut c_void, u32, *mut RawInterfaceValue) -> u8>,
+    pub item: Option<unsafe extern "C" fn(*mut c_void, u32, *mut RawInterfaceValue) -> u8>,
     pub drop: Option<DropCallback>,
 }
 
@@ -282,6 +334,7 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     fn text_content(&self) -> Option<String>;
     unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool;
     fn has_child_nodes(&self) -> bool;
+    fn children(&self) -> HTMLCollectionHandle;
     fn first_element_child(&self) -> Option<InterfaceHandle>;
     fn last_element_child(&self) -> Option<InterfaceHandle>;
     fn child_element_count(&self) -> u32;
@@ -338,6 +391,7 @@ pub struct ElementHostVTable {
     pub set_text_content:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
     pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_children: Option<unsafe extern "C" fn(*mut c_void, *mut RawHTMLCollectionValue) -> u8>,
     pub get_first_element_child:
         Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub get_last_element_child:
@@ -921,6 +975,25 @@ unsafe extern "C" fn element_host_has_child_nodes<T: ElementHostBinding>(
     1
 }
 
+unsafe extern "C" fn element_host_get_children<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut RawHTMLCollectionValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let handle = unsafe { (&*native.cast::<T>()).children() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe {
+        *output = RawHTMLCollectionValue {
+            key: handle.key,
+            native: handle.native,
+        }
+    };
+    1
+}
+
 unsafe extern "C" fn element_host_get_first_element_child<T: ElementHostBinding>(
     native: *mut c_void,
     output: *mut RawInterfaceValue,
@@ -1126,6 +1199,104 @@ fn node_list_host_vtable<T: NodeListHostBinding>() -> NodeListHostVTable {
     }
 }
 
+unsafe extern "C" fn html_collection_host_get_length<T: HTMLCollectionHostBinding>(
+    native: *mut c_void,
+    output: *mut u32,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    unsafe { *output = (&*native.cast::<T>()).length() };
+    1
+}
+
+unsafe extern "C" fn html_collection_host_item<T: HTMLCollectionHostBinding>(
+    native: *mut c_void,
+    index: u32,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let item = unsafe { (&*native.cast::<T>()).item(index) };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, item) }
+}
+
+unsafe extern "C" fn html_collection_host_named_item<T: HTMLCollectionHostBinding>(
+    native: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() || (name.is_null() && name_length != 0) {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(name) = (unsafe { element_host_utf8(name, name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let item = unsafe { (&*native.cast::<T>()).named_item(name) };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, item) }
+}
+
+unsafe extern "C" fn html_collection_host_get_supported_name_count<T: HTMLCollectionHostBinding>(
+    native: *mut c_void,
+    output: *mut u32,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let names = unsafe { (&*native.cast::<T>()).supported_names() };
+    let Ok(count) = u32::try_from(names.len()) else {
+        return 0;
+    };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { *output = count };
+    1
+}
+
+unsafe extern "C" fn html_collection_host_supported_name<T: HTMLCollectionHostBinding>(
+    native: *mut c_void,
+    index: u32,
+    output: *mut OwnedUtf8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let names = unsafe { (&*native.cast::<T>()).supported_names() };
+    let Some(name) = names.into_iter().nth(index as usize) else {
+        return 0;
+    };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_owned_utf8(output, name) }
+}
+
+unsafe extern "C" fn html_collection_host_drop<T: HTMLCollectionHostBinding>(native: *mut c_void) {
+    if native.is_null() {
+        return;
+    }
+    // SAFETY: The bridge returns the exact Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+fn html_collection_host_vtable<T: HTMLCollectionHostBinding>() -> HTMLCollectionHostVTable {
+    HTMLCollectionHostVTable {
+        get_length: Some(html_collection_host_get_length::<T>),
+        item: Some(html_collection_host_item::<T>),
+        named_item: Some(html_collection_host_named_item::<T>),
+        get_supported_name_count: Some(html_collection_host_get_supported_name_count::<T>),
+        supported_name: Some(html_collection_host_supported_name::<T>),
+        drop: Some(html_collection_host_drop::<T>),
+    }
+}
+
 fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
     ElementHostVTable {
         get_local_name: Some(element_host_get_local_name::<T>),
@@ -1143,6 +1314,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         get_text_content: Some(element_host_get_text_content::<T>),
         set_text_content: Some(element_host_set_text_content::<T>),
         has_child_nodes: Some(element_host_has_child_nodes::<T>),
+        get_children: Some(element_host_get_children::<T>),
         get_first_element_child: Some(element_host_get_first_element_child::<T>),
         get_last_element_child: Some(element_host_get_last_element_child::<T>),
         get_child_element_count: Some(element_host_get_child_element_count::<T>),
@@ -1288,6 +1460,11 @@ unsafe extern "C" {
     fn servo_v8_install_node_list_host(
         runtime: *mut RawRuntime,
         vtable: *const NodeListHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_install_html_collection_host(
+        runtime: *mut RawRuntime,
+        vtable: *const HTMLCollectionHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_install_engine_binding_smoke(
@@ -1801,8 +1978,27 @@ impl Runtime {
         let mut error = error_buffer(&mut storage);
         // SAFETY: The runtime is live and C++ copies the complete vtable
         // synchronously before this method returns.
+        let succeeded =
+            unsafe { servo_v8_install_node_list_host(self.raw.as_ptr(), &vtable, &mut error) };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
+    /// Registers the type-level host for live HTMLCollections returned by
+    /// ParentNode.children. Each owner transfers a host separately and the
+    /// realm preserves the attribute's `[SameObject]` wrapper identity.
+    pub fn install_html_collection_host<T: HTMLCollectionHostBinding>(
+        &mut self,
+    ) -> Result<(), Error> {
+        let vtable = html_collection_host_vtable::<T>();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The runtime is live and C++ copies the complete vtable
+        // synchronously before this method returns.
         let succeeded = unsafe {
-            servo_v8_install_node_list_host(self.raw.as_ptr(), &vtable, &mut error)
+            servo_v8_install_html_collection_host(self.raw.as_ptr(), &vtable, &mut error)
         };
         if succeeded == 0 {
             return Err(error_from(&storage, &error));
@@ -2337,7 +2533,8 @@ mod tests {
         text_content: RefCell<Option<String>>,
         has_child_nodes: Cell<bool>,
         is_connected: Cell<bool>,
-        element_children: RefCell<Vec<ElementProbeChild>>,
+        element_children: Rc<RefCell<Vec<ElementProbeChild>>>,
+        html_collection_drops: Rc<Cell<usize>>,
     }
 
     impl ElementProbeState {
@@ -2360,7 +2557,8 @@ mod tests {
                 text_content: RefCell::new(Some(text_content.to_owned())),
                 has_child_nodes: Cell::new(has_child_nodes),
                 is_connected: Cell::new(true),
-                element_children: RefCell::new(Vec::new()),
+                element_children: Rc::new(RefCell::new(Vec::new())),
+                html_collection_drops: Rc::new(Cell::new(0)),
             })
         }
 
@@ -2455,7 +2653,77 @@ mod tests {
         }
 
         fn item(&self, index: u32) -> Option<InterfaceHandle> {
-            self.items.get(index as usize).map(|item| item.interface_handle())
+            self.items
+                .get(index as usize)
+                .map(|item| item.interface_handle())
+        }
+    }
+
+    struct HTMLCollectionHostProbe {
+        items: Rc<RefCell<Vec<ElementProbeChild>>>,
+        element_drops: Rc<Cell<usize>>,
+        drop_reentry: Option<ElementDropReentryProbe>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for HTMLCollectionHostProbe {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    impl HTMLCollectionHostProbe {
+        fn item_handle(&self, index: usize) -> Option<InterfaceHandle> {
+            let child = self.items.borrow().get(index)?.clone();
+            NodeListProbeItem {
+                local_name: child.local_name,
+                tag_name: child.tag_name,
+                identity: Rc::as_ptr(&child.identity).cast(),
+                state: child.state,
+                owned_identity: Some(child.identity),
+                element_drops: Rc::clone(&self.element_drops),
+                drop_reentry: self.drop_reentry.clone(),
+            }
+            .interface_handle()
+            .into()
+        }
+    }
+
+    // SAFETY: The live child vector and its identities are Rc-rooted on the
+    // runtime's owner thread. No callback or Drop can enter V8.
+    unsafe impl HTMLCollectionHostBinding for HTMLCollectionHostProbe {
+        fn length(&self) -> u32 {
+            self.items.borrow().len() as u32
+        }
+
+        fn item(&self, index: u32) -> Option<InterfaceHandle> {
+            self.item_handle(index as usize)
+        }
+
+        fn named_item(&self, name: &str) -> Option<InterfaceHandle> {
+            if name.is_empty() {
+                return None;
+            }
+            let index = self.items.borrow().iter().position(|child| {
+                child.state.get("id").as_deref() == Some(name)
+                    || child.state.get("name").as_deref() == Some(name)
+            })?;
+            self.item_handle(index)
+        }
+
+        fn supported_names(&self) -> Vec<String> {
+            let mut names = Vec::new();
+            for child in self.items.borrow().iter() {
+                for name in [child.state.get("id"), child.state.get("name")]
+                    .into_iter()
+                    .flatten()
+                {
+                    if !name.is_empty() && !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            names
         }
     }
 
@@ -2566,12 +2834,31 @@ mod tests {
             let value = value.unwrap_or_default();
             *self.state.text_content.borrow_mut() = Some(value.to_owned());
             self.state.has_child_nodes.set(!value.is_empty());
+            for child in self.state.element_children.borrow().iter() {
+                child.state.is_connected.set(false);
+            }
             self.state.element_children.borrow_mut().clear();
             true
         }
 
         fn has_child_nodes(&self) -> bool {
             self.state.has_child_nodes.get()
+        }
+
+        fn children(&self) -> HTMLCollectionHandle {
+            // SAFETY: Every test runtime exposing ElementHostProbe installs
+            // HTMLCollectionHostProbe, and `identity` is the stable owner key.
+            unsafe {
+                HTMLCollectionHandle::new(
+                    self.identity,
+                    HTMLCollectionHostProbe {
+                        items: Rc::clone(&self.state.element_children),
+                        element_drops: Rc::clone(&self.drops),
+                        drop_reentry: self.drop_reentry.clone(),
+                        drops: Rc::clone(&self.state.html_collection_drops),
+                    },
+                )
+            }
         }
 
         fn first_element_child(&self) -> Option<InterfaceHandle> {
@@ -2878,17 +3165,21 @@ mod tests {
         drops: Rc<Cell<usize>>,
         /// Stands in for the address of a Servo Element the host would root.
         /// Stable for this probe's lifetime, which is what identity needs.
-        element_identity: Box<u8>,
-        head_identity: Box<u8>,
-        id_element_identity: Box<u8>,
+        element_identity: Rc<u8>,
+        head_identity: Rc<u8>,
+        id_element_identity: Rc<u8>,
+        document_children_identity: Rc<u8>,
+        document_children: Rc<RefCell<Vec<ElementProbeChild>>>,
         element_state: Rc<ElementProbeState>,
         head_state: Rc<ElementProbeState>,
         id_element_state: Rc<ElementProbeState>,
         document_element_present: bool,
         head_present: bool,
+        malformed_children: bool,
         get_element_by_id_calls: Rc<RefCell<Vec<String>>>,
         element_drops: Rc<Cell<usize>>,
         node_list_drops: Rc<Cell<usize>>,
+        html_collection_drops: Rc<Cell<usize>>,
         element_drop_reentry: Option<ElementDropReentryProbe>,
     }
 
@@ -2912,15 +3203,31 @@ mod tests {
                     identity: Rc::new(0),
                     local_name: "span".to_owned(),
                     tag_name: "SPAN".to_owned(),
-                    state: ElementProbeState::with_node(&[("id", "first-child")], "first", false),
+                    state: ElementProbeState::with_node(
+                        &[("id", "first-child"), ("name", "named-first")],
+                        "first",
+                        false,
+                    ),
                 },
                 ElementProbeChild {
                     identity: Rc::new(0),
                     local_name: "em".to_owned(),
                     tag_name: "EM".to_owned(),
-                    state: ElementProbeState::with_node(&[("id", "last-child")], "last", false),
+                    state: ElementProbeState::with_node(
+                        &[("id", "last-child"), ("name", "item")],
+                        "last",
+                        false,
+                    ),
                 },
             ]);
+            let element_identity = Rc::new(0);
+            let element_state = ElementProbeState::with_attributes(&[]);
+            let document_children = Rc::new(RefCell::new(vec![ElementProbeChild {
+                identity: Rc::clone(&element_identity),
+                local_name: "html".to_owned(),
+                tag_name: "HTML".to_owned(),
+                state: Rc::clone(&element_state),
+            }]));
             Self {
                 hidden,
                 bg_color: Rc::new(RefCell::new("red".to_owned())),
@@ -2929,17 +3236,21 @@ mod tests {
                 bg_color_getter_calls: Rc::new(Cell::new(0)),
                 bg_color_setter_calls: Rc::new(Cell::new(0)),
                 drops,
-                element_identity: Box::new(0),
-                head_identity: Box::new(0),
-                id_element_identity: Box::new(0),
-                element_state: ElementProbeState::with_attributes(&[]),
+                element_identity,
+                head_identity: Rc::new(0),
+                id_element_identity: Rc::new(0),
+                document_children_identity: Rc::new(0),
+                document_children,
+                element_state,
                 head_state: ElementProbeState::with_attributes(&[]),
                 id_element_state,
                 document_element_present: true,
                 head_present: true,
+                malformed_children: false,
                 get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
                 element_drops: Rc::new(Cell::new(0)),
                 node_list_drops: Rc::new(Cell::new(0)),
+                html_collection_drops: Rc::new(Cell::new(0)),
                 element_drop_reentry: None,
             }
         }
@@ -3070,6 +3381,31 @@ mod tests {
             })
         }
 
+        fn children(&self) -> HTMLCollectionHandle {
+            let items = if self.document_element_present {
+                Rc::clone(&self.document_children)
+            } else {
+                Rc::new(RefCell::new(Vec::new()))
+            };
+            // SAFETY: Every test runtime exposing DocumentHostProbe installs
+            // HTMLCollectionHostProbe and this Rc supplies a stable owner key.
+            unsafe {
+                HTMLCollectionHandle::new(
+                    if self.malformed_children {
+                        std::ptr::null()
+                    } else {
+                        Rc::as_ptr(&self.document_children_identity).cast()
+                    },
+                    HTMLCollectionHostProbe {
+                        items,
+                        element_drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                        drops: Rc::clone(&self.html_collection_drops),
+                    },
+                )
+            }
+        }
+
         fn first_element_child(&self) -> Option<InterfaceHandle> {
             self.document_element()
         }
@@ -3165,9 +3501,7 @@ mod tests {
                     &self.element_state,
                 );
             }
-            if (selectors == "*" || selectors.eq_ignore_ascii_case("head"))
-                && self.head_present
-            {
+            if (selectors == "*" || selectors.eq_ignore_ascii_case("head")) && self.head_present {
                 push(
                     (&*self.head_identity as *const u8).cast(),
                     "head",
@@ -3175,8 +3509,7 @@ mod tests {
                     &self.head_state,
                 );
             }
-            if selectors == "*" || selectors == "#target" || selectors.eq_ignore_ascii_case("div")
-            {
+            if selectors == "*" || selectors == "#target" || selectors.eq_ignore_ascii_case("div") {
                 push(
                     (&*self.id_element_identity as *const u8).cast(),
                     "div",
@@ -3904,6 +4237,9 @@ mod tests {
         runtime
             .install_element_host::<ElementHostProbe>()
             .expect("Element host vtable installs once");
+        runtime
+            .install_html_collection_host::<HTMLCollectionHostProbe>()
+            .expect("HTMLCollection host vtable installs once");
         let realm = runtime.create_realm().unwrap();
         let element_drops = Rc::new(Cell::new(0));
         let mut host = DocumentHostProbe::new(
@@ -3912,6 +4248,7 @@ mod tests {
             Rc::new(Cell::new(0)),
         );
         host.element_drops = Rc::clone(&element_drops);
+        let collection_drops = Rc::clone(&host.html_collection_drops);
         runtime.install_document_host(realm, host).unwrap();
 
         assert!(
@@ -3951,8 +4288,43 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.keptCollection = document.children; \
+                     keptCollection.length === 1",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 2);
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 2);
+        assert_eq!(collection_drops.get(), 0);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "globalThis.keptCollection = null; true")
+                .unwrap()
+        );
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 1);
+        assert_eq!(collection_drops.get(), 1);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.recreatedCollection = document.children; \
+                     recreatedCollection.length === 1",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 2);
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(element_drops.get(), 2);
+        assert_eq!(collection_drops.get(), 2);
         assert!(runtime.wrapper_cache_size_for_testing(realm).is_err());
     }
 
@@ -4884,6 +5256,202 @@ mod tests {
     }
 
     #[test]
+    fn children_exposes_live_sameobject_html_collections() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+
+        let mut incomplete = html_collection_host_vtable::<HTMLCollectionHostProbe>();
+        incomplete.supported_name = None;
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The deliberately incomplete table is borrowed only for this
+        // validating installation call and is rejected synchronously.
+        assert_eq!(
+            unsafe {
+                servo_v8_install_html_collection_host(runtime.raw.as_ptr(), &incomplete, &mut error)
+            },
+            0
+        );
+        assert!(text_from(&storage, &error).contains("vtable is incomplete"));
+        runtime
+            .install_html_collection_host::<HTMLCollectionHostProbe>()
+            .expect("HTMLCollection host vtable installs once");
+        assert!(
+            runtime
+                .install_html_collection_host::<HTMLCollectionHostProbe>()
+                .is_err()
+        );
+
+        let realm = runtime.create_realm().unwrap();
+        let host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        let element_collection_drops = Rc::clone(&host.id_element_state.html_collection_drops);
+        let document_collection_drops = Rc::clone(&host.html_collection_drops);
+        runtime.install_document_host(realm, host).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"
+            (() => {
+              const target = document.getElementById('target');
+              const collection = target.children;
+              const documentChildren = document.children;
+              const prototype = HTMLCollection.prototype;
+              const lengthDescriptor = Object.getOwnPropertyDescriptor(prototype, 'length');
+              const itemDescriptor = Object.getOwnPropertyDescriptor(prototype, 'item');
+              const namedItemDescriptor = Object.getOwnPropertyDescriptor(prototype, 'namedItem');
+              const zeroDescriptor = Object.getOwnPropertyDescriptor(collection, '0');
+              const namedDescriptor = Object.getOwnPropertyDescriptor(collection, 'first-child');
+              const ownNames = Object.getOwnPropertyNames(collection);
+              let illegalCall = false;
+              let illegalConstruct = false;
+              let rejectsWrongItemBrand = false;
+              let rejectsWrongNamedBrand = false;
+              let rejectsWrongLengthBrand = false;
+              try { HTMLCollection(); } catch (error) { illegalCall = error instanceof TypeError; }
+              try { new HTMLCollection(); } catch (error) { illegalConstruct = error instanceof TypeError; }
+              try { prototype.item.call({}, 0); } catch (error) { rejectsWrongItemBrand = error instanceof TypeError; }
+              try { prototype.namedItem.call({}, 'x'); } catch (error) { rejectsWrongNamedBrand = error instanceof TypeError; }
+              try { lengthDescriptor.get.call({}); } catch (error) { rejectsWrongLengthBrand = error instanceof TypeError; }
+
+              const initial =
+                collection === target.children && collection !== documentChildren &&
+                documentChildren === document.children &&
+                collection instanceof HTMLCollection &&
+                Object.prototype.toString.call(collection) === '[object HTMLCollection]' &&
+                HTMLCollection.name === 'HTMLCollection' && HTMLCollection.length === 0 &&
+                prototype.constructor === HTMLCollection &&
+                collection.length === 2 && collection[0] === collection.item(0) &&
+                collection[1] === collection.item(1) && collection[2] === undefined &&
+                collection.item(2) === null &&
+                collection['first-child'] === collection[0] &&
+                collection['named-first'] === collection[0] &&
+                collection.namedItem('last-child') === collection[1] &&
+                collection.namedItem('item') === collection[1] &&
+                collection.item === prototype.item &&
+                prototype[Symbol.iterator] === undefined &&
+                !('forEach' in prototype) &&
+                documentChildren.length === 1 &&
+                documentChildren[0] === document.documentElement &&
+                Object.keys(collection).join(',') === '0,1' &&
+                ownNames.includes('0') && ownNames.includes('1') &&
+                ownNames.includes('first-child') && ownNames.includes('named-first') &&
+                ownNames.includes('last-child') && !ownNames.includes('item') &&
+                zeroDescriptor && zeroDescriptor.value === collection[0] &&
+                !zeroDescriptor.writable && zeroDescriptor.enumerable && zeroDescriptor.configurable &&
+                namedDescriptor && namedDescriptor.value === collection[0] &&
+                !namedDescriptor.writable && !namedDescriptor.enumerable && namedDescriptor.configurable &&
+                lengthDescriptor && lengthDescriptor.get.length === 0 &&
+                lengthDescriptor.set === undefined && lengthDescriptor.enumerable &&
+                lengthDescriptor.configurable &&
+                itemDescriptor && itemDescriptor.value.length === 1 &&
+                itemDescriptor.value.name === 'item' && itemDescriptor.writable &&
+                itemDescriptor.enumerable && itemDescriptor.configurable &&
+                namedItemDescriptor && namedItemDescriptor.value.length === 1 &&
+                namedItemDescriptor.value.name === 'namedItem' && namedItemDescriptor.writable &&
+                namedItemDescriptor.enumerable && namedItemDescriptor.configurable &&
+                illegalCall && illegalConstruct && rejectsWrongItemBrand &&
+                rejectsWrongNamedBrand && rejectsWrongLengthBrand;
+
+              const retainedChild = collection[0];
+              retainedChild.id = 'renamed-first';
+              const renamedOwnNames = Object.getOwnPropertyNames(collection);
+              const namedPropertiesStayedLive =
+                collection['first-child'] === undefined &&
+                collection.namedItem('first-child') === null &&
+                collection['renamed-first'] === retainedChild &&
+                collection.namedItem('renamed-first') === retainedChild &&
+                !renamedOwnNames.includes('first-child') &&
+                renamedOwnNames.includes('renamed-first');
+
+              target.textContent = '';
+              const liveAfterMutation =
+                collection === target.children && collection.length === 0 &&
+                collection[0] === undefined && collection.item(0) === null &&
+                collection['first-child'] === undefined &&
+                collection.namedItem('first-child') === null &&
+                !retainedChild.isConnected &&
+                Object.keys(collection).length === 0;
+              globalThis.htmlCollectionBindingProof =
+                initial && namedPropertiesStayedLive && liveAfterMutation;
+            })();
+            "#,
+            "html-collection-binding.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: The non-null token is lent only for this synchronous run.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "htmlCollectionBindingProof")
+                .unwrap()
+        );
+        let element_drops_before_teardown = element_collection_drops.get();
+        let document_drops_before_teardown = document_collection_drops.get();
+        assert!(
+            element_drops_before_teardown > 0 && document_drops_before_teardown > 0,
+            "SameObject cache hits must drop speculative collection hosts"
+        );
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(
+            element_collection_drops.get(),
+            element_drops_before_teardown + 1,
+            "realm teardown must synchronously release the live Element.children host"
+        );
+        assert_eq!(
+            document_collection_drops.get(),
+            document_drops_before_teardown + 1,
+            "realm teardown must synchronously release the live Document.children host"
+        );
+
+        let malformed_realm = runtime.create_realm().unwrap();
+        let mut malformed_host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        malformed_host.malformed_children = true;
+        let malformed_drops = Rc::clone(&malformed_host.html_collection_drops);
+        runtime
+            .install_document_host(malformed_realm, malformed_host)
+            .unwrap();
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    malformed_realm,
+                    "(() => { try { document.children; } \
+                     catch (error) { return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            malformed_drops.get(),
+            1,
+            "a malformed collection transfer must drop its native host exactly once"
+        );
+        runtime.destroy_realm(malformed_realm).unwrap();
+        assert_eq!(malformed_drops.get(), 1);
+    }
+
+    #[test]
     fn query_selector_all_exposes_static_iterable_node_lists() {
         let mut runtime = Runtime::new(Options {
             expose_gc: 1,
@@ -4902,11 +5470,7 @@ mod tests {
         // validating install call and is never retained after rejection.
         assert_eq!(
             unsafe {
-                servo_v8_install_node_list_host(
-                    runtime.raw.as_ptr(),
-                    &incomplete,
-                    &mut error,
-                )
+                servo_v8_install_node_list_host(runtime.raw.as_ptr(), &incomplete, &mut error)
             },
             0
         );

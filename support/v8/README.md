@@ -73,11 +73,11 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.contentType`, `Document.referrer`, `Document.lastModified`,
 `Document.visibilityState`, `Document.readyState`, `Document.title`,
 `Node.nodeType`, `Document.documentElement`, `Document.head`, and
-`Document.firstElementChild`, `Document.lastElementChild`,
+`Document.children`, `Document.firstElementChild`, `Document.lastElementChild`,
 `Document.childElementCount`, `Document.getElementById`, and
 `Document.querySelector`, `Document.querySelectorAll`, plus
-`Element.querySelectorAll`, `Element.closest`, `Element.matches`, and
-`Element.webkitMatchesSelector`, declarations in
+`Element.children`, `Element.querySelectorAll`, `Element.closest`,
+`Element.matches`, and `Element.webkitMatchesSelector`, declarations in
 Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
 shape, exact returned interface)` records, with the interface field absent for
@@ -100,7 +100,7 @@ string.
 `Document.documentElement`, `Document.head`, `Document.getElementById`,
 `Document.querySelector`, the
 ParentNode traversal getters, and the Element slice are the members whose value
-or receiver is another DOM object, and they rest on the per-realm wrapper cache
+or receiver is another DOM object, and they rest on per-realm weak wrapper caches
 described in `wrapper-identity-design.md`. Independent Document, id, and child
 traversal paths prove that distinct DOM identities get distinct stable wrappers
 while repeated paths to one object converge on the same wrapper. That
@@ -143,7 +143,7 @@ the other Element-returning paths.
 
 `Document.querySelectorAll` and `Element.querySelectorAll` reuse that parser
 without constructing an unused SpiderMonkey `NodeList`. Servo first roots the
-matched `Element` vector as a static snapshot, then ABI v27 transfers one
+matched `Element` vector as a static snapshot, then ABI v28 transfers one
 fresh, uncached NodeList host to V8. The wrapper exposes `length`, `item`,
 enumerable indexed values, and Web IDL's realm-local Array iterator/forEach
 intrinsics. Its items still converge on the Element wrapper cache, while the
@@ -151,6 +151,19 @@ collection host itself is weakly tracked for GC and synchronously released on
 realm teardown. The current indexed surface is deliberately a facade: ordinary
 read-only numeric properties reproduce lookup, enumeration and iteration, but
 not every `LegacyPlatformObject` edge case involving deletion, redefinition or
+`preventExtensions`.
+
+`Document.children` and `Element.children` use a different collection path:
+one `Trusted<Node>` roots the ParentNode owner and each callback walks its
+current direct element children, so a retained wrapper observes tree, id, and
+name changes. A separate weak cache keyed by the owner preserves
+`[SameObject]` without colliding with the Element cache, even though both keys
+are the same DOM address. The `HTMLCollection` facade exposes live indexed and
+supported named properties through V8 interceptors, including tree-order
+deduplication, HTML-only `name` matching, prototype masking, and the WebIDL
+enumerability split. It intentionally has no NodeList iterator or `forEach`.
+Like the NodeList facade, it does not yet reproduce every
+`LegacyPlatformObject` edge case around `defineProperty`, deletion, or
 `preventExtensions`.
 
 ## Compile real Servo scripts in the V8 shadow
@@ -297,10 +310,10 @@ surface is deliberately limited to `window`, the `console` logging slice,
 `document.bgColor`, `document.URL`, `document.documentURI`, document metadata
 string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
-`document.head`, the three ParentNode traversal getters, and
+`document.head`, the ParentNode `children`/first/last/count getters, and
 `document.getElementById()`. Elements returned through that
 surface share a per-realm prototype implementing `localName`, `tagName`, `id`,
-`className`, `hasAttributes()`, `getAttribute()`, `hasAttribute()`,
+`className`, `hasAttributes()`, `getAttribute()`, `hasAttribute()`, `children`,
 `firstElementChild`, `lastElementChild`, and `childElementCount`. That
 prototype inherits from a shared Node prototype implementing `nodeType`,
 `nodeName`, `isConnected`, `textContent`, and `hasChildNodes()`.
@@ -400,6 +413,7 @@ The proof suite uses that same counting argument:
 | `authoritative_query_selector_proof.html` | Document and Element selector queries use Servo's parser, V8 DOMException, and stable wrappers |
 | `authoritative_element_selector_methods_proof.html` | Element matching and closest operations preserve conversion, SyntaxError, and identity semantics |
 | `authoritative_query_selector_all_proof.html` | static rooted NodeLists survive real tree mutation and expose indexed/iterable WebIDL behavior |
+| `authoritative_children_collection_proof.html` | live SameObject HTMLCollections track tree/name mutation with indexed and named legacy properties |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the

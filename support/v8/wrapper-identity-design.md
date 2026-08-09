@@ -140,11 +140,12 @@ identifies the object it was created for.
 ## Where the generator fits
 
 The manifest carries `Document.documentElement`, `Document.head`, the
-ParentNode first/last/count getters, and `Document.getElementById` like any
-other members and pins their exact declared interfaces (`Element`,
+ParentNode children/first/last/count getters, and `Document.getElementById`
+like any other members and pins their exact declared interfaces (`Element`,
 `HTMLHeadElement`, and `Element`). The generator emits their ABI slots, Rust
 trait methods, thunks, checked C++ callbacks, and prototype registration.
-Interface attributes use the `readonly nullable interface` shape; ParentNode's
+Interface attributes use the `readonly nullable interface` shape; `children`
+uses an exact `[SameObject]` non-nullable `HTMLCollection` shape; ParentNode's
 two interface getters additionally require exact `[Pure]`, its count uses a
 32-bit unsigned shape, and the operation pins one required DOMString argument
 and `[Pure]`. WebIDL drift in any declared return type remains a build failure
@@ -163,6 +164,15 @@ cleared collection handles alongside cleared Element-cache entries. Calling
 `item()` or reading an indexed value still routes the returned Element through
 the ordinary cache, so collection and direct query paths preserve item
 identity.
+
+`children` has the opposite collection lifetime. Its `HTMLCollection` is live
+and `[SameObject]`, so each realm keeps a second weak cache keyed by the
+ParentNode owner. It cannot share the Element map: an Element and that
+Element's children collection intentionally use the same owner address while
+representing different JavaScript objects. The collection cell holds a
+`Trusted<Node>` and rereads direct child elements, ids, and HTML names on every
+callback. Cache hits discard the speculative host; major-GC pruning and realm
+teardown walk both maps and release both kinds of roots.
 
 ## What this does not do
 
@@ -239,7 +249,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_element_scalar_proof.html`,
 `authoritative_node_scalar_proof.html`, and
 `authoritative_parent_node_proof.html`, and
-`authoritative_query_selector_all_proof.html` cover runtime behaviour against real
+`authoritative_query_selector_all_proof.html`, and
+`authoritative_children_collection_proof.html` cover runtime behaviour against real
 Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by

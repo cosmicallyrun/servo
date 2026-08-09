@@ -231,6 +231,7 @@ struct ServoV8DomCell final : public v8::Object::Wrappable {
 enum class ServoV8HostKind : uint8_t {
   kElement,
   kNodeList,
+  kHTMLCollection,
 };
 
 struct ServoV8HostCell final : public v8::Object::Wrappable {
@@ -336,6 +337,11 @@ struct ServoV8RealmState {
   // pinned for the life of the realm along with the element behind it.
   std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
       wrappers;
+  // `[SameObject]` collection wrappers are cached by their ParentNode owner.
+  // This must be separate from `wrappers`: an Element owner and its children
+  // collection intentionally use the same DOM address as distinct keys.
+  std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
+      html_collections;
   // NewObject-returning collection wrappers have no DOM identity cache entry,
   // but realm teardown must still release their Servo roots synchronously.
   std::vector<cppgc::WeakPersistent<ServoV8HostCell>> uncached_hosts;
@@ -345,6 +351,9 @@ struct ServoV8RealmState {
   v8::Global<v8::ObjectTemplate> node_list_template;
   v8::Global<v8::Object> node_list_prototype;
   v8::Global<v8::Function> node_list_constructor;
+  v8::Global<v8::ObjectTemplate> html_collection_template;
+  v8::Global<v8::Object> html_collection_prototype;
+  v8::Global<v8::Function> html_collection_constructor;
   v8::Global<v8::Function> dom_exception_constructor;
   v8::Global<v8::Object> dom_exception_prototype;
   ServoV8DocumentHostState document_host;
@@ -395,6 +404,8 @@ struct ServoV8Runtime {
   bool element_host_installed = false;
   ServoV8NodeListHostVTable node_list_host_vtable{};
   bool node_list_host_installed = false;
+  ServoV8HTMLCollectionHostVTable html_collection_host_vtable{};
+  bool html_collection_host_installed = false;
   bool expose_gc = false;
 };
 
@@ -674,6 +685,15 @@ void PruneDeadWrapperCacheEntries(v8::Isolate* isolate,
         entry = wrappers.erase(entry);
       }
     }
+    auto& html_collections = realm->html_collections;
+    for (auto entry = html_collections.begin();
+         entry != html_collections.end();) {
+      if (entry->second.Get()) {
+        ++entry;
+      } else {
+        entry = html_collections.erase(entry);
+      }
+    }
     auto& uncached_hosts = realm->uncached_hosts;
     uncached_hosts.erase(
         std::remove_if(uncached_hosts.begin(), uncached_hosts.end(),
@@ -735,6 +755,12 @@ void DropUnownedNodeListHost(ServoV8Runtime* runtime, void* native) {
   if (!runtime || !native || !runtime->node_list_host_vtable.drop) return;
   RustCallbackScope callback_scope(runtime);
   runtime->node_list_host_vtable.drop(native);
+}
+
+void DropUnownedHTMLCollectionHost(ServoV8Runtime* runtime, void* native) {
+  if (!runtime || !native || !runtime->html_collection_host_vtable.drop) return;
+  RustCallbackScope callback_scope(runtime);
+  runtime->html_collection_host_vtable.drop(native);
 }
 
 v8::Local<v8::Private> DomExceptionBrandKey(v8::Isolate* isolate) {
@@ -1043,6 +1069,11 @@ v8::Local<v8::Object> WrapperForNodeListHost(
     v8::Local<v8::Context> context,
     void* native);
 
+v8::Local<v8::Object> WrapperForHTMLCollectionValue(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    const ServoV8HTMLCollectionValue& value);
+
 void ReturnSelectorElementOutcome(
     ServoV8RealmState* realm,
     v8::Local<v8::Context> context,
@@ -1289,6 +1320,59 @@ v8::Local<v8::Object> WrapperForNodeListHost(
   return wrapper;
 }
 
+v8::Local<v8::Object> WrapperForHTMLCollectionValue(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    const ServoV8HTMLCollectionValue& value) {
+  ServoV8Runtime* runtime = realm->runtime;
+  v8::Isolate* isolate = runtime->isolate;
+  const ServoV8HTMLCollectionHostVTable& vtable =
+      runtime->html_collection_host_vtable;
+  auto fail = [&]() {
+    DropUnownedHTMLCollectionHost(runtime, value.native);
+    return v8::Local<v8::Object>();
+  };
+
+  if (!value.key || !value.native ||
+      !runtime->html_collection_host_installed || !vtable.get_length ||
+      !vtable.item || !vtable.named_item ||
+      !vtable.get_supported_name_count || !vtable.supported_name ||
+      !vtable.drop || realm->html_collection_template.IsEmpty() ||
+      realm->html_collection_prototype.IsEmpty()) {
+    return fail();
+  }
+
+  const auto entry = realm->html_collections.find(value.key);
+  if (entry != realm->html_collections.end()) {
+    if (ServoV8HostCell* cell = entry->second.Get()) {
+      DropUnownedHTMLCollectionHost(runtime, value.native);
+      return cell->wrapper(isolate);
+    }
+    realm->html_collections.erase(entry);
+  }
+
+  v8::Local<v8::Object> wrapper;
+  if (!realm->html_collection_template.Get(isolate)
+           ->NewInstance(context)
+           .ToLocal(&wrapper) ||
+      !wrapper
+           ->SetPrototype(context, realm->html_collection_prototype.Get(isolate))
+           .FromMaybe(false)) {
+    return fail();
+  }
+
+  v8::CppHeap* cpp_heap = isolate->GetCppHeap();
+  auto* cell = cppgc::MakeGarbageCollected<ServoV8HostCell>(
+      cpp_heap->GetAllocationHandle(), runtime, value.native, vtable.drop,
+      value.key, ServoV8HostKind::kHTMLCollection);
+  cppgc::Persistent<ServoV8HostCell> pending(cell);
+  v8::Object::Wrap<kServoHostTag>(isolate, wrapper, cell);
+  cell->SetWrapper(isolate, wrapper);
+  realm->html_collections[value.key] = cell;
+  pending.Clear();
+  return wrapper;
+}
+
 ServoV8HostCell* UnwrapNodeListHostCell(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Local<v8::Value> receiver = info.This();
@@ -1384,6 +1468,371 @@ void NodeListHostItem(const v8::FunctionCallbackInfo<v8::Value>& info) {
 }
 
 void NodeListIllegalConstructor(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ThrowTypeError(info.GetIsolate(), "Illegal constructor");
+}
+
+ServoV8HostCell* UnwrapHTMLCollectionHostCell(v8::Isolate* isolate,
+                                              v8::Local<v8::Object> receiver) {
+  auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(
+      isolate, receiver);
+  return cell && cell->kind() == ServoV8HostKind::kHTMLCollection ? cell
+                                                                  : nullptr;
+}
+
+bool HTMLCollectionHostCallbackState(v8::Isolate* isolate,
+                                     v8::Local<v8::Object> receiver,
+                                     ServoV8RealmState** realm_output,
+                                     void** native_output) {
+  auto* realm = static_cast<ServoV8RealmState*>(
+      receiver->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  ServoV8HostCell* cell = UnwrapHTMLCollectionHostCell(isolate, receiver);
+  if (!realm || realm->tearing_down || !realm->runtime ||
+      realm->runtime->isolate != isolate || realm->context.IsEmpty() ||
+      realm->context.Get(isolate) != isolate->GetCurrentContext() || !cell ||
+      !cell->native() || !realm->runtime->html_collection_host_installed ||
+      !realm->runtime->element_host_installed) {
+    ThrowTypeError(isolate, "invalid HTMLCollection host state");
+    return false;
+  }
+  if (realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "re-entrant HTMLCollection host callback");
+    return false;
+  }
+  *realm_output = realm;
+  *native_output = cell->native();
+  return true;
+}
+
+bool HTMLCollectionHostCallbackState(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ServoV8RealmState** realm_output,
+    void** native_output) {
+  return HTMLCollectionHostCallbackState(info.GetIsolate(), info.This(),
+                                         realm_output, native_output);
+}
+
+bool HTMLCollectionReadLength(ServoV8RealmState* realm,
+                              void* native,
+                              uint32_t* length) {
+  RustCallbackScope callback_scope(realm->runtime);
+  if (!realm->runtime->html_collection_host_vtable.get_length(native, length)) {
+    ThrowTypeError(realm->runtime->isolate,
+                   "HTMLCollection.length host callback failed");
+    return false;
+  }
+  return true;
+}
+
+bool HTMLCollectionWrapItem(ServoV8RealmState* realm,
+                            v8::Local<v8::Context> context,
+                            ServoV8InterfaceValue* value,
+                            bool succeeded,
+                            bool* present,
+                            v8::Local<v8::Object>* item) {
+  const bool malformed =
+      value->is_null > 1 ||
+      (value->is_null != 0 && (value->key || value->native)) ||
+      (value->is_null == 0 && (!value->key || !value->native));
+  if (!succeeded || malformed) {
+    DropUnownedElementHost(realm->runtime, value->native,
+                           realm->runtime->element_host_vtable.drop);
+    ThrowTypeError(realm->runtime->isolate,
+                   "HTMLCollection item host callback failed");
+    return false;
+  }
+  if (value->is_null != 0) {
+    *present = false;
+    return true;
+  }
+  *item = WrapperForInterfaceValue(realm, realm->runtime->isolate, context,
+                                   *value);
+  if (item->IsEmpty()) {
+    ThrowTypeError(realm->runtime->isolate,
+                   "HTMLCollection item wrapper could not be created");
+    return false;
+  }
+  *present = true;
+  return true;
+}
+
+bool HTMLCollectionReadItem(ServoV8RealmState* realm,
+                            void* native,
+                            uint32_t index,
+                            bool* present,
+                            v8::Local<v8::Object>* item) {
+  ServoV8InterfaceValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->html_collection_host_vtable.item(
+                    native, index, &value) != 0;
+  }
+  return HTMLCollectionWrapItem(
+      realm, realm->runtime->isolate->GetCurrentContext(), &value, succeeded,
+      present, item);
+}
+
+bool HTMLCollectionReadNamedItem(ServoV8RealmState* realm,
+                                 void* native,
+                                 v8::Local<v8::String> name,
+                                 bool* present,
+                                 v8::Local<v8::Object>* item) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::String::Utf8Value utf8(isolate, name);
+  if (!*utf8 && utf8.length() != 0) return false;
+  ServoV8InterfaceValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->html_collection_host_vtable.named_item(
+                    native, reinterpret_cast<const uint8_t*>(*utf8),
+                    static_cast<size_t>(utf8.length()), &value) != 0;
+  }
+  return HTMLCollectionWrapItem(realm, isolate->GetCurrentContext(), &value,
+                                succeeded, present, item);
+}
+
+void HTMLCollectionHostGetLength(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info, &realm, &native)) return;
+  uint32_t length = 0;
+  if (HTMLCollectionReadLength(realm, native, &length)) {
+    info.GetReturnValue().Set(length);
+  }
+}
+
+void HTMLCollectionHostItem(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info, &realm, &native)) return;
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, "HTMLCollection.item requires 1 argument");
+    return;
+  }
+  v8::Maybe<uint32_t> maybe_index =
+      info[0]->Uint32Value(isolate->GetCurrentContext());
+  if (maybe_index.IsNothing()) return;
+  bool present = false;
+  v8::Local<v8::Object> item;
+  if (!HTMLCollectionReadItem(realm, native, maybe_index.FromJust(), &present,
+                              &item)) {
+    return;
+  }
+  if (present) {
+    info.GetReturnValue().Set(item);
+  } else {
+    info.GetReturnValue().SetNull();
+  }
+}
+
+void HTMLCollectionHostNamedItem(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info, &realm, &native)) return;
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, "HTMLCollection.namedItem requires 1 argument");
+    return;
+  }
+  v8::Local<v8::String> name;
+  if (!info[0]->ToString(isolate->GetCurrentContext()).ToLocal(&name)) return;
+  bool present = false;
+  v8::Local<v8::Object> item;
+  if (!HTMLCollectionReadNamedItem(realm, native, name, &present, &item)) return;
+  if (present) {
+    info.GetReturnValue().Set(item);
+  } else {
+    info.GetReturnValue().SetNull();
+  }
+}
+
+v8::Intercepted HTMLCollectionIndexedGetter(
+    uint32_t index, const v8::PropertyCallbackInfo<v8::Value>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info.GetIsolate(), info.Holder(),
+                                       &realm, &native)) {
+    return v8::Intercepted::kYes;
+  }
+  bool present = false;
+  v8::Local<v8::Object> item;
+  if (!HTMLCollectionReadItem(realm, native, index, &present, &item)) {
+    return v8::Intercepted::kYes;
+  }
+  if (!present) return v8::Intercepted::kNo;
+  info.GetReturnValue().Set(item);
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted HTMLCollectionIndexedQuery(
+    uint32_t index, const v8::PropertyCallbackInfo<v8::Integer>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info.GetIsolate(), info.Holder(),
+                                       &realm, &native)) {
+    return v8::Intercepted::kYes;
+  }
+  uint32_t length = 0;
+  if (!HTMLCollectionReadLength(realm, native, &length)) {
+    return v8::Intercepted::kYes;
+  }
+  if (index >= length) return v8::Intercepted::kNo;
+  info.GetReturnValue().Set(static_cast<int32_t>(v8::ReadOnly));
+  return v8::Intercepted::kYes;
+}
+
+void HTMLCollectionIndexedEnumerator(
+    const v8::PropertyCallbackInfo<v8::Array>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info.GetIsolate(), info.Holder(),
+                                       &realm, &native)) {
+    return;
+  }
+  uint32_t length = 0;
+  if (!HTMLCollectionReadLength(realm, native, &length)) return;
+  if (length > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(info.GetIsolate(), "HTMLCollection is too large to enumerate");
+    return;
+  }
+  v8::Local<v8::Array> names =
+      v8::Array::New(info.GetIsolate(), static_cast<int>(length));
+  v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+  for (uint32_t index = 0; index < length; ++index) {
+    if (!names->Set(context, index, v8::Integer::NewFromUnsigned(
+                                         info.GetIsolate(), index))
+             .FromMaybe(false)) {
+      return;
+    }
+  }
+  info.GetReturnValue().Set(names);
+}
+
+v8::Intercepted HTMLCollectionNamedGetter(
+    v8::Local<v8::Name> property,
+    const v8::PropertyCallbackInfo<v8::Value>& info) {
+  if (!property->IsString()) return v8::Intercepted::kNo;
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info.GetIsolate(), info.Holder(),
+                                       &realm, &native)) {
+    return v8::Intercepted::kYes;
+  }
+  bool present = false;
+  v8::Local<v8::Object> item;
+  if (!HTMLCollectionReadNamedItem(realm, native, property.As<v8::String>(),
+                                   &present, &item)) {
+    return v8::Intercepted::kYes;
+  }
+  if (!present) return v8::Intercepted::kNo;
+  info.GetReturnValue().Set(item);
+  return v8::Intercepted::kYes;
+}
+
+v8::Intercepted HTMLCollectionNamedQuery(
+    v8::Local<v8::Name> property,
+    const v8::PropertyCallbackInfo<v8::Integer>& info) {
+  if (!property->IsString()) return v8::Intercepted::kNo;
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(info.GetIsolate(), info.Holder(),
+                                       &realm, &native)) {
+    return v8::Intercepted::kYes;
+  }
+  bool present = false;
+  v8::Local<v8::Object> item;
+  if (!HTMLCollectionReadNamedItem(realm, native, property.As<v8::String>(),
+                                   &present, &item)) {
+    return v8::Intercepted::kYes;
+  }
+  if (!present) return v8::Intercepted::kNo;
+  info.GetReturnValue().Set(static_cast<int32_t>(v8::ReadOnly | v8::DontEnum));
+  return v8::Intercepted::kYes;
+}
+
+void HTMLCollectionNamedEnumerator(
+    const v8::PropertyCallbackInfo<v8::Array>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!HTMLCollectionHostCallbackState(isolate, info.Holder(), &realm,
+                                       &native)) {
+    return;
+  }
+  uint32_t count = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->html_collection_host_vtable.get_supported_name_count(
+            native, &count)) {
+      ThrowTypeError(isolate,
+                     "HTMLCollection supported names host callback failed");
+      return;
+    }
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  std::vector<v8::Local<v8::String>> visible_names;
+  visible_names.reserve(count);
+  for (uint32_t index = 0; index < count; ++index) {
+    ServoV8OwnedUtf8 value{};
+    bool succeeded = false;
+    {
+      RustCallbackScope callback_scope(realm->runtime);
+      succeeded = realm->runtime->html_collection_host_vtable.supported_name(
+                      native, index, &value) != 0;
+    }
+    DocumentHostOwnedUtf8Scope value_scope(realm->runtime, &value);
+    if (!succeeded || (!value.data && value.length != 0) || !value.owner ||
+        !value.drop_owner) {
+      ThrowTypeError(isolate,
+                     "HTMLCollection supported name host callback failed");
+      return;
+    }
+    if (value.length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      ThrowTypeError(isolate, "HTMLCollection supported name is too large");
+      return;
+    }
+    v8::Local<v8::String> name;
+    if (!v8::String::NewFromUtf8(
+             isolate, reinterpret_cast<const char*>(value.data),
+             v8::NewStringType::kNormal, static_cast<int>(value.length))
+             .ToLocal(&name)) {
+      return;
+    }
+    v8::Maybe<bool> has_real_own =
+        info.Holder()->HasRealNamedProperty(context, name);
+    if (has_real_own.IsNothing()) return;
+    if (has_real_own.FromJust()) continue;
+    // HTMLCollection does not carry `[LegacyOverrideBuiltIns]`: a real
+    // prototype property hides an otherwise-supported named property.
+    if (info.Holder()
+            ->GetRealNamedPropertyAttributesInPrototypeChain(context, name)
+            .IsJust()) {
+      continue;
+    }
+    visible_names.push_back(name);
+  }
+  if (visible_names.size() >
+      static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(isolate, "HTMLCollection has too many supported names");
+    return;
+  }
+  v8::Local<v8::Array> names =
+      v8::Array::New(isolate, static_cast<int>(visible_names.size()));
+  for (uint32_t index = 0; index < visible_names.size(); ++index) {
+    if (!names->Set(context, index, visible_names[index]).FromMaybe(false)) {
+      return;
+    }
+  }
+  info.GetReturnValue().Set(names);
+}
+
+void HTMLCollectionIllegalConstructor(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   ThrowTypeError(info.GetIsolate(), "Illegal constructor");
 }
@@ -1861,6 +2310,42 @@ void ElementHostGetFirstElementChild(
       "Element.firstElementChild host callback failed");
 }
 
+void ElementHostGetChildren(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->html_collection_host_installed ||
+      !realm->runtime->element_host_installed ||
+      realm->html_collection_template.IsEmpty() ||
+      realm->element_template.IsEmpty() ||
+      !realm->runtime->element_host_vtable.get_children) {
+    ThrowTypeError(isolate,
+                   "HTMLCollection host is not installed in this realm");
+    return;
+  }
+  ServoV8HTMLCollectionValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.get_children(native,
+                                                                  &value) != 0;
+  }
+  if (!succeeded || !value.key || !value.native) {
+    DropUnownedHTMLCollectionHost(realm->runtime, value.native);
+    ThrowTypeError(isolate, "Element.children host callback failed");
+    return;
+  }
+  v8::Local<v8::Object> wrapper = WrapperForHTMLCollectionValue(
+      realm, isolate->GetCurrentContext(), value);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(isolate, "Element.children wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(wrapper);
+}
+
 void ElementHostGetLastElementChild(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   ElementHostGetInterface(
@@ -2126,6 +2611,86 @@ bool InstallNodeListInterface(ServoV8RealmState* realm,
   return true;
 }
 
+bool InstallHTMLCollectionInterface(ServoV8RealmState* realm,
+                                    v8::Local<v8::Context> context,
+                                    v8::Local<v8::Object> global) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::Local<v8::FunctionTemplate> constructor_template =
+      v8::FunctionTemplate::New(isolate, HTMLCollectionIllegalConstructor);
+  constructor_template->SetClassName(V8String(isolate, "HTMLCollection"));
+  v8::Local<v8::ObjectTemplate> instance_template =
+      constructor_template->InstanceTemplate();
+  const auto indexed_flags = v8::PropertyHandlerFlags::kHasNoSideEffect;
+  instance_template->SetHandler(v8::IndexedPropertyHandlerConfiguration(
+      HTMLCollectionIndexedGetter, nullptr, HTMLCollectionIndexedQuery,
+      nullptr, HTMLCollectionIndexedEnumerator, v8::Local<v8::Value>(),
+      indexed_flags));
+  const auto named_flags = static_cast<v8::PropertyHandlerFlags>(
+      static_cast<int>(v8::PropertyHandlerFlags::kNonMasking) |
+      static_cast<int>(v8::PropertyHandlerFlags::kOnlyInterceptStrings) |
+      static_cast<int>(v8::PropertyHandlerFlags::kHasNoSideEffect));
+  instance_template->SetHandler(v8::NamedPropertyHandlerConfiguration(
+      HTMLCollectionNamedGetter, nullptr, HTMLCollectionNamedQuery, nullptr,
+      HTMLCollectionNamedEnumerator, v8::Local<v8::Value>(), named_flags));
+
+  v8::Local<v8::Function> constructor;
+  if (!constructor_template->GetFunction(context).ToLocal(&constructor)) {
+    return false;
+  }
+  v8::Local<v8::Value> prototype_value;
+  if (!constructor->Get(context, V8String(isolate, "prototype"))
+           .ToLocal(&prototype_value) ||
+      !prototype_value->IsObject()) {
+    return false;
+  }
+  v8::Local<v8::Object> prototype = prototype_value.As<v8::Object>();
+
+  v8::Local<v8::Function> length_getter;
+  if (!v8::Function::New(context, HTMLCollectionHostGetLength, {}, 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&length_getter)) {
+    return false;
+  }
+  length_getter->SetName(V8String(isolate, "get length"));
+  prototype->SetAccessorProperty(V8String(isolate, "length"), length_getter,
+                                 v8::Local<v8::Function>(), v8::None);
+
+  auto define_operation = [&](const char* name, v8::FunctionCallback callback,
+                              int length) -> bool {
+    v8::Local<v8::Function> function;
+    if (!v8::Function::New(context, callback, {}, length,
+                           v8::ConstructorBehavior::kThrow,
+                           v8::SideEffectType::kHasNoSideEffect)
+             .ToLocal(&function)) {
+      return false;
+    }
+    function->SetName(V8String(isolate, name));
+    return prototype
+        ->DefineOwnProperty(context, V8String(isolate, name), function, v8::None)
+        .FromMaybe(false);
+  };
+  if (!define_operation("item", HTMLCollectionHostItem, 1) ||
+      !define_operation("namedItem", HTMLCollectionHostNamedItem, 1) ||
+      !prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "HTMLCollection"),
+                               static_cast<v8::PropertyAttribute>(
+                                   v8::ReadOnly | v8::DontEnum))
+           .FromMaybe(false) ||
+      !global
+           ->DefineOwnProperty(context, V8String(isolate, "HTMLCollection"),
+                               constructor, v8::DontEnum)
+           .FromMaybe(false)) {
+    return false;
+  }
+
+  realm->html_collection_template.Reset(isolate, instance_template);
+  realm->html_collection_prototype.Reset(isolate, prototype);
+  realm->html_collection_constructor.Reset(isolate, constructor);
+  return true;
+}
+
 bool InstallNodePrototype(ServoV8RealmState* realm,
                           v8::Local<v8::Context> context,
                           v8::Local<v8::Object> prototype) {
@@ -2192,6 +2757,7 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"tagName", &ElementHostGetTagName, nullptr},
       {"id", &ElementHostGetId, &ElementHostSetId},
       {"className", &ElementHostGetClassName, &ElementHostSetClassName},
+      {"children", &ElementHostGetChildren, nullptr},
       {"firstElementChild", &ElementHostGetFirstElementChild, nullptr},
       {"lastElementChild", &ElementHostGetLastElementChild, nullptr},
       {"childElementCount", &ElementHostGetChildElementCount, nullptr},
@@ -2711,6 +3277,10 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
     if (ServoV8HostCell* cell = entry.second.Get()) cell->ReleaseHost();
   }
   realm->wrappers.clear();
+  for (auto& entry : realm->html_collections) {
+    if (ServoV8HostCell* cell = entry.second.Get()) cell->ReleaseHost();
+  }
+  realm->html_collections.clear();
   for (auto& host : realm->uncached_hosts) {
     if (ServoV8HostCell* cell = host.Get()) cell->ReleaseHost();
   }
@@ -2721,6 +3291,9 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->node_list_template.Reset();
   realm->node_list_prototype.Reset();
   realm->node_list_constructor.Reset();
+  realm->html_collection_template.Reset();
+  realm->html_collection_prototype.Reset();
+  realm->html_collection_constructor.Reset();
   realm->dom_exception_constructor.Reset();
   realm->dom_exception_prototype.Reset();
   realm->document.Reset();
@@ -3029,6 +3602,7 @@ extern "C" int32_t servo_v8_realm_create(
   v8::Local<v8::Object> node_prototype = v8::Object::New(isolate);
   v8::Local<v8::Object> element_prototype = v8::Object::New(isolate);
   if (!InstallNodeListInterface(realm.get(), context, global) ||
+      !InstallHTMLCollectionInterface(realm.get(), context, global) ||
       !InstallNodePrototype(realm.get(), context, node_prototype) ||
       !InstallElementPrototype(realm.get(), context, element_prototype) ||
       !element_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
@@ -3570,6 +4144,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->has_child_nodes ||
+      !vtable->get_children ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
       !vtable->get_child_element_count || !vtable->query_selector ||
       !vtable->closest || !vtable->matches ||
@@ -3605,6 +4180,27 @@ extern "C" int32_t servo_v8_install_node_list_host(
   }
   runtime->node_list_host_vtable = *vtable;
   runtime->node_list_host_installed = true;
+  return 1;
+}
+
+extern "C" int32_t servo_v8_install_html_collection_host(
+    ServoV8Runtime* runtime,
+    const ServoV8HTMLCollectionHostVTable* vtable,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!vtable || !vtable->get_length || !vtable->item ||
+      !vtable->named_item || !vtable->get_supported_name_count ||
+      !vtable->supported_name || !vtable->drop) {
+    WriteError(error, "HTMLCollection host vtable is incomplete");
+    return 0;
+  }
+  if (runtime->html_collection_host_installed) {
+    WriteError(error, "HTMLCollection host is already installed");
+    return 0;
+  }
+  runtime->html_collection_host_vtable = *vtable;
+  runtime->html_collection_host_installed = true;
   return 1;
 }
 
@@ -3762,7 +4358,7 @@ extern "C" int32_t servo_v8_realm_wrapper_cache_size_for_testing(
   }
   ServoV8RealmState* realm = FindRealm(runtime, realm_id, error);
   if (!realm) return 0;
-  *result = realm->wrappers.size();
+  *result = realm->wrappers.size() + realm->html_collections.size();
   return 1;
 }
 

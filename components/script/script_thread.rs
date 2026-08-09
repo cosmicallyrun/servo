@@ -18,6 +18,7 @@
 //! loop.
 
 use std::cell::{Cell, RefCell};
+#[cfg(feature = "v8-shadow")]
 use std::collections::HashSet;
 use std::default::Default;
 #[cfg(feature = "v8-shadow")]
@@ -55,7 +56,7 @@ use encoding_rs::Encoding;
 use fonts::{FontContext, SystemFontServiceProxy};
 use headers::{HeaderMapExt, LastModified, ReferrerPolicy as ReferrerPolicyHeader};
 #[cfg(feature = "v8-shadow")]
-use html5ever::local_name;
+use html5ever::{local_name, ns};
 use http::header::REFRESH;
 use hyper_serde::Serde;
 use ipc_channel::router::ROUTER;
@@ -252,6 +253,94 @@ struct V8StaticNodeListHost {
     elements: Vec<Trusted<Element>>,
 }
 
+/// One live `ParentNode.children` collection.
+///
+/// The owner node is the collection's only cross-heap root. Collection reads
+/// traverse its direct element children each time, so a wrapper retained by
+/// V8 observes subsequent Servo DOM mutations.
+#[cfg(feature = "v8-shadow")]
+struct V8ChildrenCollectionHost {
+    root: Trusted<Node>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: The host and its Trusted root stay on the originating script
+// thread. Every operation is a synchronous read of the owner's direct
+// children, and every returned item uses the installed V8ElementHost type.
+unsafe impl servo_v8::HTMLCollectionHostBinding for V8ChildrenCollectionHost {
+    fn length(&self) -> u32 {
+        self.root
+            .root()
+            .child_elements()
+            .count()
+            .min(u32::MAX as usize) as u32
+    }
+
+    fn item(&self, index: u32) -> Option<servo_v8::InterfaceHandle> {
+        let element = self
+            .root
+            .root()
+            .child_elements()
+            .nth(index as usize)?;
+        Some(v8_element_interface_handle(&element))
+    }
+
+    fn named_item(&self, name: &str) -> Option<servo_v8::InterfaceHandle> {
+        if name.is_empty() {
+            return None;
+        }
+
+        let name = Atom::from(name);
+        let element = self.root.root().child_elements().find(|element| {
+            element.get_id().is_some_and(|id| id == name) ||
+                (element.namespace() == &ns!(html) &&
+                    element.get_name().is_some_and(|element_name| element_name == name))
+        })?;
+        Some(v8_element_interface_handle(&element))
+    }
+
+    fn supported_names(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+
+        for element in self.root.root().child_elements() {
+            if let Some(id) = element.get_id() {
+                let id = id.to_string();
+                if !id.is_empty() && seen.insert(id.clone()) {
+                    result.push(id);
+                }
+            }
+
+            if element.namespace() == &ns!(html) &&
+                let Some(name) = element.get_name()
+            {
+                let name = name.to_string();
+                if !name.is_empty() && seen.insert(name.clone()) {
+                    result.push(name);
+                }
+            }
+        }
+
+        result
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
+fn v8_children_collection_handle(root: &Node) -> servo_v8::HTMLCollectionHandle {
+    // SAFETY: The cache key is the address of the owner Node rooted by the
+    // freshly boxed host. ScriptThread installs V8ChildrenCollectionHost as
+    // the runtime's sole HTMLCollection host type before creating any realm.
+    unsafe {
+        servo_v8::HTMLCollectionHandle::new(
+            (root as *const Node).cast::<c_void>(),
+            V8ChildrenCollectionHost {
+                root: Trusted::new(root),
+            },
+        )
+    }
+}
+
 #[cfg(feature = "v8-shadow")]
 #[expect(unsafe_code)]
 // SAFETY: The host and its Trusted roots stay on the originating script
@@ -425,6 +514,11 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
 
     fn has_child_nodes(&self) -> bool {
         self.element.root().upcast::<Node>().HasChildNodes()
+    }
+
+    fn children(&self) -> servo_v8::HTMLCollectionHandle {
+        let element = self.element.root();
+        v8_children_collection_handle(element.upcast::<Node>())
     }
 
     fn first_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
@@ -709,6 +803,11 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         let head = self.document.root().GetHead()?;
         let element = head.upcast::<Element>();
         Some(v8_element_interface_handle(element))
+    }
+
+    fn children(&self) -> servo_v8::HTMLCollectionHandle {
+        let document = self.document.root();
+        v8_children_collection_handle(document.upcast::<Node>())
     }
 
     fn first_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
@@ -2491,6 +2590,11 @@ impl ScriptThread {
                 }
                 if let Err(error) = runtime.install_node_list_host::<V8StaticNodeListHost>() {
                     panic!("V8 NodeList host installation failed: {error}");
+                }
+                if let Err(error) =
+                    runtime.install_html_collection_host::<V8ChildrenCollectionHost>()
+                {
+                    panic!("V8 HTMLCollection host installation failed: {error}");
                 }
                 Some(V8ShadowState {
                     runtime,

@@ -216,6 +216,10 @@ def write_outputs(webidls_dir: Path, out_dir: Path) -> None:
             Path(cache_dir) / "node",
             webidls_dir=webidls_dir,
         )
+        production_webidl.select_html_collection_interface(
+            Path(cache_dir) / "html_collection",
+            webidls_dir=webidls_dir,
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     for filename, contents in generate_outputs(selected_members).items():
         (out_dir / filename).write_text(contents, encoding="utf-8")
@@ -1136,6 +1140,140 @@ def _readonly_nullable_interface_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_getter_name(member.attribute)}"]
 
 
+# A `[SameObject]` collection is always present, but like other interface
+# results it transfers a speculative native host alongside the DOM identity
+# key used by the per-realm wrapper cache.
+_HTML_COLLECTION_C_TYPE: Block = [
+    "typedef struct ServoV8HTMLCollectionValue {",
+    "  const void* key;",
+    "  void* native;",
+    "} ServoV8HTMLCollectionValue;",
+]
+
+_HTML_COLLECTION_RUST_TYPE: Block = [
+    "#[derive(Clone, Copy)]",
+    "#[repr(C)]",
+    "pub struct RawHTMLCollectionValue {",
+    "    pub key: *const c_void,",
+    "    pub native: *mut c_void,",
+    "}",
+]
+
+
+def _sameobject_readonly_interface_header_slots(member: Member) -> Block:
+    return [
+        f"  uint8_t (*{_getter_name(member.attribute)})(void* native, ServoV8HTMLCollectionValue* output);",
+    ]
+
+
+def _sameobject_readonly_interface_rust_trait_members(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        "    /// Transfers one boxed live-collection host; the realm cache preserves `SameObject`.",
+        f"    fn {name}(&self) -> HTMLCollectionHandle;",
+    ]
+
+
+def _sameobject_readonly_interface_rust_vtable_fields(member: Member) -> Block:
+    return [
+        f'    pub {_getter_name(member.attribute)}: Option<unsafe extern "C" fn(*mut c_void, *mut RawHTMLCollectionValue) -> u8>,',
+    ]
+
+
+def _sameobject_readonly_interface_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    getter = _getter_name(member.attribute)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{getter}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    output: *mut RawHTMLCollectionValue,",
+            ") -> u8 {",
+            "    if output.is_null() {",
+            "        return 0;",
+            "    }",
+            "    // SAFETY: The vtable contract requires a live Box<T> native pointer.",
+            f"    let handle = unsafe {{ &*native.cast::<T>() }}.{name}();",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe {",
+            "        *output = RawHTMLCollectionValue {",
+            "            key: handle.key,",
+            "            native: handle.native,",
+            "        };",
+            "    }",
+            "    1",
+            "}",
+        ],
+    )
+
+
+def _sameobject_readonly_interface_rust_vtable_init(member: Member) -> Block:
+    getter = _getter_name(member.attribute)
+    return [f"            {getter}: Some(document_host_{getter}::<T>),"]
+
+
+def _sameobject_readonly_interface_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    getter = _getter_name(member.attribute)
+    accessor = _cpp_member_name(member.attribute)
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostGet{accessor}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{getter}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->html_collection_host_installed ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->html_collection_template.IsEmpty() ||",
+            "      realm->element_template.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "HTMLCollection host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  ServoV8HTMLCollectionValue value{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{getter}(state->native, &value) != 0;",
+            "  }",
+            "  if (!succeeded) {",
+            "    DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            f'    ThrowTypeError(isolate, "{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            "  if (!value.key || !value.native) {",
+            "    DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            f'    ThrowTypeError(isolate, "invalid {qualified_name} interface result");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            "  v8::Local<v8::Object> wrapper =",
+            "      WrapperForHTMLCollectionValue(realm, context, value);",
+            "  if (wrapper.IsEmpty()) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} wrapper could not be created");',
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(wrapper);",
+            "}",
+        ],
+    )
+
+
+def _sameobject_readonly_interface_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_getter_name(member.attribute)}"]
+
+
 # This operation has the same nullable Element result contract as the
 # interface-valued attributes above, but it also converts one JavaScript value
 # to DOMString and passes the embedding's ephemeral JSContext through to Servo.
@@ -1908,6 +2046,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(),
         cpp_bodies=_readonly_nullable_interface_cpp_bodies,
         cpp_vtable_terms=_readonly_nullable_interface_cpp_vtable_terms,
+    ),
+    production_webidl.SAMEOBJECT_READONLY_INTERFACE: ShapeEmitter(
+        header_type_blocks=(_HTML_COLLECTION_C_TYPE,),
+        header_slots=_sameobject_readonly_interface_header_slots,
+        rust_type_blocks=(_HTML_COLLECTION_RUST_TYPE,),
+        rust_trait_members=_sameobject_readonly_interface_rust_trait_members,
+        rust_vtable_fields=_sameobject_readonly_interface_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_sameobject_readonly_interface_rust_thunks,
+        rust_vtable_init=_sameobject_readonly_interface_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_sameobject_readonly_interface_cpp_bodies,
+        cpp_vtable_terms=_sameobject_readonly_interface_cpp_vtable_terms,
     ),
     production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE: ShapeEmitter(
         header_type_blocks=(),

@@ -48,6 +48,7 @@ NODE_TEXT_CONTENT = "Node.textContent"
 NODE_HAS_CHILD_NODES = "Node.hasChildNodes"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_HEAD = "Document.head"
+DOCUMENT_CHILDREN = "Document.children"
 DOCUMENT_FIRST_ELEMENT_CHILD = "Document.firstElementChild"
 DOCUMENT_LAST_ELEMENT_CHILD = "Document.lastElementChild"
 DOCUMENT_CHILD_ELEMENT_COUNT = "Document.childElementCount"
@@ -71,6 +72,7 @@ ELEMENT_CLASS_NAME = "Element.className"
 ELEMENT_HAS_ATTRIBUTES = "Element.hasAttributes"
 ELEMENT_GET_ATTRIBUTE = "Element.getAttribute"
 ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
+ELEMENT_CHILDREN = "Element.children"
 ELEMENT_FIRST_ELEMENT_CHILD = "Element.firstElementChild"
 ELEMENT_LAST_ELEMENT_CHILD = "Element.lastElementChild"
 ELEMENT_CHILD_ELEMENT_COUNT = "Element.childElementCount"
@@ -79,6 +81,10 @@ ELEMENT_CLOSEST = "Element.closest"
 ELEMENT_MATCHES = "Element.matches"
 ELEMENT_WEBKIT_MATCHES_SELECTOR = "Element.webkitMatchesSelector"
 ELEMENT_QUERY_SELECTOR_ALL = "Element.querySelectorAll"
+HTML_COLLECTION_INTERFACE = "HTMLCollection"
+HTML_COLLECTION_LENGTH = "HTMLCollection.length"
+HTML_COLLECTION_ITEM = "HTMLCollection.item"
+HTML_COLLECTION_NAMED_ITEM = "HTMLCollection.namedItem"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -93,6 +99,7 @@ READONLY_UNSIGNED_SHORT = "readonly unsigned short"
 READONLY_UNSIGNED_LONG = "readonly unsigned long"
 READONLY_NULLABLE_INTERFACE = "readonly nullable interface"
 PURE_READONLY_NULLABLE_INTERFACE = "Pure readonly nullable interface"
+SAMEOBJECT_READONLY_INTERFACE = "SameObject readonly interface"
 PURE_DOMSTRING_TO_NULLABLE_INTERFACE = "Pure operation DOMString -> nullable interface"
 PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE = (
     "Pure Throws operation DOMString -> nullable interface"
@@ -132,6 +139,7 @@ PURE_THROWS_DOMSTRING_TO_BOOLEAN_EXTENDED_ATTRIBUTES = frozenset(
 NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE_EXTENDED_ATTRIBUTES = frozenset(
     {"NewObject", "Throws"}
 )
+SAMEOBJECT_READONLY_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"SameObject"})
 
 # An enum crosses the ABI as its string value, so the generated glue is only
 # correct for the exact value set it was written against. Pinning the set makes
@@ -188,6 +196,11 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     # A second identity exercises multiple wrapper-cache entries in one realm.
     # HTMLHeadElement is exposed through the current inherited Element facade.
     DocumentHostMember(DOCUMENT_HEAD, READONLY_NULLABLE_INTERFACE, "HTMLHeadElement"),
+    DocumentHostMember(
+        DOCUMENT_CHILDREN,
+        SAMEOBJECT_READONLY_INTERFACE,
+        "HTMLCollection",
+    ),
     # ParentNode mixin reads reuse the same stable Element wrappers. The parser
     # resolves included mixins onto Document, so these also prove that the
     # production inclusion remains enabled rather than pinning a detached copy.
@@ -260,6 +273,7 @@ ELEMENT_HOST = (
     ELEMENT_HAS_ATTRIBUTES,
     ELEMENT_GET_ATTRIBUTE,
     ELEMENT_HAS_ATTRIBUTE,
+    ELEMENT_CHILDREN,
     ELEMENT_FIRST_ELEMENT_CHILD,
     ELEMENT_LAST_ELEMENT_CHILD,
     ELEMENT_CHILD_ELEMENT_COUNT,
@@ -579,6 +593,42 @@ def select_pure_readonly_nullable_interface_attribute(
             f"`{qualified_name}` must carry exactly ['Pure'], "
             f"got {sorted(actual_attributes)}"
         )
+    return member
+
+
+def select_sameobject_readonly_interface_attribute(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_interface: str,
+) -> WebIDL.IDLAttribute:
+    """Select the exact `[SameObject]` non-nullable interface attribute shape."""
+
+    member = _select_instance_attribute(
+        parser_results,
+        qualified_name,
+        SAMEOBJECT_READONLY_INTERFACE_EXTENDED_ATTRIBUTES,
+    )
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != {"SameObject"}:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly ['SameObject'], "
+            f"got {sorted(actual_attributes)}"
+        )
+    if not member.readonly:
+        raise WebIDLSelectionError(f"`{qualified_name}` must be readonly")
+    if member.type.nullable():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be non-nullable")
+    if not member.type.isInterface():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return an interface, got `{member.type.prettyName()}`"
+        )
+
+    actual_interface = member.type.name
+    if actual_interface != expected_interface:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return `{expected_interface}`, got `{actual_interface}`"
+        )
+
     return member
 
 
@@ -1120,6 +1170,7 @@ def _select_element_host_member(
         "tagName": {"Pure"},
         "id": {"CEReactions", "Pure"},
         "className": {"CEReactions", "Pure"},
+        "children": {"SameObject"},
         "firstElementChild": {"Pure"},
         "lastElementChild": {"Pure"},
         "childElementCount": {"Pure"},
@@ -1139,6 +1190,7 @@ def _select_element_host_member(
         expected_readonly = member_name in {
             "localName",
             "tagName",
+            "children",
             "firstElementChild",
             "lastElementChild",
             "childElementCount",
@@ -1146,7 +1198,17 @@ def _select_element_host_member(
         if member.readonly != expected_readonly:
             state = "readonly" if expected_readonly else "writable"
             raise WebIDLSelectionError(f"`{qualified_name}` must be {state}")
-        if member_name in {"firstElementChild", "lastElementChild"}:
+        if member_name == "children":
+            if (
+                member.type.nullable()
+                or not member.type.isInterface()
+                or member.type.name != "HTMLCollection"
+            ):
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use non-nullable `HTMLCollection`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member_name in {"firstElementChild", "lastElementChild"}:
             if (
                 not member.type.nullable()
                 or not member.type.inner.isInterface()
@@ -1346,6 +1408,173 @@ def _select_node_host_member(
     return member
 
 
+def _select_html_collection_interface(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+) -> WebIDL.IDLInterface:
+    """Pin the complete manually installed HTMLCollection WebIDL surface."""
+
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == HTML_COLLECTION_INTERFACE
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{HTML_COLLECTION_INTERFACE}`, "
+            f"found {len(interfaces)}"
+        )
+    interface = interfaces[0]
+
+    expected_interface_attributes = {
+        "Exposed",
+        "LegacyUnenumerableNamedProperties",
+    }
+    actual_interface_attributes = set(interface._extendedAttrDict)
+    if actual_interface_attributes != expected_interface_attributes:
+        raise WebIDLSelectionError(
+            "`HTMLCollection` must carry exactly "
+            f"{sorted(expected_interface_attributes)}, "
+            f"got {sorted(actual_interface_attributes)}"
+        )
+    if interface.getExtendedAttribute("Exposed") != ["Window"]:
+        raise WebIDLSelectionError(
+            "`HTMLCollection` must carry exactly `[Exposed=Window]`"
+        )
+    if interface.getExtendedAttribute("LegacyUnenumerableNamedProperties") is not True:
+        raise WebIDLSelectionError(
+            "`HTMLCollection` must carry `[LegacyUnenumerableNamedProperties]`"
+        )
+    if interface.isCallback():
+        raise WebIDLSelectionError("`HTMLCollection` must be an ordinary interface")
+    if interface.parent is not None:
+        raise WebIDLSelectionError("`HTMLCollection` must not inherit from another interface")
+    if interface.ctor() is not None or interface.legacyFactoryFunctions:
+        raise WebIDLSelectionError("`HTMLCollection` must not be constructible")
+    if interface.maplikeOrSetlikeOrIterable is not None:
+        raise WebIDLSelectionError(
+            "`HTMLCollection` must not declare iterable, maplike, or setlike members"
+        )
+
+    expected_member_names = ["length", "item", "namedItem"]
+    actual_member_names = [member.identifier.name for member in interface.members]
+    if actual_member_names != expected_member_names:
+        raise WebIDLSelectionError(
+            f"`HTMLCollection` must declare exactly {expected_member_names}, "
+            f"got {actual_member_names}"
+        )
+
+    length, item, named_item = interface.members
+    if not length.isAttr() or length.isStatic():
+        raise WebIDLSelectionError(
+            f"`{HTML_COLLECTION_LENGTH}` must be an instance attribute"
+        )
+    if set(length._extendedAttrDict) != {"Pure"}:
+        raise WebIDLSelectionError(
+            f"`{HTML_COLLECTION_LENGTH}` must carry exactly ['Pure'], "
+            f"got {sorted(length._extendedAttrDict)}"
+        )
+    if not length.readonly:
+        raise WebIDLSelectionError(f"`{HTML_COLLECTION_LENGTH}` must be readonly")
+    if length.type.nullable() or length.type.tag() != WebIDL.IDLType.Tags.uint32:
+        raise WebIDLSelectionError(
+            f"`{HTML_COLLECTION_LENGTH}` must use non-nullable `unsigned long`, "
+            f"got `{length.type.prettyName()}`"
+        )
+    if length.type._extendedAttrDict:
+        raise WebIDLSelectionError(
+            f"`{HTML_COLLECTION_LENGTH}` type carries extended attributes that are not implemented: "
+            + ", ".join(sorted(length.type._extendedAttrDict))
+        )
+
+    _validate_html_collection_getter(
+        item,
+        HTML_COLLECTION_ITEM,
+        named=False,
+        argument_name="index",
+        argument_type="unsigned long",
+    )
+    _validate_html_collection_getter(
+        named_item,
+        HTML_COLLECTION_NAMED_ITEM,
+        named=True,
+        argument_name="name",
+        argument_type="DOMString",
+    )
+    return interface
+
+
+def _validate_html_collection_getter(
+    member: WebIDL.IDLInterfaceMember,
+    qualified_name: str,
+    *,
+    named: bool,
+    argument_name: str,
+    argument_type: str,
+) -> None:
+    """Validate one exact HTMLCollection indexed or named getter."""
+
+    if not member.isMethod() or member.isStatic() or not member.isGetter():
+        kind = "named" if named else "indexed"
+        article = "a" if named else "an"
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must be {article} {kind} instance getter"
+        )
+    if member.isNamed() != named or member.isIndexed() == named:
+        kind = "named" if named else "indexed"
+        raise WebIDLSelectionError(f"`{qualified_name}` must be a {kind} getter")
+    if set(member._extendedAttrDict) != {"Pure"}:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly ['Pure'], "
+            f"got {sorted(member._extendedAttrDict)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, "
+            f"found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if (
+        not return_type.nullable()
+        or not return_type.inner.isInterface()
+        or return_type.inner.name != "Element"
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return nullable `Element`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if len(arguments) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly one argument, found {len(arguments)}"
+        )
+    argument = arguments[0]
+    type_matches = (
+        argument.type.tag() == WebIDL.IDLType.Tags.uint32
+        if argument_type == "unsigned long"
+        else argument.type.isDOMString()
+    )
+    if (
+        argument.identifier.name != argument_name
+        or argument.optional
+        or argument.variadic
+        or argument.defaultValue is not None
+        or argument.type.nullable()
+        or not type_matches
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take required non-nullable "
+            f"`{argument_type} {argument_name}`"
+        )
+    argument_attributes = set(argument._extendedAttrDict) | set(
+        argument.type._extendedAttrDict
+    )
+    if argument_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument_name}` carries extended attributes "
+            "that are not implemented: " + ", ".join(sorted(argument_attributes))
+        )
+
+
 def select_document_hidden(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
@@ -1393,6 +1622,7 @@ def _select_document_host_member(
     if member.shape in {
         READONLY_NULLABLE_INTERFACE,
         PURE_READONLY_NULLABLE_INTERFACE,
+        SAMEOBJECT_READONLY_INTERFACE,
         PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
         PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
         NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
@@ -1409,6 +1639,12 @@ def _select_document_host_member(
             )
         if member.shape == PURE_READONLY_NULLABLE_INTERFACE:
             return select_pure_readonly_nullable_interface_attribute(
+                parser_results,
+                member.qualified_name,
+                member.expected_interface,
+            )
+        if member.shape == SAMEOBJECT_READONLY_INTERFACE:
+            return select_sameobject_readonly_interface_attribute(
                 parser_results,
                 member.qualified_name,
                 member.expected_interface,
@@ -1510,6 +1746,17 @@ def select_node_host_members(
         qualified_name: _select_node_host_member(parser_results, qualified_name)
         for qualified_name in NODE_HOST
     }
+
+
+def select_html_collection_interface(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> WebIDL.IDLInterface:
+    """Load the production corpus and pin the complete HTMLCollection interface."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return _select_html_collection_interface(parser_results)
 
 
 def _split_qualified_name(qualified_name: str) -> tuple[str, str]:

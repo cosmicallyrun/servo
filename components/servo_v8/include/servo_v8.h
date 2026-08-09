@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 27u
+#define SERVO_V8_ABI_VERSION 28u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -128,6 +128,8 @@ typedef struct ServoV8ElementHostVTable {
                               const uint8_t* value,
                               size_t value_length);
   uint8_t (*has_child_nodes)(void* native, uint8_t* output);
+  uint8_t (*get_children)(void* native,
+                          ServoV8HTMLCollectionValue* output);
   uint8_t (*get_first_element_child)(void* native,
                                      ServoV8InterfaceValue* output);
   uint8_t (*get_last_element_child)(void* native,
@@ -171,6 +173,24 @@ typedef struct ServoV8NodeListHostVTable {
                   ServoV8InterfaceValue* output);
   ServoV8DropCallback drop;
 } ServoV8NodeListHostVTable;
+
+/* One live HTMLCollection returned by ParentNode.children. The host roots its
+ * owner and derives the current direct child elements on every callback. */
+typedef struct ServoV8HTMLCollectionHostVTable {
+  uint8_t (*get_length)(void* native, uint32_t* output);
+  uint8_t (*item)(void* native,
+                  uint32_t index,
+                  ServoV8InterfaceValue* output);
+  uint8_t (*named_item)(void* native,
+                        const uint8_t* name,
+                        size_t name_length,
+                        ServoV8InterfaceValue* output);
+  uint8_t (*get_supported_name_count)(void* native, uint32_t* output);
+  uint8_t (*supported_name)(void* native,
+                            uint32_t index,
+                            ServoV8OwnedUtf8* output);
+  ServoV8DropCallback drop;
+} ServoV8HTMLCollectionHostVTable;
 
 /* A realm-owned host for HTML's timer scheduling algorithms.
  *
@@ -362,6 +382,12 @@ int32_t servo_v8_install_element_host(
 int32_t servo_v8_install_node_list_host(
     ServoV8Runtime* runtime,
     const ServoV8NodeListHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Registers the type-level live HTMLCollection host vtable for this runtime. */
+int32_t servo_v8_install_html_collection_host(
+    ServoV8Runtime* runtime,
+    const ServoV8HTMLCollectionHostVTable* vtable,
     ServoV8ErrorBuffer* error);
 
 int32_t servo_v8_install_engine_binding_smoke(
