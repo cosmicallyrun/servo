@@ -574,6 +574,27 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         self.element.root().upcast::<Node>().HasChildNodes()
     }
 
+    unsafe fn remove(&self, host_context: *mut c_void) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context
+        // only for this synchronous production DOM mutation.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let element = self.element.root();
+        // This is ChildNode's production remove algorithm. As with id,
+        // className, and textContent above, CEReactions deliberately remain
+        // on Servo's outer or backup queue until V8 has unwound.
+        element.upcast::<Node>().remove_self(cx);
+        // A removal normally has no throwing branch, but do not return to V8
+        // with a SpiderMonkey exception pending if that ever changes.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return false;
+        }
+        true
+    }
+
     fn children(&self) -> servo_v8::HTMLCollectionHandle {
         let element = self.element.root();
         v8_children_collection_handle(element.upcast::<Node>())

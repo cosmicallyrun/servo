@@ -1,0 +1,161 @@
+<!doctype html>
+<!--
+Runtime proof for Element.remove(). The V8-authoritative script pins the
+Element.prototype operation and Symbol.unscopables surface, then removes a
+child through Servo's production ChildNode algorithm. It retains both the
+live HTMLCollection and a static rooted NodeList across the mutation. The
+following unmarked SpiderMonkey script independently checks the real DOM.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Element remove proof</title>
+    <style>
+      #target { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="target">
+      <span id="first" class="child">first</span>
+      <em id="removed" class="child">removed</em>
+      <strong id="last" class="child">last</strong>
+    </section>
+    <script data-servo-v8="authoritative">
+      const target = document.getElementById("target");
+      const removed = document.getElementById("removed");
+      // The constrained authoritative realm intentionally has no Element
+      // constructor global; this is its realm-shared Element.prototype.
+      const elementPrototype = Object.getPrototypeOf(removed);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "remove",
+      );
+      const unscopables = elementPrototype[Symbol.unscopables];
+      const unscopablesDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        Symbol.unscopables,
+      );
+      const removeUnscopableDescriptor = Object.getOwnPropertyDescriptor(
+        unscopables,
+        "remove",
+      );
+
+      if (
+        Object.getPrototypeOf(removed) !== elementPrototype ||
+        Object.hasOwn(removed, "remove") ||
+        !descriptor ||
+        typeof descriptor.value !== "function" ||
+        descriptor.value.name !== "remove" ||
+        descriptor.value.length !== 0 ||
+        !descriptor.writable ||
+        !descriptor.enumerable ||
+        !descriptor.configurable ||
+        !unscopablesDescriptor ||
+        unscopablesDescriptor.value !== unscopables ||
+        unscopablesDescriptor.writable ||
+        unscopablesDescriptor.enumerable ||
+        !unscopablesDescriptor.configurable ||
+        !unscopables ||
+        Object.getPrototypeOf(unscopables) !== null ||
+        unscopables.remove !== true ||
+        !removeUnscopableDescriptor ||
+        removeUnscopableDescriptor.value !== true ||
+        !removeUnscopableDescriptor.writable ||
+        !removeUnscopableDescriptor.enumerable ||
+        !removeUnscopableDescriptor.configurable
+      ) {
+        throw new Error("Element.remove prototype surface is wrong");
+      }
+
+      let surplusArgumentTouched = false;
+      let wrongBrandRejected = false;
+      try {
+        descriptor.value.call({}, {
+          toString() {
+            surplusArgumentTouched = true;
+            return "unused";
+          },
+        });
+      } catch (error) {
+        wrongBrandRejected = error instanceof TypeError;
+      }
+      if (!wrongBrandRejected || surplusArgumentTouched) {
+        throw new Error("Element.remove did not brand-check before conversion");
+      }
+
+      let lexicalRemove;
+      (function () {
+        var remove = "outer binding";
+        with (removed) {
+          lexicalRemove = remove;
+        }
+      })();
+      if (lexicalRemove !== "outer binding") {
+        throw new Error("Element.remove was not excluded by Symbol.unscopables");
+      }
+
+      const children = target.children;
+      const snapshot = target.querySelectorAll(".child");
+      const first = children[0];
+      const last = children[2];
+      if (
+        children.length !== 3 ||
+        snapshot.length !== 3 ||
+        snapshot[1] !== removed ||
+        children[1] !== removed ||
+        first.id !== "first" ||
+        last.id !== "last"
+      ) {
+        throw new Error("remove fixture was not available through production DOM");
+      }
+
+      const result = removed.remove();
+      if (
+        result !== undefined ||
+        children !== target.children ||
+        children.length !== 2 ||
+        children[0] !== first ||
+        children[1] !== last ||
+        children.item(2) !== null ||
+        snapshot.length !== 3 ||
+        snapshot[1] !== removed ||
+        snapshot.item(1) !== removed ||
+        target.querySelector("#removed") !== null ||
+        document.querySelector("#removed") !== null ||
+        removed.isConnected ||
+        target.childElementCount !== 2
+      ) {
+        throw new Error("Element.remove did not mutate live Servo DOM correctly");
+      }
+
+      // A disconnected node's ChildNode.remove is a no-op.
+      if (
+        removed.remove() !== undefined ||
+        children.length !== 2 ||
+        children[1] !== last ||
+        snapshot[1] !== removed ||
+        removed.isConnected
+      ) {
+        throw new Error("second Element.remove was not a no-op");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently verifies the production DOM mutation.
+      const target = document.getElementById("target");
+      if (
+        !target ||
+        target.childElementCount !== 2 ||
+        target.children[0].id !== "first" ||
+        target.children[1].id !== "last" ||
+        document.getElementById("removed") !== null ||
+        target.querySelector("#removed") !== null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

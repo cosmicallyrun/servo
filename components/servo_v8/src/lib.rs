@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 29;
+const ABI_VERSION: u32 = 30;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -362,6 +362,7 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     fn first_element_child(&self) -> Option<InterfaceHandle>;
     fn last_element_child(&self) -> Option<InterfaceHandle>;
     fn child_element_count(&self) -> u32;
+    unsafe fn remove(&self, host_context: *mut c_void) -> bool;
     unsafe fn query_selector(
         &self,
         host_context: *mut c_void,
@@ -424,6 +425,7 @@ pub struct ElementHostVTable {
     pub get_last_element_child:
         Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub get_child_element_count: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
+    pub remove: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> u8>,
     pub query_selector: Option<
         unsafe extern "C" fn(
             *mut c_void,
@@ -1084,6 +1086,17 @@ unsafe extern "C" fn element_host_get_child_element_count<T: ElementHostBinding>
     1
 }
 
+unsafe extern "C" fn element_host_remove<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    unsafe { (&*native.cast::<T>()).remove(host_context) as u8 }
+}
+
 unsafe extern "C" fn element_host_query_selector<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -1371,6 +1384,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         get_first_element_child: Some(element_host_get_first_element_child::<T>),
         get_last_element_child: Some(element_host_get_last_element_child::<T>),
         get_child_element_count: Some(element_host_get_child_element_count::<T>),
+        remove: Some(element_host_remove::<T>),
         query_selector: Some(element_host_query_selector::<T>),
         closest: Some(element_host_closest::<T>),
         matches: Some(element_host_matches::<T>),
@@ -2586,6 +2600,7 @@ mod tests {
         text_content: RefCell<Option<String>>,
         has_child_nodes: Cell<bool>,
         is_connected: Cell<bool>,
+        remove_fails: Cell<bool>,
         element_children: Rc<RefCell<Vec<ElementProbeChild>>>,
         html_collection_drops: Rc<Cell<usize>>,
     }
@@ -2610,6 +2625,7 @@ mod tests {
                 text_content: RefCell::new(Some(text_content.to_owned())),
                 has_child_nodes: Cell::new(has_child_nodes),
                 is_connected: Cell::new(true),
+                remove_fails: Cell::new(false),
                 element_children: Rc::new(RefCell::new(Vec::new())),
                 html_collection_drops: Rc::new(Cell::new(0)),
             })
@@ -2649,6 +2665,8 @@ mod tests {
         // Child probes own their stand-in DOM identity through the host. The
         // top-level identities remain owned by DocumentHostProbe instead.
         _owned_identity: Option<Rc<u8>>,
+        parent_children: Option<Rc<RefCell<Vec<ElementProbeChild>>>>,
+        parent_state: Option<Rc<ElementProbeState>>,
         drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -2660,6 +2678,8 @@ mod tests {
         identity: *const c_void,
         state: Rc<ElementProbeState>,
         owned_identity: Option<Rc<u8>>,
+        parent_children: Option<Rc<RefCell<Vec<ElementProbeChild>>>>,
+        parent_state: Option<Rc<ElementProbeState>>,
         element_drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -2677,6 +2697,8 @@ mod tests {
                         identity: self.identity,
                         state: Rc::clone(&self.state),
                         _owned_identity: self.owned_identity.clone(),
+                        parent_children: self.parent_children.clone(),
+                        parent_state: self.parent_state.clone(),
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -2715,6 +2737,7 @@ mod tests {
     struct HTMLCollectionHostProbe {
         items: Rc<RefCell<Vec<ElementProbeChild>>>,
         required_classes: Option<Vec<String>>,
+        parent_state: Option<Rc<ElementProbeState>>,
         element_drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
         drops: Rc<Cell<usize>>,
@@ -2757,6 +2780,8 @@ mod tests {
                 identity: Rc::as_ptr(&child.identity).cast(),
                 state: child.state,
                 owned_identity: Some(child.identity),
+                parent_children: Some(Rc::clone(&self.items)),
+                parent_state: self.parent_state.clone(),
                 element_drops: Rc::clone(&self.element_drops),
                 drop_reentry: self.drop_reentry.clone(),
             }
@@ -2930,6 +2955,7 @@ mod tests {
                     HTMLCollectionHostProbe {
                         items: Rc::clone(&self.state.element_children),
                         required_classes: None,
+                        parent_state: Some(Rc::clone(&self.state)),
                         element_drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                         drops: Rc::clone(&self.state.html_collection_drops),
@@ -2951,6 +2977,7 @@ mod tests {
                             .map(str::to_owned)
                             .collect(),
                     ),
+                    parent_state: Some(Rc::clone(&self.state)),
                     element_drops: Rc::clone(&self.drops),
                     drop_reentry: self.drop_reentry.clone(),
                     drops: Rc::clone(&self.state.html_collection_drops),
@@ -2969,6 +2996,27 @@ mod tests {
 
         fn child_element_count(&self) -> u32 {
             self.state.element_children.borrow().len() as u32
+        }
+
+        unsafe fn remove(&self, host_context: *mut c_void) -> bool {
+            assert!(!host_context.is_null());
+            if self.state.remove_fails.get() {
+                return false;
+            }
+            if let Some(parent_children) = &self.parent_children {
+                let mut children = parent_children.borrow_mut();
+                if let Some(index) = children
+                    .iter()
+                    .position(|child| Rc::as_ptr(&child.identity).cast::<c_void>() == self.identity)
+                {
+                    let child = children.remove(index);
+                    child.state.is_connected.set(false);
+                    if let Some(parent_state) = &self.parent_state {
+                        parent_state.has_child_nodes.set(!children.is_empty());
+                    }
+                }
+            }
+            true
         }
 
         unsafe fn query_selector(
@@ -3053,6 +3101,8 @@ mod tests {
                     identity: Rc::as_ptr(&child.identity).cast(),
                     state: Rc::clone(&child.state),
                     owned_identity: Some(Rc::clone(&child.identity)),
+                    parent_children: None,
+                    parent_state: None,
                     element_drops: Rc::clone(&self.drops),
                     drop_reentry: self.drop_reentry.clone(),
                 })
@@ -3094,6 +3144,8 @@ mod tests {
                         identity: self.identity,
                         state: Rc::clone(&self.state),
                         _owned_identity: self._owned_identity.clone(),
+                        parent_children: self.parent_children.clone(),
+                        parent_state: self.parent_state.clone(),
                         drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -3114,6 +3166,8 @@ mod tests {
                         identity: Rc::as_ptr(&child.identity).cast::<c_void>(),
                         state: child.state,
                         _owned_identity: Some(child.identity),
+                        parent_children: Some(Rc::clone(&self.state.element_children)),
+                        parent_state: Some(Rc::clone(&self.state)),
                         drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -3449,6 +3503,8 @@ mod tests {
                         identity: (&*self.element_identity as *const u8).cast(),
                         state: Rc::clone(&self.element_state),
                         _owned_identity: None,
+                        parent_children: None,
+                        parent_state: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -3471,6 +3527,8 @@ mod tests {
                         identity: (&*self.head_identity as *const u8).cast(),
                         state: Rc::clone(&self.head_state),
                         _owned_identity: None,
+                        parent_children: None,
+                        parent_state: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -3496,6 +3554,7 @@ mod tests {
                     HTMLCollectionHostProbe {
                         items,
                         required_classes: None,
+                        parent_state: None,
                         element_drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                         drops: Rc::clone(&self.html_collection_drops),
@@ -3547,6 +3606,7 @@ mod tests {
                             .map(str::to_owned)
                             .collect(),
                     ),
+                    parent_state: None,
                     element_drops: Rc::clone(&self.element_drops),
                     drop_reentry: self.element_drop_reentry.clone(),
                     drops: Rc::clone(&self.html_collection_drops),
@@ -3589,6 +3649,8 @@ mod tests {
                         identity: (&*self.id_element_identity as *const u8).cast(),
                         state: Rc::clone(&self.id_element_state),
                         _owned_identity: None,
+                        parent_children: None,
+                        parent_state: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -3634,6 +3696,8 @@ mod tests {
                     tag_name: tag_name.to_owned(),
                     identity,
                     state: Rc::clone(state),
+                    parent_children: None,
+                    parent_state: None,
                     owned_identity: None,
                     element_drops: Rc::clone(&self.element_drops),
                     drop_reentry: self.element_drop_reentry.clone(),
@@ -5637,6 +5701,161 @@ mod tests {
     }
 
     #[test]
+    fn element_remove_exposes_exact_unscopable_live_tree_behavior() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+        runtime
+            .install_html_collection_host::<HTMLCollectionHostProbe>()
+            .expect("HTMLCollection host vtable installs once");
+        runtime
+            .install_node_list_host::<NodeListHostProbe>()
+            .expect("NodeList host vtable installs once");
+
+        let realm = runtime.create_realm().unwrap();
+        let host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        let removed_child_state =
+            Rc::clone(&host.id_element_state.element_children.borrow()[0].state);
+        runtime.install_document_host(realm, host).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"
+            (() => {
+              const target = document.getElementById('target');
+              const collection = target.children;
+              // Obtain the child through children so the probe supplies its
+              // parent_children link to Element.remove().
+              const first = collection[0];
+              const second = collection[1];
+              const snapshot = target.querySelectorAll('*');
+              const elementPrototype = Object.getPrototypeOf(first);
+              const removeDescriptor = Object.getOwnPropertyDescriptor(
+                elementPrototype, 'remove');
+              const unscopablesDescriptor = Object.getOwnPropertyDescriptor(
+                elementPrototype, Symbol.unscopables);
+              const unscopables = elementPrototype[Symbol.unscopables];
+              const removeUnscopableDescriptor = unscopables &&
+                Object.getOwnPropertyDescriptor(unscopables, 'remove');
+
+              let wrongBrandSurplusTouched = false;
+              let wrongBrand = false;
+              try {
+                removeDescriptor.value.call({}, {
+                  toString() {
+                    wrongBrandSurplusTouched = true;
+                    return 'surplus';
+                  }
+                });
+              } catch (error) { wrongBrand = error instanceof TypeError; }
+
+              const descriptorShape = removeDescriptor &&
+                removeDescriptor.value.name === 'remove' &&
+                removeDescriptor.value.length === 0 &&
+                removeDescriptor.writable && removeDescriptor.enumerable &&
+                removeDescriptor.configurable;
+              const unscopablesShape = unscopablesDescriptor &&
+                unscopablesDescriptor.value === unscopables &&
+                !unscopablesDescriptor.writable &&
+                !unscopablesDescriptor.enumerable &&
+                unscopablesDescriptor.configurable &&
+                unscopables && Object.getPrototypeOf(unscopables) === null &&
+                removeUnscopableDescriptor &&
+                removeUnscopableDescriptor.value === true &&
+                removeUnscopableDescriptor.writable &&
+                removeUnscopableDescriptor.enumerable &&
+                removeUnscopableDescriptor.configurable;
+
+              first.remove();
+              const liveAfterRemove = collection.length === 1 &&
+                collection[0] === second && collection.item(0) === second &&
+                collection[1] === undefined && collection.item(1) === null &&
+                target.childElementCount === 1 &&
+                target.firstElementChild === second &&
+                target.lastElementChild === second &&
+                !first.isConnected && second.isConnected;
+              const freshSelectorMiss = target.querySelector('span') === null &&
+                target.querySelector('#first-child') === null &&
+                target.querySelector('#last-child') === second &&
+                target.querySelectorAll('span').length === 0;
+              const staticSnapshotRetained = snapshot.length === 2 &&
+                snapshot[0] === first && snapshot[1] === second &&
+                !snapshot[0].isConnected && snapshot[1].isConnected;
+
+              // ChildNode.remove() is idempotent for a detached child.
+              first.remove();
+              const secondRemoveWasNoOp = collection.length === 1 &&
+                collection[0] === second && second.isConnected &&
+                target.childElementCount === 1;
+
+              globalThis.elementRemoveDetachedChild = first;
+              globalThis.elementRemoveBindingProof =
+                descriptorShape && unscopablesShape && wrongBrand &&
+                !wrongBrandSurplusTouched && liveAfterRemove &&
+                freshSelectorMiss && staticSnapshotRetained &&
+                secondRemoveWasNoOp;
+            })();
+            "#,
+            "element-remove-binding.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: The token remains live for this synchronous host entry.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "elementRemoveBindingProof")
+                .unwrap()
+        );
+
+        removed_child_state.remove_fails.set(true);
+        let failure_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               let hostFailure = false;\n\
+               try { elementRemoveDetachedChild.remove(); }\n\
+               catch (error) { hostFailure = error instanceof TypeError; }\n\
+               globalThis.elementRemoveHostFailureProof = hostFailure;\n\
+             })();",
+            "element-remove-host-failure.js",
+            1,
+        ));
+        // SAFETY: The token remains live for this synchronous host entry.
+        let failure_outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                failure_script,
+                (&mut host_context as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(failure_outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "elementRemoveHostFailureProof")
+                .unwrap()
+        );
+        runtime.destroy_realm(realm).unwrap();
+    }
+
+    #[test]
     fn get_elements_by_class_name_exposes_fresh_live_html_collections() {
         let mut runtime = Runtime::new(Options {
             expose_gc: 1,
@@ -6573,6 +6792,7 @@ mod tests {
         let closest = element_host_closest::<ElementHostProbe>;
         let matches = element_host_matches::<ElementHostProbe>;
         let webkit_matches = element_host_webkit_matches_selector::<ElementHostProbe>;
+        let remove = element_host_remove::<ElementHostProbe>;
         let query_all = element_host_query_selector_all::<ElementHostProbe>;
         let get_by_class = element_host_get_elements_by_class_name::<ElementHostProbe>;
         let collection_drops = Rc::clone(&document.id_element_state.html_collection_drops);
@@ -6593,6 +6813,10 @@ mod tests {
         // SAFETY: Each invalid pointer combination is intentional and every
         // valid byte range and output remains live for the call.
         unsafe {
+            assert_eq!(remove(std::ptr::null_mut(), host_context), 0);
+            assert_eq!(remove(native, std::ptr::null_mut()), 0);
+            assert_eq!(remove(native, host_context), 1);
+
             assert_eq!(
                 closest(
                     native,

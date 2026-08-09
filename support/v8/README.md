@@ -78,7 +78,7 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.querySelector`, `Document.querySelectorAll`, and
 `Document.getElementsByClassName`, plus
 `Element.children`, `Element.querySelectorAll`,
-`Element.getElementsByClassName`, `Element.closest`,
+`Element.getElementsByClassName`, `Element.remove`, `Element.closest`,
 `Element.matches`, and `Element.webkitMatchesSelector`, declarations in
 Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
@@ -177,6 +177,14 @@ the document's standards/quirks class-matching mode. These results share the
 existing `HTMLCollection` facade and Element wrapper cache, but not the
 `children` `[SameObject]` key: a unique per-call native-host key prevents one
 class filter from aliasing another or either from aliasing `children`.
+
+ABI v30 adds `Element.remove`. The zero-argument, brand-checked method is
+installed on `Element.prototype` and marks itself unscopable. Its host call
+uses Servo's production ChildNode removal algorithm with the ephemeral
+SpiderMonkey context, leaves custom-element reactions on Servo's outer or
+backup queue, and clears any unexpected pending SpiderMonkey exception before
+returning failure to V8. Retained `children` collections update live, while
+pre-existing `querySelectorAll` NodeLists remain static rooted snapshots.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -431,6 +439,7 @@ The proof suite uses that same counting argument:
 | `authoritative_query_selector_all_proof.html` | static rooted NodeLists survive real tree mutation and expose indexed/iterable WebIDL behavior |
 | `authoritative_children_collection_proof.html` | live SameObject HTMLCollections track tree/name mutation with indexed and named legacy properties |
 | `authoritative_get_elements_by_class_name_proof.html` | Document/Element class queries produce independently rooted live HTMLCollections with correct scope, conversion, identity, and mutation behavior |
+| `authoritative_element_remove_proof.html` | Element.remove uses Servo's ChildNode algorithm, updates live children while preserving static NodeList identity, and is unscopable |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the

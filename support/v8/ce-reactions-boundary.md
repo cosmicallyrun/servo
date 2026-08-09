@@ -1,18 +1,19 @@
 # V8-originated custom-element reactions
 
 Status: implemented for the current `Document.bgColor`, `Element.id`,
-`Element.className`, and `Node.textContent` mutation surface.
+`Element.className`, `Node.textContent`, and `Element.remove()` mutation
+surface.
 
 ## The mixed-engine hazard
 
-`Document.bgColor`, `Element.id`, `Element.className`, and `Node.textContent`
-are `[CEReactions]`. Servo's ordinary SpiderMonkey binding pushes an element
-queue, performs the mutation, then pops the queue and invokes the callbacks
-before returning to JavaScript. Doing the same inside a V8 host setter runs
-SpiderMonkey `attributeChangedCallback` code while V8, the C ABI callback, and
-a mutable borrow of the sidecar are all still on the native stack. A callback
-that reaches a V8-authoritative API then recursively enters the same isolate
-and `RefCell`.
+`Document.bgColor`, `Element.id`, `Element.className`, `Node.textContent`, and
+`Element.remove()` are `[CEReactions]`. Servo's ordinary SpiderMonkey binding
+pushes an element queue, performs the mutation, then pops the queue and invokes
+the callbacks before returning to JavaScript. Doing the same inside a V8 host
+call runs SpiderMonkey `attributeChangedCallback` code while V8, the C ABI
+callback, and a mutable borrow of the sidecar are all still on the native
+stack. A callback that reaches a V8-authoritative API then recursively enters
+the same isolate and `RefCell`.
 
 That is page-reachable control flow, so crashing, panicking, or treating it as
 an embedding invariant violation is not acceptable.
@@ -27,7 +28,8 @@ queue when there is none. The backup path schedules a
 
 The resulting sequence is:
 
-1. V8 enters a `Document.bgColor`, Element attribute, or `Node.textContent` setter.
+1. V8 enters a `Document.bgColor`, Element attribute, or `Node.textContent`
+   setter, or calls `Element.remove()`.
 2. Rust mutates the real Servo attribute and enqueues its reaction.
 3. Rust and C++ return; the V8 script or V8 microtask finishes.
 4. The authoritative-entry guard and sidecar borrow are released.
@@ -60,7 +62,7 @@ Servo-owned FIFO capable of representing V8 jobs and custom-element reactions.
 
 `authoritative_cereactions_proof.html` defines a customized body for `bgcolor`,
 an autonomous custom element for `id` and `class`, and a custom child removed
-by `textContent`. Every attribute or disconnection callback reads
+with `Element.remove()`. Every attribute or disconnection callback reads
 V8-authoritative `document.hidden`. The proof requires both authoritative
 features. It succeeds only when the page renders lime, the body callback fires
 twice, both Element attribute callbacks and the child disconnection fire, the

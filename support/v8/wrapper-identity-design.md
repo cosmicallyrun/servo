@@ -7,9 +7,12 @@ ABI version 27 adds static querySelectorAll NodeLists whose items converge on
 the same Element cache while each collection wrapper remains `[NewObject]`.
 ABI version 28 adds `[SameObject]` live `children` HTMLCollections. ABI version
 29 adds fresh live `getElementsByClassName` HTMLCollections whose per-call keys
-keep different filters separate.
+keep different filters separate. ABI version 30 adds `Element.remove`, whose
+retained Element wrapper can leave the tree while remaining the same rooted
+object in pre-existing static NodeLists.
 `Document.documentElement`, `Document.head`, `Document.getElementById()`, the
-Element/Node scalar slices, and ParentNode traversal are built on it.
+Element/Node scalar slices, Element removal, and ParentNode traversal are built
+on it.
 
 This is the subsystem every interface-typed binding waits on.
 `Document.documentElement`, `Document.head`, `Document.getElementById`, the
@@ -270,7 +273,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_parent_node_proof.html`, and
 `authoritative_query_selector_all_proof.html`, and
 `authoritative_children_collection_proof.html`, and
-`authoritative_get_elements_by_class_name_proof.html` cover runtime behaviour
+`authoritative_get_elements_by_class_name_proof.html`, and
+`authoritative_element_remove_proof.html` cover runtime behaviour
 against real Servo DOM, and `interface_returns_preserve_wrapper_identity`
 covers the bridge:
 

@@ -297,6 +297,21 @@ class ProductionElementTests(unittest.TestCase):
         self.assertEqual(query_all_return.name, "NodeList")
         self.assertEqual(query_all_arguments[0].identifier.name, "selectors")
 
+    def test_pins_real_childnode_remove_included_on_element(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_element_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        remove = members[production_webidl.ELEMENT_REMOVE]
+        self.assertEqual(remove._name.QName(), "::ChildNode::remove")
+        self.assertEqual(set(remove._extendedAttrDict), {"CEReactions", "Unscopable"})
+        return_type, arguments = remove.signatures()[0]
+        self.assertEqual(return_type.prettyName(), "undefined")
+        self.assertFalse(return_type.nullable())
+        self.assertEqual(arguments, [])
+
 
 class ProductionHTMLCollectionTests(unittest.TestCase):
     def test_pins_the_complete_real_interface(self) -> None:
@@ -1499,6 +1514,66 @@ class SyntheticSelectionTests(unittest.TestCase):
             "childElementCount",
             "`Element.childElementCount` must use non-nullable `unsigned long`, "
             "got `unsigned short`",
+        )
+
+    def test_selects_exact_childnode_remove_operation(self) -> None:
+        parser_results = self.parse(
+            {
+                "ChildNode.webidl": """
+                    interface mixin ChildNode {
+                      [CEReactions, Unscopable] undefined remove();
+                    };
+                    interface Element {};
+                    Element includes ChildNode;
+                """,
+            }
+        )
+        member = production_webidl._select_element_host_member(
+            parser_results,
+            production_webidl.ELEMENT_REMOVE,
+        )
+        self.assertEqual(member._name.QName(), "::ChildNode::remove")
+
+    def assert_remove_rejected(self, declaration: str, expected: str) -> None:
+        self.assert_element_rejected(declaration, "remove", expected)
+
+    def test_rejects_childnode_remove_missing_or_extra_extended_attributes(self) -> None:
+        self.assert_remove_rejected(
+            "[CEReactions] undefined remove();",
+            "`Element.remove` must carry exactly ['CEReactions', 'Unscopable'], "
+            "got ['CEReactions']",
+        )
+        self.assert_remove_rejected(
+            "[CEReactions, Throws, Unscopable] undefined remove();",
+            "`Element.remove` must carry exactly ['CEReactions', 'Unscopable'], "
+            "got ['CEReactions', 'Throws', 'Unscopable']",
+        )
+
+    def test_rejects_childnode_remove_arguments_and_wrong_return(self) -> None:
+        self.assert_remove_rejected(
+            "[CEReactions, Unscopable] undefined remove(long index);",
+            "`Element.remove` must take no arguments, found 1",
+        )
+        self.assert_remove_rejected(
+            "[CEReactions, Unscopable] boolean remove();",
+            "`Element.remove` must return non-nullable `undefined`, got `boolean`",
+        )
+
+    def test_rejects_childnode_remove_overload_static_and_special_shapes(self) -> None:
+        self.assert_remove_rejected(
+            """
+              [CEReactions, Unscopable] undefined remove();
+              [CEReactions, Unscopable] undefined remove(long index);
+            """,
+            "`Element.remove` must have exactly one signature, found 2",
+        )
+        self.assert_remove_rejected(
+            "[CEReactions] static undefined remove();",
+            "`Element.remove` must be an ordinary instance operation",
+        )
+        self.assert_remove_rejected(
+            "stringifier DOMString remove();",
+            "`Element.remove` must be an ordinary instance operation",
         )
 
     def assert_node_rejected(

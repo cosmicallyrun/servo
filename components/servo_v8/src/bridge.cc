@@ -2427,6 +2427,26 @@ void ElementHostGetChildElementCount(
   info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, result));
 }
 
+void ElementHostRemove(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!realm->document_host.active_host_context ||
+      !realm->runtime->element_host_vtable.remove) {
+    ThrowTypeError(isolate, "Element.remove requires a live host context");
+    return;
+  }
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.remove(
+            native, realm->document_host.active_host_context)) {
+      ThrowTypeError(isolate, "Element.remove host callback failed");
+      return;
+    }
+  }
+}
+
 void NodeHostGetNodeType(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   ServoV8RealmState* realm = nullptr;
@@ -2799,6 +2819,40 @@ bool InstallNodePrototype(ServoV8RealmState* realm,
       .FromMaybe(false);
 }
 
+bool AddUnscopable(v8::Isolate* isolate,
+                   v8::Local<v8::Context> context,
+                   v8::Local<v8::Object> prototype,
+                   const char* name) {
+  const v8::Local<v8::Symbol> symbol = v8::Symbol::GetUnscopables(isolate);
+  const v8::Maybe<bool> has_unscopables =
+      prototype->HasOwnProperty(context, symbol);
+  if (has_unscopables.IsNothing()) return false;
+
+  v8::Local<v8::Object> unscopables;
+  if (has_unscopables.FromJust()) {
+    v8::Local<v8::Value> value;
+    if (!prototype->Get(context, symbol).ToLocal(&value) || !value->IsObject()) {
+      return false;
+    }
+    unscopables = value.As<v8::Object>();
+  } else {
+    unscopables = v8::Object::New(isolate);
+    if (!unscopables->SetPrototype(context, v8::Null(isolate)).FromMaybe(false) ||
+        !prototype
+             ->DefineOwnProperty(
+                 context, symbol, unscopables,
+                 static_cast<v8::PropertyAttribute>(v8::ReadOnly |
+                                                    v8::DontEnum))
+             .FromMaybe(false)) {
+      return false;
+    }
+  }
+  return unscopables
+      ->DefineOwnProperty(context, V8String(isolate, name), v8::True(isolate),
+                          v8::None)
+      .FromMaybe(false);
+}
+
 bool InstallElementPrototype(ServoV8RealmState* realm,
                              v8::Local<v8::Context> context,
                              v8::Local<v8::Object> prototype) {
@@ -2857,6 +2911,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
        v8::SideEffectType::kHasSideEffect},
       {"getElementsByClassName", &ElementHostGetElementsByClassName, 1,
        v8::SideEffectType::kHasSideEffect},
+      {"remove", &ElementHostRemove, 0,
+       v8::SideEffectType::kHasSideEffect},
       {"querySelector", &ElementHostQuerySelector, 1,
        v8::SideEffectType::kHasNoSideEffect},
       {"querySelectorAll", &ElementHostQuerySelectorAll, 1,
@@ -2883,7 +2939,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       return false;
     }
   }
-  return true;
+
+  return AddUnscopable(isolate, context, prototype, "remove");
 }
 
 ServoV8RealmState* CallbackRealm(
@@ -4204,7 +4261,8 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->set_text_content || !vtable->has_child_nodes ||
       !vtable->get_children || !vtable->get_elements_by_class_name ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
-      !vtable->get_child_element_count || !vtable->query_selector ||
+      !vtable->get_child_element_count || !vtable->remove ||
+      !vtable->query_selector ||
       !vtable->closest || !vtable->matches ||
       !vtable->webkit_matches_selector || !vtable->query_selector_all ||
       !vtable->drop) {

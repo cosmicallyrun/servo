@@ -4,8 +4,8 @@ Runtime proof that V8-originated CEReactions run only after V8 unwinds.
 
 A customized built-in <body> observes bgcolor, an autonomous custom element
 observes id and class, and its custom child observes disconnection caused by
-`textContent`. The V8-authoritative script mutates all four through the host
-bridge. Servo leaves the resulting reactions on its rooted backup queue and
+`Element.remove()`. The V8-authoritative script mutates all four through the
+host bridge. Servo leaves the resulting reactions on its rooted backup queue and
 invokes the callbacks at the existing microtask checkpoint, after the V8
 setters, authoritative-entry guard, and sidecar borrow have unwound. Each
 SpiderMonkey callback then reads authoritative document.hidden and must
@@ -76,7 +76,7 @@ and no "answered from the host's own native source" warning.
       var target = document.getElementById("target");
       target.id = "changed-id";
       target.className = "after";
-      target.textContent = null;
+      target.remove();
     </script>
     <script>
       document.title =

@@ -83,6 +83,7 @@ ELEMENT_MATCHES = "Element.matches"
 ELEMENT_WEBKIT_MATCHES_SELECTOR = "Element.webkitMatchesSelector"
 ELEMENT_GET_ELEMENTS_BY_CLASS_NAME = "Element.getElementsByClassName"
 ELEMENT_QUERY_SELECTOR_ALL = "Element.querySelectorAll"
+ELEMENT_REMOVE = "Element.remove"
 HTML_COLLECTION_INTERFACE = "HTMLCollection"
 HTML_COLLECTION_LENGTH = "HTMLCollection.length"
 HTML_COLLECTION_ITEM = "HTMLCollection.item"
@@ -294,6 +295,7 @@ ELEMENT_HOST = (
     ELEMENT_WEBKIT_MATCHES_SELECTOR,
     ELEMENT_GET_ELEMENTS_BY_CLASS_NAME,
     ELEMENT_QUERY_SELECTOR_ALL,
+    ELEMENT_REMOVE,
 )
 
 # Inherited scalar behavior installed on the Node prototype shared by Element
@@ -1356,6 +1358,30 @@ def _select_element_host_member(
         return select_newobject_throws_domstring_to_interface_operation(
             parser_results, qualified_name, "NodeList"
         )
+    if member_name == "remove":
+        expected_attributes = {"CEReactions", "Unscopable"}
+        actual_attributes = set(member._extendedAttrDict)
+        if actual_attributes != expected_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+                f"got {sorted(actual_attributes)}"
+            )
+        signatures = member.signatures()
+        if len(signatures) != 1:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+            )
+        return_type, arguments = signatures[0]
+        if return_type.nullable() or return_type.tag() != WebIDL.IDLType.Tags.undefined:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must return non-nullable `undefined`, "
+                f"got `{return_type.prettyName()}`"
+            )
+        if arguments:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take no arguments, found {len(arguments)}"
+            )
+        return member
     expected_attributes = (
         {"Pure"} if member_name in {"hasAttributes", "getAttribute"} else set()
     )
