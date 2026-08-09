@@ -537,6 +537,14 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         self.element.root().upcast::<Node>().NodeName().into()
     }
 
+    fn namespace_uri(&self) -> Option<String> {
+        self.element.root().GetNamespaceURI().map(Into::into)
+    }
+
+    fn prefix(&self) -> Option<String> {
+        self.element.root().GetPrefix().map(Into::into)
+    }
+
     fn is_connected(&self) -> bool {
         self.element.root().upcast::<Node>().IsConnected()
     }

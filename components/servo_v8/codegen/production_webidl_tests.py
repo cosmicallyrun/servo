@@ -243,6 +243,16 @@ class ProductionElementTests(unittest.TestCase):
         self.assertTrue(members[production_webidl.ELEMENT_TAG_NAME].readonly)
         self.assertFalse(members[production_webidl.ELEMENT_ID].readonly)
         self.assertFalse(members[production_webidl.ELEMENT_CLASS_NAME].readonly)
+        for qualified_name in (
+            production_webidl.ELEMENT_NAMESPACE_URI,
+            production_webidl.ELEMENT_PREFIX,
+        ):
+            with self.subTest(member=qualified_name):
+                attribute = members[qualified_name]
+                self.assertTrue(attribute.readonly)
+                self.assertTrue(attribute.type.nullable())
+                self.assertTrue(attribute.type.inner.isDOMString())
+                self.assertEqual(set(attribute._extendedAttrDict), {"Constant"})
         children = members[production_webidl.ELEMENT_CHILDREN]
         self.assertTrue(children.readonly)
         self.assertFalse(children.type.nullable())
@@ -1489,6 +1499,85 @@ class SyntheticSelectionTests(unittest.TestCase):
                 parser_results,
                 production_webidl.ELEMENT_CHILDREN,
             )
+
+    def test_selects_exact_element_namespace_string_attributes(self) -> None:
+        parser_results = self.parse(
+            {
+                "Element.webidl": """
+                    interface Element {
+                      [Constant] readonly attribute DOMString? namespaceURI;
+                      [Constant] readonly attribute DOMString? prefix;
+                    };
+                """,
+            }
+        )
+        for qualified_name in (
+            production_webidl.ELEMENT_NAMESPACE_URI,
+            production_webidl.ELEMENT_PREFIX,
+        ):
+            with self.subTest(member=qualified_name):
+                member = production_webidl._select_element_host_member(
+                    parser_results, qualified_name
+                )
+                self.assertTrue(member.readonly)
+                self.assertEqual(set(member._extendedAttrDict), {"Constant"})
+                self.assertTrue(member.type.nullable())
+                self.assertTrue(member.type.inner.isDOMString())
+
+    def test_rejects_element_namespace_string_attribute_drift(self) -> None:
+        for member in ("namespaceURI", "prefix"):
+            with self.subTest(member=member):
+                self.assert_element_rejected(
+                    f"readonly attribute DOMString? {member};",
+                    member,
+                    f"`Element.{member}` must carry exactly ['Constant'], got []",
+                )
+                self.assert_element_rejected(
+                    f"[Constant, Throws] readonly attribute DOMString? {member};",
+                    member,
+                    f"`Element.{member}` must carry exactly ['Constant'], "
+                    "got ['Constant', 'Throws']",
+                )
+                self.assert_element_rejected(
+                    f"[Constant] readonly attribute DOMString {member};",
+                    member,
+                    f"`Element.{member}` must use nullable `DOMString`, got `DOMString`",
+                )
+                self.assert_element_rejected(
+                    f"[Constant] readonly attribute USVString? {member};",
+                    member,
+                    f"`Element.{member}` must use nullable `DOMString`, got `USVString?`",
+                )
+                self.assert_element_rejected(
+                    f"[Constant] static readonly attribute DOMString? {member};",
+                    member,
+                    f"`Element.{member}` must be an instance attribute",
+                )
+
+    def test_rejects_element_namespace_string_attribute_writable_drift(self) -> None:
+        for member_name in ("namespaceURI", "prefix"):
+            with self.subTest(member=member_name):
+                parser_results = self.parse(
+                    {
+                        "Element.webidl": (
+                            "interface Element { [Constant] readonly attribute "
+                            f"DOMString? {member_name}; }};"
+                        )
+                    }
+                )
+                element = next(
+                    result
+                    for result in parser_results
+                    if result.isInterface() and result.identifier.name == "Element"
+                )
+                element.members[0].readonly = False
+                with self.assertRaisesRegex(
+                    production_webidl.WebIDLSelectionError,
+                    re.escape(f"`Element.{member_name}` must be readonly"),
+                ):
+                    production_webidl._select_element_host_member(
+                        parser_results, f"Element.{member_name}"
+                    )
 
     def test_rejects_nonnullable_get_attribute_return(self) -> None:
         self.assert_element_rejected(

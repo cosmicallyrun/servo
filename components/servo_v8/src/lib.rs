@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 31;
+const ABI_VERSION: u32 = 32;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -340,6 +340,8 @@ pub struct NodeListHostVTable {
 pub unsafe trait ElementHostBinding: Sized + 'static {
     fn local_name(&self) -> String;
     fn tag_name(&self) -> String;
+    fn namespace_uri(&self) -> Option<String>;
+    fn prefix(&self) -> Option<String>;
     fn id(&self) -> String;
     unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool;
     fn class_name(&self) -> String;
@@ -394,6 +396,8 @@ pub struct OptionalOwnedUtf8 {
 pub struct ElementHostVTable {
     pub get_local_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
     pub get_tag_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub get_namespace_uri: Option<unsafe extern "C" fn(*mut c_void, *mut OptionalOwnedUtf8) -> u8>,
+    pub get_prefix: Option<unsafe extern "C" fn(*mut c_void, *mut OptionalOwnedUtf8) -> u8>,
     pub get_id: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
     pub set_id: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
     pub get_class_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
@@ -759,6 +763,26 @@ unsafe fn element_host_write_optional_owned_utf8(
     };
     1
 }
+
+macro_rules! element_host_optional_string_getter {
+    ($function:ident, $method:ident) => {
+        unsafe extern "C" fn $function<T: ElementHostBinding>(
+            native: *mut c_void,
+            output: *mut OptionalOwnedUtf8,
+        ) -> u8 {
+            if native.is_null() || output.is_null() {
+                return 0;
+            }
+            // SAFETY: The vtable contract supplies this exact live Box<T>.
+            let value = unsafe { (&*native.cast::<T>()).$method() };
+            // SAFETY: output is caller-owned writable storage.
+            unsafe { element_host_write_optional_owned_utf8(output, value) }
+        }
+    };
+}
+
+element_host_optional_string_getter!(element_host_get_namespace_uri, namespace_uri);
+element_host_optional_string_getter!(element_host_get_prefix, prefix);
 
 unsafe fn element_host_write_interface_value(
     output: *mut RawInterfaceValue,
@@ -1398,6 +1422,8 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
     ElementHostVTable {
         get_local_name: Some(element_host_get_local_name::<T>),
         get_tag_name: Some(element_host_get_tag_name::<T>),
+        get_namespace_uri: Some(element_host_get_namespace_uri::<T>),
+        get_prefix: Some(element_host_get_prefix::<T>),
         get_id: Some(element_host_get_id::<T>),
         set_id: Some(element_host_set_id::<T>),
         get_class_name: Some(element_host_get_class_name::<T>),
@@ -2505,6 +2531,7 @@ mod tests {
     use super::*;
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
+    static OPTIONAL_STRING_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
         static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
@@ -2631,6 +2658,8 @@ mod tests {
     #[derive(Default)]
     struct ElementProbeState {
         attributes: RefCell<Vec<(String, String)>>,
+        namespace_uri: RefCell<Option<String>>,
+        prefix: RefCell<Option<String>>,
         text_content: RefCell<Option<String>>,
         has_child_nodes: Cell<bool>,
         is_connected: Cell<bool>,
@@ -2656,6 +2685,8 @@ mod tests {
                         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                         .collect(),
                 ),
+                namespace_uri: RefCell::new(Some("http://www.w3.org/1999/xhtml".to_owned())),
+                prefix: RefCell::new(None),
                 text_content: RefCell::new(Some(text_content.to_owned())),
                 has_child_nodes: Cell::new(has_child_nodes),
                 is_connected: Cell::new(true),
@@ -2908,6 +2939,14 @@ mod tests {
 
         fn tag_name(&self) -> String {
             self.tag_name.clone()
+        }
+
+        fn namespace_uri(&self) -> Option<String> {
+            self.state.namespace_uri.borrow().clone()
+        }
+
+        fn prefix(&self) -> Option<String> {
+            self.state.prefix.borrow().clone()
         }
 
         fn id(&self) -> String {
@@ -3970,6 +4009,82 @@ mod tests {
         // SAFETY: output is non-null and writable for this callback.
         unsafe { *output = outcome };
         1
+    }
+
+    unsafe extern "C" fn adversarial_optional_string_owner_drop(owner: *mut c_void) {
+        if owner.is_null() {
+            return;
+        }
+        // SAFETY: The adversarial getter transfers exactly one Box<Vec<u8>>
+        // for each non-null owner and the C++ scope returns it exactly once.
+        drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
+        OPTIONAL_STRING_OWNER_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn adversarial_optional_string_owned(value: &str) -> OwnedUtf8 {
+        let owner = Box::new(value.as_bytes().to_vec());
+        OwnedUtf8 {
+            data: owner.as_ptr(),
+            length: owner.len(),
+            owner: Box::into_raw(owner).cast(),
+            drop_owner: Some(adversarial_optional_string_owner_drop),
+        }
+    }
+
+    unsafe extern "C" fn adversarial_element_namespace_uri(
+        native: *mut c_void,
+        output: *mut OptionalOwnedUtf8,
+    ) -> u8 {
+        if native.is_null() || output.is_null() {
+            return 0;
+        }
+        // SAFETY: The custom vtable is installed for exactly this host type.
+        let mode = unsafe { &*native.cast::<ElementHostProbe>() }.id();
+        let mut result = OptionalOwnedUtf8 {
+            is_null: 0,
+            value: OwnedUtf8 {
+                data: std::ptr::null(),
+                length: 0,
+                owner: std::ptr::null_mut(),
+                drop_owner: None,
+            },
+        };
+        let succeeded = match mode.as_str() {
+            "callback-failure" => {
+                result.value = adversarial_optional_string_owned("failure payload");
+                false
+            },
+            "invalid-null-flag" => {
+                result.is_null = 2;
+                true
+            },
+            "null-with-owned" => {
+                result.is_null = 1;
+                result.value = adversarial_optional_string_owned("null payload");
+                true
+            },
+            "length-without-data" => {
+                result.value.length = 1;
+                true
+            },
+            "empty-without-data" => true,
+            "oversized-owned" => {
+                result.value = adversarial_optional_string_owned("oversized");
+                result.value.length = usize::MAX;
+                true
+            },
+            "valid-empty" => {
+                result.value = adversarial_optional_string_owned("");
+                true
+            },
+            _ => {
+                result.value = adversarial_optional_string_owned("urn:servo-v8:valid");
+                true
+            },
+        };
+        // SAFETY: output is non-null caller-owned writable storage.
+        unsafe { *output = result };
+        succeeded as u8
     }
 
     impl Drop for NativeSmoke {
@@ -6884,6 +6999,7 @@ mod tests {
             Rc::new(Cell::new(0)),
         );
         document.element_drops = Rc::clone(&element_drops);
+        *document.id_element_state.prefix.borrow_mut() = Some("probe".to_owned());
         let mut host_context_token = 0_u8;
         let host_context = (&mut host_context_token as *mut u8).cast::<c_void>();
         // SAFETY: document and the stand-in Element identity remain live for
@@ -6894,6 +7010,8 @@ mod tests {
         let matches = element_host_matches::<ElementHostProbe>;
         let webkit_matches = element_host_webkit_matches_selector::<ElementHostProbe>;
         let remove = element_host_remove::<ElementHostProbe>;
+        let namespace_uri = element_host_get_namespace_uri::<ElementHostProbe>;
+        let prefix = element_host_get_prefix::<ElementHostProbe>;
         let previous = element_host_get_previous_element_sibling::<ElementHostProbe>;
         let next = element_host_get_next_element_sibling::<ElementHostProbe>;
         let query_all = element_host_query_selector_all::<ElementHostProbe>;
@@ -6917,6 +7035,15 @@ mod tests {
             key: std::ptr::null(),
             native: std::ptr::null_mut(),
         };
+        let mut optional_string_output = OptionalOwnedUtf8 {
+            is_null: 1,
+            value: OwnedUtf8 {
+                data: std::ptr::null(),
+                length: 0,
+                owner: std::ptr::null_mut(),
+                drop_owner: None,
+            },
+        };
 
         // SAFETY: Each invalid pointer combination is intentional and every
         // valid byte range and output remains live for the call.
@@ -6937,6 +7064,47 @@ mod tests {
             assert_eq!(sibling_output.is_null, 1);
             assert!(sibling_output.key.is_null());
             assert!(sibling_output.native.is_null());
+            assert_eq!(
+                namespace_uri(std::ptr::null_mut(), &mut optional_string_output),
+                0
+            );
+            assert_eq!(namespace_uri(native, std::ptr::null_mut()), 0);
+            assert_eq!(namespace_uri(native, &mut optional_string_output), 1);
+            assert_eq!(optional_string_output.is_null, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    optional_string_output.value.data,
+                    optional_string_output.value.length,
+                ),
+                b"http://www.w3.org/1999/xhtml",
+            );
+            optional_string_output.value.drop_owner.unwrap()(optional_string_output.value.owner);
+
+            *document.id_element_state.namespace_uri.borrow_mut() = Some(String::new());
+            assert_eq!(namespace_uri(native, &mut optional_string_output), 1);
+            assert_eq!(optional_string_output.is_null, 0);
+            assert_eq!(optional_string_output.value.length, 0);
+            optional_string_output.value.drop_owner.unwrap()(optional_string_output.value.owner);
+
+            assert_eq!(prefix(std::ptr::null_mut(), &mut optional_string_output), 0);
+            assert_eq!(prefix(native, std::ptr::null_mut()), 0);
+            assert_eq!(prefix(native, &mut optional_string_output), 1);
+            assert_eq!(optional_string_output.is_null, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    optional_string_output.value.data,
+                    optional_string_output.value.length,
+                ),
+                b"probe",
+            );
+            optional_string_output.value.drop_owner.unwrap()(optional_string_output.value.owner);
+            *document.id_element_state.prefix.borrow_mut() = None;
+            assert_eq!(prefix(native, &mut optional_string_output), 1);
+            assert_eq!(optional_string_output.is_null, 1);
+            assert!(optional_string_output.value.data.is_null());
+            assert_eq!(optional_string_output.value.length, 0);
+            assert!(optional_string_output.value.owner.is_null());
+            assert!(optional_string_output.value.drop_owner.is_none());
 
             assert_eq!(
                 closest(
@@ -7187,6 +7355,136 @@ mod tests {
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(element_drops.get(), 1);
         assert_eq!(document_drops.get(), 1);
+    }
+
+    #[test]
+    fn optional_element_strings_reject_malformed_values_and_drop_owners() {
+        OPTIONAL_STRING_OWNER_DROPS.store(0, Ordering::SeqCst);
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let mut vtable = element_host_vtable::<ElementHostProbe>();
+        vtable.get_namespace_uri = Some(adversarial_element_namespace_uri);
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The complete vtable contains callbacks for the exact probe
+        // host type and C++ copies it synchronously.
+        let installed =
+            unsafe { servo_v8_install_element_host(runtime.raw.as_ptr(), &vtable, &mut error) };
+        assert_eq!(
+            installed,
+            1,
+            "custom Element vtable install failed: {:?}",
+            error_from(&storage, &error)
+        );
+
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let element_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               const target = document.getElementById('target');\n\
+               const prototype = Object.getPrototypeOf(target);\n\
+               const namespaceDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 prototype, 'namespaceURI');\n\
+               const prefixDescriptor = Object.getOwnPropertyDescriptor(\n\
+                 prototype, 'prefix');\n\
+               let namespaceWrongBrand = false;\n\
+               let prefixWrongBrand = false;\n\
+               try { namespaceDescriptor.get.call({}); }\n\
+               catch (error) { namespaceWrongBrand = error instanceof TypeError; }\n\
+               try { prefixDescriptor.get.call({}); }\n\
+               catch (error) { prefixWrongBrand = error instanceof TypeError; }\n\
+               const exactSurface = namespaceDescriptor && prefixDescriptor &&\n\
+                 namespaceDescriptor.get.name === 'get namespaceURI' &&\n\
+                 prefixDescriptor.get.name === 'get prefix' &&\n\
+                 [namespaceDescriptor, prefixDescriptor].every(descriptor =>\n\
+                   descriptor.get.length === 0 && descriptor.set === undefined &&\n\
+                   descriptor.enumerable && descriptor.configurable) &&\n\
+                 !Object.hasOwn(target, 'namespaceURI') &&\n\
+                 !Object.hasOwn(target, 'prefix') && namespaceWrongBrand &&\n\
+                 prefixWrongBrand;\n\
+               const malformedModes = [\n\
+                 'callback-failure', 'invalid-null-flag', 'null-with-owned',\n\
+                 'length-without-data', 'empty-without-data', 'oversized-owned'\n\
+               ];\n\
+               const rejectionByMode = {};\n\
+               const rejected = malformedModes.map(mode => {\n\
+                 target.id = mode;\n\
+                 try { target.namespaceURI; return rejectionByMode[mode] = false; }\n\
+                 catch (error) {\n\
+                   return rejectionByMode[mode] = error instanceof TypeError;\n\
+                 }\n\
+               }).every(Boolean);\n\
+               target.id = 'valid-empty';\n\
+               const emptyPreserved = target.namespaceURI === '';\n\
+               target.id = 'valid';\n\
+               const validValue = target.namespaceURI === 'urn:servo-v8:valid';\n\
+               const nullPrefix = target.prefix === null;\n\
+               globalThis.optionalElementStringDetails = {\n\
+                 exactSurface, rejected, emptyPreserved, validValue, nullPrefix,\n\
+                 rejectionByMode\n\
+               };\n\
+               globalThis.optionalElementStringProof = exactSurface && rejected &&\n\
+                 emptyPreserved && validValue && nullPrefix;\n\
+             })();",
+            "optional-element-string-adversarial.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: The opaque context token stays live for the synchronous run.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        for name in ["exactSurface", "emptyPreserved", "validValue", "nullPrefix"] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(realm, &format!("optionalElementStringDetails.{name}"),)
+                    .unwrap(),
+                "optional Element string behavior failed: {name}",
+            );
+        }
+        for mode in [
+            "callback-failure",
+            "invalid-null-flag",
+            "null-with-owned",
+            "length-without-data",
+            "empty-without-data",
+            "oversized-owned",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(
+                        realm,
+                        &format!("optionalElementStringDetails.rejectionByMode['{mode}']"),
+                    )
+                    .unwrap(),
+                "malformed optional Element string was accepted: {mode}",
+            );
+        }
+        assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 5);
+        assert_eq!(element_drops.get(), 0);
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(element_drops.get(), 1);
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 5);
     }
 
     #[test]

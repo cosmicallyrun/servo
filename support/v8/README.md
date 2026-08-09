@@ -80,7 +80,8 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Element.children`, `Element.querySelectorAll`,
 `Element.getElementsByClassName`, `Element.remove`,
 `Element.previousElementSibling`, `Element.nextElementSibling`, `Element.closest`,
-`Element.matches`, and `Element.webkitMatchesSelector`, declarations in
+`Element.matches`, `Element.webkitMatchesSelector`, `Element.namespaceURI`, and
+`Element.prefix`, declarations in
 Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
 shape, exact returned interface)` records, with the interface field absent for
@@ -193,6 +194,11 @@ Servo's production NonDocumentTypeChildNode traversal and return the existing
 per-realm Element wrapper for a non-null sibling. They skip text nodes and
 therefore immediately reflect a preceding `Element.remove` mutation without
 creating a second wrapper for a still-reachable sibling.
+
+ABI v32 adds `Element.namespaceURI` and `Element.prefix`. These read-only,
+brand-checked nullable-string accessors delegate to Servo's production Element
+getters, preserving the HTML and SVG namespace URI values and `null` for an
+unprefixed element. A non-null prefix is additionally pinned by Rust ABI tests.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -449,6 +455,7 @@ The proof suite uses that same counting argument:
 | `authoritative_get_elements_by_class_name_proof.html` | Document/Element class queries produce independently rooted live HTMLCollections with correct scope, conversion, identity, and mutation behavior |
 | `authoritative_element_remove_proof.html` | Element.remove uses Servo's ChildNode algorithm, updates live children while preserving static NodeList identity, and is unscopable |
 | `authoritative_element_sibling_proof.html` | Element-only sibling traversal skips text nodes, preserves wrapper identity, and updates after Element.remove |
+| `authoritative_element_namespace_proof.html` | HTML and inline SVG Element namespaceURI and null prefix accessors preserve descriptors, brands, and nullable-string values |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the

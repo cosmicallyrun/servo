@@ -2048,8 +2048,10 @@ void ElementHostGetAttribute(
       result.is_null != 0 &&
       (result.value.data || result.value.length != 0 || result.value.owner ||
        result.value.drop_owner);
-  if (result.is_null > 1 || malformed_null ||
-      (!result.value.data && result.value.length != 0) ||
+  const bool malformed_non_null =
+      result.is_null == 0 &&
+      (!result.value.data || !result.value.owner || !result.value.drop_owner);
+  if (result.is_null > 1 || malformed_null || malformed_non_null ||
       result.value.length >
           static_cast<size_t>(std::numeric_limits<int>::max())) {
     ThrowTypeError(isolate, "invalid Element.getAttribute result");
@@ -2518,30 +2520,44 @@ void NodeHostHasChildNodes(
                         "Node.hasChildNodes host callback failed");
 }
 
-void NodeHostGetTextContent(
-    const v8::FunctionCallbackInfo<v8::Value>& info) {
+using ElementOptionalStringGetter =
+    uint8_t (*)(void* native, ServoV8OptionalOwnedUtf8* output);
+using ElementOptionalStringGetterSlot =
+    ElementOptionalStringGetter ServoV8ElementHostVTable::*;
+
+void ElementHostGetOptionalString(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ElementOptionalStringGetterSlot getter_slot,
+    const char* member_name,
+    const char* invalid_result_message) {
   v8::Isolate* isolate = info.GetIsolate();
   ServoV8RealmState* realm = nullptr;
   void* native = nullptr;
   if (!ElementHostCallbackState(info, &realm, &native)) return;
+  const ElementOptionalStringGetter getter =
+      realm->runtime->element_host_vtable.*getter_slot;
   ServoV8OptionalOwnedUtf8 result{};
+  bool succeeded = false;
   {
     RustCallbackScope callback_scope(realm->runtime);
-    if (!realm->runtime->element_host_vtable.get_text_content(native, &result)) {
-      ThrowTypeError(isolate, "Node.textContent host callback failed");
-      return;
-    }
+    succeeded = getter && getter(native, &result);
   }
   DocumentHostOwnedUtf8Scope result_scope(realm->runtime, &result.value);
+  if (!succeeded) {
+    ThrowTypeError(isolate, member_name);
+    return;
+  }
   const bool malformed_null =
       result.is_null != 0 &&
       (result.value.data || result.value.length != 0 || result.value.owner ||
        result.value.drop_owner);
-  if (result.is_null > 1 || malformed_null ||
-      (!result.value.data && result.value.length != 0) ||
+  const bool malformed_non_null =
+      result.is_null == 0 &&
+      (!result.value.data || !result.value.owner || !result.value.drop_owner);
+  if (result.is_null > 1 || malformed_null || malformed_non_null ||
       result.value.length >
           static_cast<size_t>(std::numeric_limits<int>::max())) {
-    ThrowTypeError(isolate, "invalid Node.textContent result");
+    ThrowTypeError(isolate, invalid_result_message);
     return;
   }
   if (result.is_null) {
@@ -2556,6 +2572,27 @@ void NodeHostGetTextContent(
     return;
   }
   info.GetReturnValue().Set(value);
+}
+
+void ElementHostGetNamespaceURI(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetOptionalString(
+      info, &ServoV8ElementHostVTable::get_namespace_uri,
+      "Element.namespaceURI host callback failed",
+      "invalid Element.namespaceURI result");
+}
+
+void ElementHostGetPrefix(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetOptionalString(info, &ServoV8ElementHostVTable::get_prefix,
+                               "Element.prefix host callback failed",
+                               "invalid Element.prefix result");
+}
+
+void NodeHostGetTextContent(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetOptionalString(
+      info, &ServoV8ElementHostVTable::get_text_content,
+      "Node.textContent host callback failed", "invalid Node.textContent result");
 }
 
 void NodeHostSetTextContent(
@@ -2877,6 +2914,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
     v8::FunctionCallback setter;
   };
   const ElementAccessor accessors[] = {
+      {"namespaceURI", &ElementHostGetNamespaceURI, nullptr},
+      {"prefix", &ElementHostGetPrefix, nullptr},
       {"localName", &ElementHostGetLocalName, nullptr},
       {"tagName", &ElementHostGetTagName, nullptr},
       {"id", &ElementHostGetId, &ElementHostSetId},
@@ -4270,6 +4309,7 @@ extern "C" int32_t servo_v8_install_element_host(
   ClearError(error);
   if (!CheckRuntime(runtime, error)) return 0;
   if (!vtable || !vtable->get_local_name || !vtable->get_tag_name ||
+      !vtable->get_namespace_uri || !vtable->get_prefix ||
       !vtable->get_id || !vtable->set_id || !vtable->get_class_name ||
       !vtable->set_class_name || !vtable->has_attributes ||
       !vtable->get_attribute || !vtable->has_attribute ||

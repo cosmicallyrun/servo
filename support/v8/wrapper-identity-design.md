@@ -12,6 +12,8 @@ retained Element wrapper can leave the tree while remaining the same rooted
 object in pre-existing static NodeLists. ABI version 31 adds
 `Element.previousElementSibling` and `Element.nextElementSibling`, whose
 nullable results converge on the same wrapper cache and update after removal.
+ABI version 32 adds nullable string `Element.namespaceURI` and `Element.prefix`
+accessors; they introduce no cross-heap return value or wrapper-cache entry.
 `Document.documentElement`, `Document.head`, `Document.getElementById()`, the
 Element/Node scalar slices, Element removal, and ParentNode traversal are built
 on it.
@@ -277,7 +279,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_children_collection_proof.html`, and
 `authoritative_get_elements_by_class_name_proof.html`, and
 `authoritative_element_remove_proof.html`, and
-`authoritative_element_sibling_proof.html` cover runtime behaviour
+`authoritative_element_sibling_proof.html`, and
+`authoritative_element_namespace_proof.html` cover runtime behaviour
 against real Servo DOM, and `interface_returns_preserve_wrapper_identity`
 covers the bridge:
 

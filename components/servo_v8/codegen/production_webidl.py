@@ -74,6 +74,8 @@ ELEMENT_HAS_ATTRIBUTES = "Element.hasAttributes"
 ELEMENT_GET_ATTRIBUTE = "Element.getAttribute"
 ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
 ELEMENT_CHILDREN = "Element.children"
+ELEMENT_NAMESPACE_URI = "Element.namespaceURI"
+ELEMENT_PREFIX = "Element.prefix"
 ELEMENT_FIRST_ELEMENT_CHILD = "Element.firstElementChild"
 ELEMENT_LAST_ELEMENT_CHILD = "Element.lastElementChild"
 ELEMENT_CHILD_ELEMENT_COUNT = "Element.childElementCount"
@@ -288,6 +290,8 @@ ELEMENT_HOST = (
     ELEMENT_GET_ATTRIBUTE,
     ELEMENT_HAS_ATTRIBUTE,
     ELEMENT_CHILDREN,
+    ELEMENT_NAMESPACE_URI,
+    ELEMENT_PREFIX,
     ELEMENT_FIRST_ELEMENT_CHILD,
     ELEMENT_LAST_ELEMENT_CHILD,
     ELEMENT_CHILD_ELEMENT_COUNT,
@@ -1276,6 +1280,8 @@ def _select_element_host_member(
         "id": {"CEReactions", "Pure"},
         "className": {"CEReactions", "Pure"},
         "children": {"SameObject"},
+        "namespaceURI": {"Constant"},
+        "prefix": {"Constant"},
         "firstElementChild": {"Pure"},
         "lastElementChild": {"Pure"},
         "childElementCount": {"Pure"},
@@ -1298,6 +1304,8 @@ def _select_element_host_member(
             "localName",
             "tagName",
             "children",
+            "namespaceURI",
+            "prefix",
             "firstElementChild",
             "lastElementChild",
             "childElementCount",
@@ -1315,6 +1323,15 @@ def _select_element_host_member(
             ):
                 raise WebIDLSelectionError(
                     f"`{qualified_name}` must use non-nullable `HTMLCollection`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member_name in {"namespaceURI", "prefix"}:
+            if (
+                not member.type.nullable()
+                or not member.type.inner.isDOMString()
+            ):
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use nullable `DOMString`, "
                     f"got `{member.type.prettyName()}`"
                 )
         elif member_name in {
