@@ -614,6 +614,16 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         self.element.root().ChildElementCount()
     }
 
+    fn previous_element_sibling(&self) -> Option<servo_v8::InterfaceHandle> {
+        let sibling = self.element.root().GetPreviousElementSibling()?;
+        Some(v8_element_interface_handle(&sibling))
+    }
+
+    fn next_element_sibling(&self) -> Option<servo_v8::InterfaceHandle> {
+        let sibling = self.element.root().GetNextElementSibling()?;
+        Some(v8_element_interface_handle(&sibling))
+    }
+
     unsafe fn query_selector(
         &self,
         host_context: *mut c_void,

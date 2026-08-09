@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 30;
+const ABI_VERSION: u32 = 31;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -362,6 +362,8 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     fn first_element_child(&self) -> Option<InterfaceHandle>;
     fn last_element_child(&self) -> Option<InterfaceHandle>;
     fn child_element_count(&self) -> u32;
+    fn previous_element_sibling(&self) -> Option<InterfaceHandle>;
+    fn next_element_sibling(&self) -> Option<InterfaceHandle>;
     unsafe fn remove(&self, host_context: *mut c_void) -> bool;
     unsafe fn query_selector(
         &self,
@@ -425,6 +427,10 @@ pub struct ElementHostVTable {
     pub get_last_element_child:
         Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub get_child_element_count: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
+    pub get_previous_element_sibling:
+        Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
+    pub get_next_element_sibling:
+        Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub remove: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> u8>,
     pub query_selector: Option<
         unsafe extern "C" fn(
@@ -1086,6 +1092,32 @@ unsafe extern "C" fn element_host_get_child_element_count<T: ElementHostBinding>
     1
 }
 
+unsafe extern "C" fn element_host_get_previous_element_sibling<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let handle = unsafe { (&*native.cast::<T>()).previous_element_sibling() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, handle) }
+}
+
+unsafe extern "C" fn element_host_get_next_element_sibling<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let handle = unsafe { (&*native.cast::<T>()).next_element_sibling() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, handle) }
+}
+
 unsafe extern "C" fn element_host_remove<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -1384,6 +1416,8 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         get_first_element_child: Some(element_host_get_first_element_child::<T>),
         get_last_element_child: Some(element_host_get_last_element_child::<T>),
         get_child_element_count: Some(element_host_get_child_element_count::<T>),
+        get_previous_element_sibling: Some(element_host_get_previous_element_sibling::<T>),
+        get_next_element_sibling: Some(element_host_get_next_element_sibling::<T>),
         remove: Some(element_host_remove::<T>),
         query_selector: Some(element_host_query_selector::<T>),
         closest: Some(element_host_closest::<T>),
@@ -2998,6 +3032,14 @@ mod tests {
             self.state.element_children.borrow().len() as u32
         }
 
+        fn previous_element_sibling(&self) -> Option<InterfaceHandle> {
+            self.sibling_element(-1)
+        }
+
+        fn next_element_sibling(&self) -> Option<InterfaceHandle> {
+            self.sibling_element(1)
+        }
+
         unsafe fn remove(&self, host_context: *mut c_void) -> bool {
             assert!(!host_context.is_null());
             if self.state.remove_fails.get() {
@@ -3168,6 +3210,34 @@ mod tests {
                         _owned_identity: Some(child.identity),
                         parent_children: Some(Rc::clone(&self.state.element_children)),
                         parent_state: Some(Rc::clone(&self.state)),
+                        drops: Rc::clone(&self.drops),
+                        drop_reentry: self.drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        fn sibling_element(&self, offset: isize) -> Option<InterfaceHandle> {
+            let parent_children = self.parent_children.as_ref()?;
+            let children = parent_children.borrow();
+            let index = children
+                .iter()
+                .position(|child| Rc::as_ptr(&child.identity).cast::<c_void>() == self.identity)?;
+            let sibling = children.get(index.checked_add_signed(offset)?)?.clone();
+            drop(children);
+            // SAFETY: The returned host owns the sibling identity and shares
+            // its live parent vector for subsequent traversal and removal.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    Rc::as_ptr(&sibling.identity).cast::<c_void>(),
+                    ElementHostProbe {
+                        local_name: sibling.local_name,
+                        tag_name: sibling.tag_name,
+                        identity: Rc::as_ptr(&sibling.identity).cast::<c_void>(),
+                        state: sibling.state,
+                        _owned_identity: Some(sibling.identity),
+                        parent_children: Some(Rc::clone(parent_children)),
+                        parent_state: self.parent_state.clone(),
                         drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -5741,6 +5811,10 @@ mod tests {
               const elementPrototype = Object.getPrototypeOf(first);
               const removeDescriptor = Object.getOwnPropertyDescriptor(
                 elementPrototype, 'remove');
+              const previousDescriptor = Object.getOwnPropertyDescriptor(
+                elementPrototype, 'previousElementSibling');
+              const nextDescriptor = Object.getOwnPropertyDescriptor(
+                elementPrototype, 'nextElementSibling');
               const unscopablesDescriptor = Object.getOwnPropertyDescriptor(
                 elementPrototype, Symbol.unscopables);
               const unscopables = elementPrototype[Symbol.unscopables];
@@ -5757,12 +5831,35 @@ mod tests {
                   }
                 });
               } catch (error) { wrongBrand = error instanceof TypeError; }
+              let previousWrongBrand = false;
+              let nextWrongBrand = false;
+              try { previousDescriptor.get.call({}); }
+              catch (error) { previousWrongBrand = error instanceof TypeError; }
+              try { nextDescriptor.get.call({}); }
+              catch (error) { nextWrongBrand = error instanceof TypeError; }
 
               const descriptorShape = removeDescriptor &&
                 removeDescriptor.value.name === 'remove' &&
                 removeDescriptor.value.length === 0 &&
                 removeDescriptor.writable && removeDescriptor.enumerable &&
                 removeDescriptor.configurable;
+              const siblingDescriptorShape =
+                [previousDescriptor, nextDescriptor].every(descriptor =>
+                  descriptor && descriptor.get.length === 0 &&
+                  descriptor.set === undefined && descriptor.enumerable &&
+                  descriptor.configurable) &&
+                previousDescriptor.get.name ===
+                  'get previousElementSibling' &&
+                nextDescriptor.get.name === 'get nextElementSibling' &&
+                previousWrongBrand &&
+                nextWrongBrand &&
+                !Object.hasOwn(first, 'previousElementSibling') &&
+                !Object.hasOwn(first, 'nextElementSibling');
+              const initialSiblings =
+                first.previousElementSibling === null &&
+                first.nextElementSibling === second &&
+                second.previousElementSibling === first &&
+                second.nextElementSibling === null;
               const unscopablesShape = unscopablesDescriptor &&
                 unscopablesDescriptor.value === unscopables &&
                 !unscopablesDescriptor.writable &&
@@ -5782,6 +5879,10 @@ mod tests {
                 target.childElementCount === 1 &&
                 target.firstElementChild === second &&
                 target.lastElementChild === second &&
+                first.previousElementSibling === null &&
+                first.nextElementSibling === null &&
+                second.previousElementSibling === null &&
+                second.nextElementSibling === null &&
                 !first.isConnected && second.isConnected;
               const freshSelectorMiss = target.querySelector('span') === null &&
                 target.querySelector('#first-child') === null &&
@@ -5799,8 +5900,8 @@ mod tests {
 
               globalThis.elementRemoveDetachedChild = first;
               globalThis.elementRemoveBindingProof =
-                descriptorShape && unscopablesShape && wrongBrand &&
-                !wrongBrandSurplusTouched && liveAfterRemove &&
+                descriptorShape && siblingDescriptorShape && initialSiblings &&
+                unscopablesShape && wrongBrand && !wrongBrandSurplusTouched && liveAfterRemove &&
                 freshSelectorMiss && staticSnapshotRetained &&
                 secondRemoveWasNoOp;
             })();
@@ -6793,6 +6894,8 @@ mod tests {
         let matches = element_host_matches::<ElementHostProbe>;
         let webkit_matches = element_host_webkit_matches_selector::<ElementHostProbe>;
         let remove = element_host_remove::<ElementHostProbe>;
+        let previous = element_host_get_previous_element_sibling::<ElementHostProbe>;
+        let next = element_host_get_next_element_sibling::<ElementHostProbe>;
         let query_all = element_host_query_selector_all::<ElementHostProbe>;
         let get_by_class = element_host_get_elements_by_class_name::<ElementHostProbe>;
         let collection_drops = Rc::clone(&document.id_element_state.html_collection_drops);
@@ -6809,6 +6912,11 @@ mod tests {
             status: u32::MAX,
             value: u8::MAX,
         };
+        let mut sibling_output = RawInterfaceValue {
+            is_null: 0,
+            key: std::ptr::null(),
+            native: std::ptr::null_mut(),
+        };
 
         // SAFETY: Each invalid pointer combination is intentional and every
         // valid byte range and output remains live for the call.
@@ -6816,6 +6924,19 @@ mod tests {
             assert_eq!(remove(std::ptr::null_mut(), host_context), 0);
             assert_eq!(remove(native, std::ptr::null_mut()), 0);
             assert_eq!(remove(native, host_context), 1);
+            assert_eq!(previous(std::ptr::null_mut(), &mut sibling_output), 0);
+            assert_eq!(previous(native, std::ptr::null_mut()), 0);
+            assert_eq!(previous(native, &mut sibling_output), 1);
+            assert_eq!(sibling_output.is_null, 1);
+            assert!(sibling_output.key.is_null());
+            assert!(sibling_output.native.is_null());
+            sibling_output.is_null = 0;
+            assert_eq!(next(std::ptr::null_mut(), &mut sibling_output), 0);
+            assert_eq!(next(native, std::ptr::null_mut()), 0);
+            assert_eq!(next(native, &mut sibling_output), 1);
+            assert_eq!(sibling_output.is_null, 1);
+            assert!(sibling_output.key.is_null());
+            assert!(sibling_output.native.is_null());
 
             assert_eq!(
                 closest(

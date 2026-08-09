@@ -2298,7 +2298,7 @@ void ElementHostGetInterface(
   v8::Local<v8::Object> wrapper = WrapperForInterfaceValue(
       realm, isolate, isolate->GetCurrentContext(), value);
   if (wrapper.IsEmpty()) {
-    ThrowTypeError(isolate, "Element child wrapper could not be created");
+    ThrowTypeError(isolate, "Element wrapper could not be created");
     return;
   }
   info.GetReturnValue().Set(wrapper);
@@ -2407,6 +2407,20 @@ void ElementHostGetLastElementChild(
   ElementHostGetInterface(
       info, &ServoV8ElementHostVTable::get_last_element_child,
       "Element.lastElementChild host callback failed");
+}
+
+void ElementHostGetPreviousElementSibling(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetInterface(
+      info, &ServoV8ElementHostVTable::get_previous_element_sibling,
+      "Element.previousElementSibling host callback failed");
+}
+
+void ElementHostGetNextElementSibling(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetInterface(
+      info, &ServoV8ElementHostVTable::get_next_element_sibling,
+      "Element.nextElementSibling host callback failed");
 }
 
 void ElementHostGetChildElementCount(
@@ -2871,6 +2885,9 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"firstElementChild", &ElementHostGetFirstElementChild, nullptr},
       {"lastElementChild", &ElementHostGetLastElementChild, nullptr},
       {"childElementCount", &ElementHostGetChildElementCount, nullptr},
+      {"previousElementSibling", &ElementHostGetPreviousElementSibling,
+       nullptr},
+      {"nextElementSibling", &ElementHostGetNextElementSibling, nullptr},
   };
   for (const auto& accessor : accessors) {
     v8::Local<v8::Function> getter;
@@ -4261,7 +4278,9 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->set_text_content || !vtable->has_child_nodes ||
       !vtable->get_children || !vtable->get_elements_by_class_name ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
-      !vtable->get_child_element_count || !vtable->remove ||
+      !vtable->get_child_element_count ||
+      !vtable->get_previous_element_sibling ||
+      !vtable->get_next_element_sibling || !vtable->remove ||
       !vtable->query_selector ||
       !vtable->closest || !vtable->matches ||
       !vtable->webkit_matches_selector || !vtable->query_selector_all ||

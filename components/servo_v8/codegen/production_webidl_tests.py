@@ -257,12 +257,15 @@ class ProductionElementTests(unittest.TestCase):
         for qualified_name in (
             production_webidl.ELEMENT_FIRST_ELEMENT_CHILD,
             production_webidl.ELEMENT_LAST_ELEMENT_CHILD,
+            production_webidl.ELEMENT_PREVIOUS_ELEMENT_SIBLING,
+            production_webidl.ELEMENT_NEXT_ELEMENT_SIBLING,
         ):
             with self.subTest(member=qualified_name):
                 attribute = members[qualified_name]
                 self.assertTrue(attribute.readonly)
                 self.assertTrue(attribute.type.nullable())
                 self.assertEqual(attribute.type.inner.name, "Element")
+                self.assertEqual(set(attribute._extendedAttrDict), {"Pure"})
         child_count = members[production_webidl.ELEMENT_CHILD_ELEMENT_COUNT]
         self.assertTrue(child_count.readonly)
         self.assertEqual(child_count.type.prettyName(), "unsigned long")
@@ -1507,6 +1510,98 @@ class SyntheticSelectionTests(unittest.TestCase):
             "firstElementChild",
             "`Element.firstElementChild` must use nullable `Element`, got `Element`",
         )
+
+    def test_selects_exact_nondocumenttypechildnode_sibling_attributes(self) -> None:
+        parser_results = self.parse(
+            {
+                "ChildNode.webidl": """
+                    interface mixin NonDocumentTypeChildNode {
+                      [Pure] readonly attribute Element? previousElementSibling;
+                      [Pure] readonly attribute Element? nextElementSibling;
+                    };
+                    interface Element {};
+                    Element includes NonDocumentTypeChildNode;
+                """,
+            }
+        )
+        for qualified_name in (
+            production_webidl.ELEMENT_PREVIOUS_ELEMENT_SIBLING,
+            production_webidl.ELEMENT_NEXT_ELEMENT_SIBLING,
+        ):
+            with self.subTest(member=qualified_name):
+                member = production_webidl._select_element_host_member(
+                    parser_results, qualified_name
+                )
+                self.assertTrue(member.readonly)
+                self.assertEqual(set(member._extendedAttrDict), {"Pure"})
+                self.assertTrue(member.type.nullable())
+                self.assertEqual(member.type.inner.name, "Element")
+
+    def assert_element_sibling_rejected(
+        self, declaration: str, member: str, expected: str
+    ) -> None:
+        sources = {
+            "Element.webidl": f"interface Element {{ {declaration} }};"
+        }
+        if "HTMLDivElement" in declaration:
+            sources["HTMLDivElement.webidl"] = "interface HTMLDivElement {};"
+        parser_results = self.parse(sources)
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_element_host_member(
+                parser_results, f"Element.{member}"
+            )
+
+    def test_rejects_sibling_attribute_extended_attribute_drift(self) -> None:
+        for member in ("previousElementSibling", "nextElementSibling"):
+            with self.subTest(member=member):
+                self.assert_element_sibling_rejected(
+                    f"readonly attribute Element? {member};",
+                    member,
+                    f"`Element.{member}` must carry exactly ['Pure'], got []",
+                )
+                self.assert_element_sibling_rejected(
+                    f"[Pure, Throws] readonly attribute Element? {member};",
+                    member,
+                    f"`Element.{member}` must carry exactly ['Pure'], "
+                    "got ['Pure', 'Throws']",
+                )
+
+    def test_rejects_sibling_attribute_shape_drift(self) -> None:
+        cases = (
+            (
+                "[Pure] attribute Element? previousElementSibling;",
+                "previousElementSibling",
+                "`Element.previousElementSibling` must be readonly",
+            ),
+            (
+                "[Pure] readonly attribute Element nextElementSibling;",
+                "nextElementSibling",
+                "`Element.nextElementSibling` must use nullable `Element`, got `Element`",
+            ),
+            (
+                "[Pure] readonly attribute HTMLDivElement? previousElementSibling;",
+                "previousElementSibling",
+                "`Element.previousElementSibling` must use nullable `Element`, "
+                "got `HTMLDivElement?`",
+            ),
+            (
+                "[Pure] readonly attribute DOMString nextElementSibling;",
+                "nextElementSibling",
+                "`Element.nextElementSibling` must use nullable `Element`, "
+                "got `DOMString`",
+            ),
+            (
+                "[Pure] static readonly attribute Element? previousElementSibling;",
+                "previousElementSibling",
+                "`Element.previousElementSibling` must be an instance attribute",
+            ),
+        )
+        for declaration, member, expected in cases:
+            with self.subTest(member=member, declaration=declaration):
+                self.assert_element_sibling_rejected(declaration, member, expected)
 
     def test_rejects_wrong_child_element_count_width(self) -> None:
         self.assert_element_rejected(

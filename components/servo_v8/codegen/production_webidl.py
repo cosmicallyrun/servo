@@ -77,6 +77,8 @@ ELEMENT_CHILDREN = "Element.children"
 ELEMENT_FIRST_ELEMENT_CHILD = "Element.firstElementChild"
 ELEMENT_LAST_ELEMENT_CHILD = "Element.lastElementChild"
 ELEMENT_CHILD_ELEMENT_COUNT = "Element.childElementCount"
+ELEMENT_PREVIOUS_ELEMENT_SIBLING = "Element.previousElementSibling"
+ELEMENT_NEXT_ELEMENT_SIBLING = "Element.nextElementSibling"
 ELEMENT_QUERY_SELECTOR = "Element.querySelector"
 ELEMENT_CLOSEST = "Element.closest"
 ELEMENT_MATCHES = "Element.matches"
@@ -289,6 +291,8 @@ ELEMENT_HOST = (
     ELEMENT_FIRST_ELEMENT_CHILD,
     ELEMENT_LAST_ELEMENT_CHILD,
     ELEMENT_CHILD_ELEMENT_COUNT,
+    ELEMENT_PREVIOUS_ELEMENT_SIBLING,
+    ELEMENT_NEXT_ELEMENT_SIBLING,
     ELEMENT_QUERY_SELECTOR,
     ELEMENT_CLOSEST,
     ELEMENT_MATCHES,
@@ -1275,6 +1279,8 @@ def _select_element_host_member(
         "firstElementChild": {"Pure"},
         "lastElementChild": {"Pure"},
         "childElementCount": {"Pure"},
+        "previousElementSibling": {"Pure"},
+        "nextElementSibling": {"Pure"},
     }
     if member_name in attribute_attributes:
         if not member.isAttr() or member.isStatic():
@@ -1295,6 +1301,8 @@ def _select_element_host_member(
             "firstElementChild",
             "lastElementChild",
             "childElementCount",
+            "previousElementSibling",
+            "nextElementSibling",
         }
         if member.readonly != expected_readonly:
             state = "readonly" if expected_readonly else "writable"
@@ -1309,7 +1317,12 @@ def _select_element_host_member(
                     f"`{qualified_name}` must use non-nullable `HTMLCollection`, "
                     f"got `{member.type.prettyName()}`"
                 )
-        elif member_name in {"firstElementChild", "lastElementChild"}:
+        elif member_name in {
+            "firstElementChild",
+            "lastElementChild",
+            "previousElementSibling",
+            "nextElementSibling",
+        }:
             if (
                 not member.type.nullable()
                 or not member.type.inner.isInterface()

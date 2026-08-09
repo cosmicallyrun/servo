@@ -1,0 +1,141 @@
+<!doctype html>
+<!--
+Runtime proof for Element.previousElementSibling and
+Element.nextElementSibling. The V8-authoritative script validates the shared
+Element prototype accessors, Element-only traversal across text nodes, wrapper
+identity, and the live results after ChildNode.remove mutates the real Servo
+tree. The following SpiderMonkey script independently checks that mutation.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Element sibling traversal proof</title>
+    <style>
+      #target { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="target">leading text<span id="first">first</span>between text<em id="middle">middle</em>more text<strong id="last">last</strong>trailing text</section>
+    <script data-servo-v8="authoritative">
+      const target = document.getElementById("target");
+      const first = document.getElementById("first");
+      const middle = document.getElementById("middle");
+      const last = document.getElementById("last");
+      // The constrained realm deliberately has no Element constructor global.
+      const elementPrototype = Object.getPrototypeOf(middle);
+      const previousDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "previousElementSibling",
+      );
+      const nextDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "nextElementSibling",
+      );
+
+      let previousBrandRejected = false;
+      let nextBrandRejected = false;
+      try {
+        previousDescriptor.get.call({});
+      } catch (error) {
+        previousBrandRejected = error instanceof TypeError;
+      }
+      try {
+        nextDescriptor.get.call({});
+      } catch (error) {
+        nextBrandRejected = error instanceof TypeError;
+      }
+      if (
+        !previousDescriptor ||
+        !nextDescriptor ||
+        previousDescriptor.get.name !== "get previousElementSibling" ||
+        nextDescriptor.get.name !== "get nextElementSibling" ||
+        ![previousDescriptor, nextDescriptor].every(
+          (descriptor) =>
+            descriptor.get.length === 0 &&
+            descriptor.set === undefined &&
+            descriptor.enumerable &&
+            descriptor.configurable,
+        ) ||
+        Object.hasOwn(middle, "previousElementSibling") ||
+        Object.hasOwn(middle, "nextElementSibling") ||
+        !previousBrandRejected ||
+        !nextBrandRejected
+      ) {
+        throw new Error("Element sibling accessor surface is wrong");
+      }
+
+      // Text nodes separate every pair, so success here specifically proves
+      // NonDocumentTypeChildNode's element-only sibling traversal.
+      first.marker = 61;
+      middle.marker = 62;
+      last.marker = 63;
+      if (
+        first.previousElementSibling !== null ||
+        first.nextElementSibling !== middle ||
+        middle.previousElementSibling !== first ||
+        middle.nextElementSibling !== last ||
+        last.previousElementSibling !== middle ||
+        last.nextElementSibling !== null ||
+        target.children[0] !== first ||
+        target.children[1] !== middle ||
+        target.children[2] !== last ||
+        first.nextElementSibling.marker !== 62 ||
+        middle.previousElementSibling.marker !== 61 ||
+        middle.nextElementSibling.marker !== 63
+      ) {
+        throw new Error("Element sibling traversal or wrapper identity is wrong");
+      }
+
+      if (
+        middle.remove() !== undefined ||
+        first.nextElementSibling !== last ||
+        last.previousElementSibling !== first ||
+        middle.previousElementSibling !== null ||
+        middle.nextElementSibling !== null ||
+        target.children.length !== 2 ||
+        target.children[0] !== first ||
+        target.children[1] !== last ||
+        !first.isConnected ||
+        !last.isConnected ||
+        middle.isConnected
+      ) {
+        throw new Error("Element siblings did not update after middle removal");
+      }
+
+      if (
+        first.remove() !== undefined ||
+        last.previousElementSibling !== null ||
+        last.nextElementSibling !== null ||
+        first.previousElementSibling !== null ||
+        first.nextElementSibling !== null ||
+        target.children.length !== 1 ||
+        target.children[0] !== last ||
+        first.isConnected ||
+        !last.isConnected
+      ) {
+        throw new Error("Element siblings did not update after first removal");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently verifies the production DOM mutation.
+      const target = document.getElementById("target");
+      const last = document.getElementById("last");
+      if (
+        !target ||
+        !last ||
+        target.children.length !== 1 ||
+        target.children[0] !== last ||
+        document.getElementById("first") !== null ||
+        document.getElementById("middle") !== null ||
+        last.previousElementSibling !== null ||
+        last.nextElementSibling !== null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

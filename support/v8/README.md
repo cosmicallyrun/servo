@@ -78,7 +78,8 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.querySelector`, `Document.querySelectorAll`, and
 `Document.getElementsByClassName`, plus
 `Element.children`, `Element.querySelectorAll`,
-`Element.getElementsByClassName`, `Element.remove`, `Element.closest`,
+`Element.getElementsByClassName`, `Element.remove`,
+`Element.previousElementSibling`, `Element.nextElementSibling`, `Element.closest`,
 `Element.matches`, and `Element.webkitMatchesSelector`, declarations in
 Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
@@ -185,6 +186,13 @@ SpiderMonkey context, leaves custom-element reactions on Servo's outer or
 backup queue, and clears any unexpected pending SpiderMonkey exception before
 returning failure to V8. Retained `children` collections update live, while
 pre-existing `querySelectorAll` NodeLists remain static rooted snapshots.
+
+ABI v31 adds `Element.previousElementSibling` and
+`Element.nextElementSibling`. The read-only, brand-checked accessors use
+Servo's production NonDocumentTypeChildNode traversal and return the existing
+per-realm Element wrapper for a non-null sibling. They skip text nodes and
+therefore immediately reflect a preceding `Element.remove` mutation without
+creating a second wrapper for a still-reachable sibling.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -440,6 +448,7 @@ The proof suite uses that same counting argument:
 | `authoritative_children_collection_proof.html` | live SameObject HTMLCollections track tree/name mutation with indexed and named legacy properties |
 | `authoritative_get_elements_by_class_name_proof.html` | Document/Element class queries produce independently rooted live HTMLCollections with correct scope, conversion, identity, and mutation behavior |
 | `authoritative_element_remove_proof.html` | Element.remove uses Servo's ChildNode algorithm, updates live children while preserving static NodeList identity, and is unscopable |
+| `authoritative_element_sibling_proof.html` | Element-only sibling traversal skips text nodes, preserves wrapper identity, and updates after Element.remove |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
