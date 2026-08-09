@@ -5,6 +5,9 @@ shared Element prototype at ABI version 22 and its inherited Node prototype at
 ABI version 23. ABI version 24 adds ParentNode Element traversal.
 ABI version 27 adds static querySelectorAll NodeLists whose items converge on
 the same Element cache while each collection wrapper remains `[NewObject]`.
+ABI version 28 adds `[SameObject]` live `children` HTMLCollections. ABI version
+29 adds fresh live `getElementsByClassName` HTMLCollections whose per-call keys
+keep different filters separate.
 `Document.documentElement`, `Document.head`, `Document.getElementById()`, the
 Element/Node scalar slices, and ParentNode traversal are built on it.
 
@@ -140,16 +143,21 @@ identifies the object it was created for.
 ## Where the generator fits
 
 The manifest carries `Document.documentElement`, `Document.head`, the
-ParentNode children/first/last/count getters, and `Document.getElementById`
-like any other members and pins their exact declared interfaces (`Element`,
-`HTMLHeadElement`, and `Element`). The generator emits their ABI slots, Rust
-trait methods, thunks, checked C++ callbacks, and prototype registration.
+ParentNode children/first/last/count getters, `Document.getElementById`, and
+`Document.getElementsByClassName` like any other members, while separately
+gating the exact Element `getElementsByClassName` declaration. It pins their
+declared interfaces (`Element`, `HTMLHeadElement`, and `HTMLCollection`). The
+Document generator emits its ABI slot, Rust trait method, thunk, checked C++
+callback, and prototype registration; the parallel Element path uses the
+hand-written per-wrapper host table after passing the same WebIDL gate.
 Interface attributes use the `readonly nullable interface` shape; `children`
 uses an exact `[SameObject]` non-nullable `HTMLCollection` shape; ParentNode's
 two interface getters additionally require exact `[Pure]`, its count uses a
-32-bit unsigned shape, and the operation pins one required DOMString argument
-and `[Pure]`. WebIDL drift in any declared return type remains a build failure
-rather than silent type erasure.
+32-bit unsigned shape, and `getElementById` pins one required DOMString argument
+and `[Pure]`. The class-name operations pin one required DOMString argument, a
+non-nullable `HTMLCollection` result, and no extended attributes. WebIDL drift
+in any declared return type remains a build failure rather than silent type
+erasure.
 
 The wrapper cache, cell, and per-realm `Element` template remain hand-written
 infrastructure in `bridge.cc`; member-specific code no longer lives there.
@@ -173,6 +181,17 @@ representing different JavaScript objects. The collection cell holds a
 `Trusted<Node>` and rereads direct child elements, ids, and HTML names on every
 callback. Cache hits discard the speculative host; major-GC pruning and realm
 teardown walk both maps and release both kinds of roots.
+
+`Document.getElementsByClassName` and `Element.getElementsByClassName` are live
+but not `[SameObject]`. This implementation returns a fresh collection wrapper
+for every call, which the DOM Standard permits, and uses the collection host's
+own native address as a unique cache key. Keying only on the receiver would
+incorrectly alias `children`, different class filters, and repeated calls. The
+cell keeps that host alive for as long as its weak wrapper entry can be hit; if
+an address is later reused, the old weak entry is already cleared and lookup
+erases it before installing the new wrapper. Items still enter the ordinary
+Element cache, so collection access, selectors, and `getElementById` converge
+on one wrapper for each underlying Element.
 
 ## What this does not do
 
@@ -250,8 +269,10 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_node_scalar_proof.html`, and
 `authoritative_parent_node_proof.html`, and
 `authoritative_query_selector_all_proof.html`, and
-`authoritative_children_collection_proof.html` cover runtime behaviour against real
-Servo DOM, and `interface_returns_preserve_wrapper_identity` covers the bridge:
+`authoritative_children_collection_proof.html`, and
+`authoritative_get_elements_by_class_name_proof.html` cover runtime behaviour
+against real Servo DOM, and `interface_returns_preserve_wrapper_identity`
+covers the bridge:
 
 - the same DOM object read twice through V8 is the same JS object, checked by
   an expando surviving a re-read rather than by equality alone

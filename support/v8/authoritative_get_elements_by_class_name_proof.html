@@ -1,0 +1,231 @@
+<!doctype html>
+<!--
+Runtime proof for Document/Element getElementsByClassName() and live,
+per-call HTMLCollection hosts. The authoritative V8 script checks WebIDL
+conversion and receiver ordering, collection scoping and identity, then keeps
+results across class and real Servo tree mutations. SpiderMonkey finally
+checks that the production DOM was changed.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative getElementsByClassName proof</title>
+    <style>
+      .fixture {
+        display: none;
+      }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="scope" class="fixture hit shared">
+      <article id="first" class="hit shared">
+        first
+        <span id="nested" class="hit shared">nested</span>
+      </article>
+      <em id="second" class="hit shared" name="named-second">second</em>
+      <i id="late" class="hit">late</i>
+    </section>
+    <script data-servo-v8="authoritative">
+      const scope = document.querySelector("#scope");
+      const first = document.querySelector("#first");
+      const nested = document.querySelector("#nested");
+      const second = document.querySelector("#second");
+      const late = document.querySelector("#late");
+      const documentDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document),
+        "getElementsByClassName",
+      );
+      const elementDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(scope),
+        "getElementsByClassName",
+      );
+
+      for (const [receiver, descriptor] of [
+        [document, documentDescriptor],
+        [scope, elementDescriptor],
+      ]) {
+        if (
+          !descriptor ||
+          typeof descriptor.value !== "function" ||
+          descriptor.value.name !== "getElementsByClassName" ||
+          descriptor.value.length !== 1 ||
+          !descriptor.writable ||
+          !descriptor.enumerable ||
+          !descriptor.configurable ||
+          Object.hasOwn(receiver, "getElementsByClassName")
+        ) {
+          throw new Error("bad getElementsByClassName method descriptor");
+        }
+      }
+
+      let wrongBrandStringified = false;
+      for (const descriptor of [documentDescriptor, elementDescriptor]) {
+        let rejected = false;
+        try {
+          descriptor.value.call({}, {
+            toString() {
+              wrongBrandStringified = true;
+              return "hit shared";
+            },
+          });
+        } catch (error) {
+          rejected = error instanceof TypeError;
+        }
+        if (!rejected) {
+          throw new Error("getElementsByClassName accepted the wrong receiver");
+        }
+      }
+      if (wrongBrandStringified) {
+        throw new Error("getElementsByClassName converted before its brand check");
+      }
+
+      const conversionError = new Error("class-name conversion sentinel");
+      for (const receiver of [document, scope]) {
+        let preserved = false;
+        let missingRejected = false;
+        let symbolRejected = false;
+        try {
+          receiver.getElementsByClassName({
+            toString() {
+              throw conversionError;
+            },
+          });
+        } catch (error) {
+          preserved = error === conversionError;
+        }
+        try {
+          receiver.getElementsByClassName();
+        } catch (error) {
+          missingRejected = error instanceof TypeError;
+        }
+        try {
+          receiver.getElementsByClassName(Symbol("hit"));
+        } catch (error) {
+          symbolRejected = error instanceof TypeError;
+        }
+        let conversions = 0;
+        const converted = receiver.getElementsByClassName({
+          toString() {
+            conversions++;
+            return "hit shared";
+          },
+        });
+        if (!preserved || !missingRejected || !symbolRejected || conversions !== 1) {
+          throw new Error("bad getElementsByClassName WebIDL conversion");
+        }
+        if (converted.length !== (receiver === document ? 4 : 3)) {
+          throw new Error("converted class-name query returned the wrong result");
+        }
+      }
+
+      const documentCollection = document.getElementsByClassName("hit shared");
+      const scopedCollection = scope.getElementsByClassName("hit shared");
+      const whitespaceCollection = scope.getElementsByClassName(
+        " \tshared\n hit\fshared\rhit ",
+      );
+      if (
+        !(documentCollection instanceof HTMLCollection) ||
+        !(scopedCollection instanceof HTMLCollection) ||
+        documentCollection === document.getElementsByClassName("hit shared") ||
+        scopedCollection === scope.getElementsByClassName("hit shared") ||
+        documentCollection === scopedCollection ||
+        documentCollection === document.children ||
+        scopedCollection === scope.children ||
+        scopedCollection === whitespaceCollection ||
+        documentCollection.length !== 4 ||
+        documentCollection[0] !== scope ||
+        documentCollection[1] !== first ||
+        documentCollection[2] !== nested ||
+        documentCollection[3] !== second ||
+        scopedCollection.length !== 3 ||
+        scopedCollection[0] !== first ||
+        scopedCollection.item(0) !== first ||
+        scopedCollection[1] !== nested ||
+        scopedCollection[2] !== second ||
+        scopedCollection[3] !== undefined ||
+        scopedCollection.item(3) !== null ||
+        scopedCollection["first"] !== first ||
+        scopedCollection.namedItem("first") !== first ||
+        scopedCollection["named-second"] !== second ||
+        scopedCollection.namedItem("named-second") !== second ||
+        scopedCollection["scope"] !== undefined ||
+        scopedCollection.namedItem("scope") !== null ||
+        whitespaceCollection.length !== 3 ||
+        whitespaceCollection[0] !== first ||
+        whitespaceCollection[1] !== nested ||
+        whitespaceCollection[2] !== second ||
+        scope.getElementsByClassName("").length !== 0 ||
+        scope.getElementsByClassName(" \t\n\f\r ").length !== 0 ||
+        document.compatMode !== "CSS1Compat" ||
+        document.getElementsByClassName("HIT shared").length !== 0
+      ) {
+        throw new Error("bad class collection scope, order, names, or identity");
+      }
+
+      first.collectionMarker = 79;
+      if (
+        document.getElementById("first") !== first ||
+        document.querySelector("#first").collectionMarker !== 79 ||
+        scope.getElementsByClassName("hit shared")[0] !== first
+      ) {
+        throw new Error("collection items did not join the Element wrapper cache");
+      }
+
+      first.className = "other";
+      late.className = "hit shared";
+      if (
+        documentCollection.length !== 4 ||
+        documentCollection[0] !== scope ||
+        documentCollection[1] !== nested ||
+        documentCollection[2] !== second ||
+        documentCollection[3] !== late ||
+        scopedCollection.length !== 3 ||
+        scopedCollection[0] !== nested ||
+        scopedCollection[1] !== second ||
+        scopedCollection[2] !== late ||
+        scopedCollection["first"] !== undefined ||
+        scopedCollection.namedItem("first") !== null ||
+        scopedCollection["late"] !== late ||
+        whitespaceCollection[2] !== late
+      ) {
+        throw new Error("class collections were not live across className mutation");
+      }
+
+      scope.textContent = "";
+      if (
+        scopedCollection.length !== 0 ||
+        scopedCollection[0] !== undefined ||
+        scopedCollection.item(0) !== null ||
+        scopedCollection["late"] !== undefined ||
+        scopedCollection.namedItem("late") !== null ||
+        whitespaceCollection.length !== 0 ||
+        documentCollection.length !== 1 ||
+        documentCollection[0] !== scope ||
+        first.isConnected ||
+        nested.isConnected ||
+        second.isConnected ||
+        late.isConnected
+      ) {
+        throw new Error("class collections were not live across tree mutation");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      var nativeScope = document.getElementById("scope");
+      if (
+        nativeScope.childElementCount !== 0 ||
+        document.getElementById("first") !== null ||
+        document.getElementById("nested") !== null ||
+        document.getElementById("second") !== null ||
+        document.getElementById("late") !== null ||
+        document.getElementsByClassName("hit shared").length !== 1 ||
+        document.getElementsByClassName("hit shared")[0] !== nativeScope
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

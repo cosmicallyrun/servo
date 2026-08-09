@@ -337,9 +337,10 @@ struct ServoV8RealmState {
   // pinned for the life of the realm along with the element behind it.
   std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
       wrappers;
-  // `[SameObject]` collection wrappers are cached by their ParentNode owner.
-  // This must be separate from `wrappers`: an Element owner and its children
-  // collection intentionally use the same DOM address as distinct keys.
+  // Collection wrappers use either their `[SameObject]` ParentNode owner or a
+  // fresh operation-host allocation as their identity. This must be separate
+  // from `wrappers`: an Element owner and its children collection intentionally
+  // use the same DOM address as distinct keys.
   std::unordered_map<const void*, cppgc::WeakPersistent<ServoV8HostCell>>
       html_collections;
   // NewObject-returning collection wrappers have no DOM identity cache entry,
@@ -2346,6 +2347,61 @@ void ElementHostGetChildren(
   info.GetReturnValue().Set(wrapper);
 }
 
+void ElementHostGetElementsByClassName(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // WebIDL brand-checks the receiver before checking or converting arguments.
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->html_collection_host_installed ||
+      !realm->runtime->element_host_installed ||
+      realm->html_collection_template.IsEmpty() ||
+      realm->element_template.IsEmpty() ||
+      !realm->runtime->element_host_vtable.get_elements_by_class_name) {
+    ThrowTypeError(isolate,
+                   "HTMLCollection host is not installed in this realm");
+    return;
+  }
+  if (info.Length() < 1) {
+    ThrowTypeError(
+        isolate, "Element.getElementsByClassName requires 1 argument");
+    return;
+  }
+  v8::Local<v8::String> class_names_string;
+  if (!info[0]
+           ->ToString(isolate->GetCurrentContext())
+           .ToLocal(&class_names_string)) {
+    return;
+  }
+  v8::String::Utf8Value class_names(isolate, class_names_string);
+  if (!*class_names && class_names.length() != 0) return;
+
+  ServoV8HTMLCollectionValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.get_elements_by_class_name(
+                    native,
+                    reinterpret_cast<const uint8_t*>(*class_names),
+                    class_names.length(), &value) != 0;
+  }
+  if (!succeeded || !value.key || !value.native) {
+    DropUnownedHTMLCollectionHost(realm->runtime, value.native);
+    ThrowTypeError(
+        isolate, "Element.getElementsByClassName host callback failed");
+    return;
+  }
+  v8::Local<v8::Object> wrapper = WrapperForHTMLCollectionValue(
+      realm, isolate->GetCurrentContext(), value);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(
+        isolate, "Element.getElementsByClassName wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(wrapper);
+}
+
 void ElementHostGetLastElementChild(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   ElementHostGetInterface(
@@ -2798,6 +2854,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"getAttribute", &ElementHostGetAttribute, 1,
        v8::SideEffectType::kHasNoSideEffect},
       {"hasAttribute", &ElementHostHasAttribute, 1,
+       v8::SideEffectType::kHasSideEffect},
+      {"getElementsByClassName", &ElementHostGetElementsByClassName, 1,
        v8::SideEffectType::kHasSideEffect},
       {"querySelector", &ElementHostQuerySelector, 1,
        v8::SideEffectType::kHasNoSideEffect},
@@ -4144,7 +4202,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->has_child_nodes ||
-      !vtable->get_children ||
+      !vtable->get_children || !vtable->get_elements_by_class_name ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
       !vtable->get_child_element_count || !vtable->query_selector ||
       !vtable->closest || !vtable->matches ||

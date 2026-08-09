@@ -1274,6 +1274,186 @@ def _sameobject_readonly_interface_cpp_vtable_terms(member: Member) -> list[str]
     return [f"vtable.{_getter_name(member.attribute)}"]
 
 
+def _domstring_to_nonnullable_interface_argument(
+    member: Member,
+) -> WebIDL.IDLArgument:
+    _, arguments = member.attribute.signatures()[0]
+    return arguments[0]
+
+
+def _domstring_to_nonnullable_interface_header_slots(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _domstring_to_nonnullable_interface_argument(member)
+    )
+    return [
+        f"  uint8_t (*{name})(void* native,",
+        f"{C_SIGNATURE_INDENT}const uint8_t* {argument},",
+        f"{C_SIGNATURE_INDENT}size_t {argument}_length,",
+        f"{C_SIGNATURE_INDENT}ServoV8HTMLCollectionValue* output);",
+    ]
+
+
+def _domstring_to_nonnullable_interface_rust_trait_members(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _domstring_to_nonnullable_interface_argument(member)
+    )
+    return [
+        "    /// Returns a live collection host for this exact class-name query.",
+        f"    fn {name}(&self, {argument}: &str) -> HTMLCollectionHandle;",
+    ]
+
+
+def _domstring_to_nonnullable_interface_rust_vtable_fields(
+    member: Member,
+) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"    pub {name}: Option<",
+        "        unsafe extern \"C\" fn(",
+        "            *mut c_void,",
+        "            *const u8,",
+        "            usize,",
+        "            *mut RawHTMLCollectionValue,",
+        "        ) -> u8,",
+        "    >,",
+    ]
+
+
+def _domstring_to_nonnullable_interface_rust_thunks(
+    member: Member,
+) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(
+        _domstring_to_nonnullable_interface_argument(member)
+    )
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{name}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            f"    {argument}: *const u8,",
+            f"    {argument}_length: usize,",
+            "    output: *mut RawHTMLCollectionValue,",
+            ") -> u8 {",
+            "    if native.is_null() || output.is_null() ||",
+            f"        ({argument}.is_null() && {argument}_length != 0)",
+            "    {",
+            "        return 0;",
+            "    }",
+            f"    let {argument}_bytes = if {argument}_length == 0 {{",
+            "        &[]",
+            "    } else {",
+            "        // SAFETY: The ABI contract lends this byte range for the callback.",
+            f"        unsafe {{ std::slice::from_raw_parts({argument}, {argument}_length) }}",
+            "    };",
+            f"    let Ok({argument}) = std::str::from_utf8({argument}_bytes) else {{",
+            "        return 0;",
+            "    };",
+            "    // SAFETY: The vtable contract supplies this exact live Box<T>.",
+            f"    let handle = unsafe {{ &*native.cast::<T>() }}.{name}({argument});",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe {",
+            "        *output = RawHTMLCollectionValue {",
+            "            key: handle.key,",
+            "            native: handle.native,",
+            "        };",
+            "    }",
+            "    1",
+            "}",
+        ],
+    )
+
+
+def _domstring_to_nonnullable_interface_rust_vtable_init(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [f"            {name}: Some(document_host_{name}::<T>),"]
+
+
+def _domstring_to_nonnullable_interface_cpp_bodies(
+    member: Member,
+) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    callback = _cpp_member_name(member.attribute)
+    argument = _rust_member_name(
+        _domstring_to_nonnullable_interface_argument(member)
+    )
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostCall{callback}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{name}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->html_collection_host_installed ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->html_collection_template.IsEmpty() ||",
+            "      realm->element_template.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "HTMLCollection host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  if (info.Length() < 1) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} requires one argument");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            f"  v8::Local<v8::String> {argument}_value;",
+            f"  if (!info[0]->ToString(context).ToLocal(&{argument}_value)) return;",
+            f"  v8::String::Utf8Value {argument}_utf8(isolate, {argument}_value);",
+            f"  if (!*{argument}_utf8 && {argument}_utf8.length() != 0) {{",
+            f'    ThrowTypeError(isolate, "{qualified_name} argument conversion failed");',
+            "    return;",
+            "  }",
+            "  ServoV8HTMLCollectionValue value{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{name}(",
+            "                    state->native,",
+            f"                    reinterpret_cast<const uint8_t*>(*{argument}_utf8),",
+            f"                    static_cast<size_t>({argument}_utf8.length()),",
+            "                    &value) != 0;",
+            "  }",
+            "  if (!succeeded) {",
+            "    DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            f'    ThrowTypeError(isolate, "{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            "  if (!value.key || !value.native) {",
+            "    DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            f'    ThrowTypeError(isolate, "invalid {qualified_name} interface result");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Object> wrapper =",
+            "      WrapperForHTMLCollectionValue(realm, context, value);",
+            "  if (wrapper.IsEmpty()) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} wrapper could not be created");',
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(wrapper);",
+            "}",
+        ],
+    )
+
+
+def _domstring_to_nonnullable_interface_cpp_vtable_terms(
+    member: Member,
+) -> list[str]:
+    return [f"vtable.{_rust_member_name(member.attribute)}"]
+
+
 # This operation has the same nullable Element result contract as the
 # interface-valued attributes above, but it also converts one JavaScript value
 # to DOMString and passes the embedding's ephemeral JSContext through to Servo.
@@ -2059,6 +2239,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(),
         cpp_bodies=_sameobject_readonly_interface_cpp_bodies,
         cpp_vtable_terms=_sameobject_readonly_interface_cpp_vtable_terms,
+    ),
+    production_webidl.DOMSTRING_TO_NONNULLABLE_INTERFACE: ShapeEmitter(
+        header_type_blocks=(_HTML_COLLECTION_C_TYPE,),
+        header_slots=_domstring_to_nonnullable_interface_header_slots,
+        rust_type_blocks=(_HTML_COLLECTION_RUST_TYPE,),
+        rust_trait_members=_domstring_to_nonnullable_interface_rust_trait_members,
+        rust_vtable_fields=_domstring_to_nonnullable_interface_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_domstring_to_nonnullable_interface_rust_thunks,
+        rust_vtable_init=_domstring_to_nonnullable_interface_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_domstring_to_nonnullable_interface_cpp_bodies,
+        cpp_vtable_terms=_domstring_to_nonnullable_interface_cpp_vtable_terms,
     ),
     production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE: ShapeEmitter(
         header_type_blocks=(),

@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 28u
+#define SERVO_V8_ABI_VERSION 29u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -130,6 +130,11 @@ typedef struct ServoV8ElementHostVTable {
   uint8_t (*has_child_nodes)(void* native, uint8_t* output);
   uint8_t (*get_children)(void* native,
                           ServoV8HTMLCollectionValue* output);
+  uint8_t (*get_elements_by_class_name)(
+      void* native,
+      const uint8_t* class_names,
+      size_t class_names_length,
+      ServoV8HTMLCollectionValue* output);
   uint8_t (*get_first_element_child)(void* native,
                                      ServoV8InterfaceValue* output);
   uint8_t (*get_last_element_child)(void* native,
@@ -174,8 +179,8 @@ typedef struct ServoV8NodeListHostVTable {
   ServoV8DropCallback drop;
 } ServoV8NodeListHostVTable;
 
-/* One live HTMLCollection returned by ParentNode.children. The host roots its
- * owner and derives the current direct child elements on every callback. */
+/* One live HTMLCollection. The host roots its owner and derives the current
+ * matching elements on every callback. */
 typedef struct ServoV8HTMLCollectionHostVTable {
   uint8_t (*get_length)(void* native, uint32_t* output);
   uint8_t (*item)(void* native,

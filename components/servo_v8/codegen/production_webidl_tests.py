@@ -128,6 +128,15 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertTrue(child_count.readonly)
         self.assertEqual(child_count.type.prettyName(), "unsigned long")
         self.assertEqual(set(child_count._extendedAttrDict), {"Pure"})
+        class_query = attributes[
+            production_webidl.DOCUMENT_GET_ELEMENTS_BY_CLASS_NAME
+        ]
+        return_type, arguments = class_query.signatures()[0]
+        self.assertEqual(return_type.name, "HTMLCollection")
+        self.assertFalse(return_type.nullable())
+        self.assertEqual(arguments[0].identifier.name, "classNames")
+        self.assertTrue(arguments[0].type.isDOMString())
+        self.assertEqual(set(class_query._extendedAttrDict), set())
         method = attributes[production_webidl.DOCUMENT_GET_ELEMENT_BY_ID]
         return_type, arguments = method.signatures()[0]
         self.assertEqual(return_type.inner.name, "Element")
@@ -273,6 +282,15 @@ class ProductionElementTests(unittest.TestCase):
                 self.assertTrue(return_type.isBoolean())
                 self.assertEqual(arguments[0].identifier.name, "selectors")
                 self.assertEqual(set(method._extendedAttrDict), {"Pure", "Throws"})
+        class_query = members[
+            production_webidl.ELEMENT_GET_ELEMENTS_BY_CLASS_NAME
+        ]
+        class_return, class_arguments = class_query.signatures()[0]
+        self.assertEqual(class_return.name, "HTMLCollection")
+        self.assertFalse(class_return.nullable())
+        self.assertEqual(class_arguments[0].identifier.name, "classNames")
+        self.assertTrue(class_arguments[0].type.isDOMString())
+        self.assertEqual(set(class_query._extendedAttrDict), set())
         query_all_return, query_all_arguments = members[
             production_webidl.ELEMENT_QUERY_SELECTOR_ALL
         ].signatures()[0]
@@ -849,6 +867,97 @@ class SyntheticSelectionTests(unittest.TestCase):
                 parser_results,
                 production_webidl.DOCUMENT_CHILD_ELEMENT_COUNT,
             )
+
+    def assert_get_elements_by_class_name_rejected(
+        self,
+        declaration: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": f"""
+                    interface HTMLCollection {{}};
+                    interface Document {{ {declaration} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_domstring_to_nonnullable_interface_operation(
+                parser_results,
+                production_webidl.DOCUMENT_GET_ELEMENTS_BY_CLASS_NAME,
+                "HTMLCollection",
+                "classNames",
+            )
+
+    def test_selects_exact_get_elements_by_class_name(self) -> None:
+        parser_results = self.parse(
+            {
+                "Document.webidl": """
+                    interface HTMLCollection {};
+                    interface Document {
+                      HTMLCollection getElementsByClassName(DOMString classNames);
+                    };
+                """,
+            }
+        )
+        method = production_webidl.select_domstring_to_nonnullable_interface_operation(
+            parser_results,
+            production_webidl.DOCUMENT_GET_ELEMENTS_BY_CLASS_NAME,
+            "HTMLCollection",
+            "classNames",
+        )
+        self.assertEqual(set(method._extendedAttrDict), set())
+
+    def test_rejects_get_elements_by_class_name_extended_attributes(self) -> None:
+        self.assert_get_elements_by_class_name_rejected(
+            "[Pure] HTMLCollection getElementsByClassName(DOMString classNames);",
+            "`Document.getElementsByClassName` must carry no extended attributes, "
+            "got ['Pure']",
+        )
+
+    def test_rejects_get_elements_by_class_name_return_drift(self) -> None:
+        self.assert_get_elements_by_class_name_rejected(
+            "HTMLCollection? getElementsByClassName(DOMString classNames);",
+            "`Document.getElementsByClassName` must return a non-nullable interface, "
+            "got `HTMLCollection?`",
+        )
+        self.assert_get_elements_by_class_name_rejected(
+            "Document getElementsByClassName(DOMString classNames);",
+            "`Document.getElementsByClassName` must return `HTMLCollection`, "
+            "got `Document`",
+        )
+
+    def test_rejects_get_elements_by_class_name_argument_drift(self) -> None:
+        expected = (
+            "`Document.getElementsByClassName` must take required non-nullable "
+            "`DOMString classNames`"
+        )
+        self.assert_get_elements_by_class_name_rejected(
+            "HTMLCollection getElementsByClassName(optional DOMString classNames);",
+            expected,
+        )
+        self.assert_get_elements_by_class_name_rejected(
+            "HTMLCollection getElementsByClassName(DOMString names);",
+            expected,
+        )
+        self.assert_get_elements_by_class_name_rejected(
+            "HTMLCollection getElementsByClassName(USVString classNames);",
+            expected,
+        )
+
+    def test_rejects_overloaded_get_elements_by_class_name(self) -> None:
+        self.assert_get_elements_by_class_name_rejected(
+            """
+              HTMLCollection getElementsByClassName(DOMString classNames);
+              HTMLCollection getElementsByClassName(
+                  DOMString classNames, DOMString extra);
+            """,
+            "`Document.getElementsByClassName` must have exactly one signature, "
+            "found 2",
+        )
 
     def assert_get_element_by_id_rejected(self, declaration: str, expected: str) -> None:
         parser_results = self.parse(

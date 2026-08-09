@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 28;
+const ABI_VERSION: u32 = 29;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -268,9 +268,32 @@ impl HTMLCollectionHandle {
             native: Box::into_raw(Box::new(host)).cast(),
         }
     }
+
+    /// Boxes a fresh operation result whose native allocation supplies its
+    /// own unique wrapper-cache key. Unlike [`Self::new`], this does not make
+    /// repeated calls return the same JavaScript object.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the exact type previously passed to
+    /// `Runtime::install_html_collection_host` for the receiving runtime.
+    /// `T` must not be zero-sized, because its allocation address is the
+    /// operation result's unique cache identity.
+    pub unsafe fn new_unique<T: HTMLCollectionHostBinding>(host: T) -> Self {
+        assert_ne!(
+            std::mem::size_of::<T>(),
+            0,
+            "a unique HTMLCollection host must not be zero-sized"
+        );
+        let native: *mut c_void = Box::into_raw(Box::new(host)).cast();
+        Self {
+            key: native.cast_const(),
+            native,
+        }
+    }
 }
 
-/// A live HTMLCollection returned by ParentNode.children.
+/// A live HTMLCollection returned by a DOM attribute or operation.
 ///
 /// # Safety
 ///
@@ -335,6 +358,7 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool;
     fn has_child_nodes(&self) -> bool;
     fn children(&self) -> HTMLCollectionHandle;
+    fn get_elements_by_class_name(&self, class_names: &str) -> HTMLCollectionHandle;
     fn first_element_child(&self) -> Option<InterfaceHandle>;
     fn last_element_child(&self) -> Option<InterfaceHandle>;
     fn child_element_count(&self) -> u32;
@@ -392,6 +416,9 @@ pub struct ElementHostVTable {
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
     pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
     pub get_children: Option<unsafe extern "C" fn(*mut c_void, *mut RawHTMLCollectionValue) -> u8>,
+    pub get_elements_by_class_name: Option<
+        unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut RawHTMLCollectionValue) -> u8,
+    >,
     pub get_first_element_child:
         Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub get_last_element_child:
@@ -994,6 +1021,31 @@ unsafe extern "C" fn element_host_get_children<T: ElementHostBinding>(
     1
 }
 
+unsafe extern "C" fn element_host_get_elements_by_class_name<T: ElementHostBinding>(
+    native: *mut c_void,
+    class_names: *const u8,
+    class_names_length: usize,
+    output: *mut RawHTMLCollectionValue,
+) -> u8 {
+    if native.is_null() || output.is_null() || (class_names.is_null() && class_names_length != 0) {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(class_names) = (unsafe { element_host_utf8(class_names, class_names_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let handle = unsafe { (&*native.cast::<T>()).get_elements_by_class_name(class_names) };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe {
+        *output = RawHTMLCollectionValue {
+            key: handle.key,
+            native: handle.native,
+        }
+    };
+    1
+}
+
 unsafe extern "C" fn element_host_get_first_element_child<T: ElementHostBinding>(
     native: *mut c_void,
     output: *mut RawInterfaceValue,
@@ -1315,6 +1367,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         set_text_content: Some(element_host_set_text_content::<T>),
         has_child_nodes: Some(element_host_has_child_nodes::<T>),
         get_children: Some(element_host_get_children::<T>),
+        get_elements_by_class_name: Some(element_host_get_elements_by_class_name::<T>),
         get_first_element_child: Some(element_host_get_first_element_child::<T>),
         get_last_element_child: Some(element_host_get_last_element_child::<T>),
         get_child_element_count: Some(element_host_get_child_element_count::<T>),
@@ -2661,6 +2714,7 @@ mod tests {
 
     struct HTMLCollectionHostProbe {
         items: Rc<RefCell<Vec<ElementProbeChild>>>,
+        required_classes: Option<Vec<String>>,
         element_drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
         drops: Rc<Cell<usize>>,
@@ -2673,8 +2727,30 @@ mod tests {
     }
 
     impl HTMLCollectionHostProbe {
+        fn matching_items(&self) -> Vec<ElementProbeChild> {
+            self.items
+                .borrow()
+                .iter()
+                .filter(|child| {
+                    let Some(required_classes) = &self.required_classes else {
+                        return true;
+                    };
+                    if required_classes.is_empty() {
+                        return false;
+                    }
+                    let classes = child.state.get("class").unwrap_or_default();
+                    required_classes.iter().all(|required| {
+                        classes
+                            .split_ascii_whitespace()
+                            .any(|candidate| candidate == required)
+                    })
+                })
+                .cloned()
+                .collect()
+        }
+
         fn item_handle(&self, index: usize) -> Option<InterfaceHandle> {
-            let child = self.items.borrow().get(index)?.clone();
+            let child = self.matching_items().get(index)?.clone();
             NodeListProbeItem {
                 local_name: child.local_name,
                 tag_name: child.tag_name,
@@ -2693,7 +2769,7 @@ mod tests {
     // runtime's owner thread. No callback or Drop can enter V8.
     unsafe impl HTMLCollectionHostBinding for HTMLCollectionHostProbe {
         fn length(&self) -> u32 {
-            self.items.borrow().len() as u32
+            self.matching_items().len() as u32
         }
 
         fn item(&self, index: u32) -> Option<InterfaceHandle> {
@@ -2704,7 +2780,7 @@ mod tests {
             if name.is_empty() {
                 return None;
             }
-            let index = self.items.borrow().iter().position(|child| {
+            let index = self.matching_items().iter().position(|child| {
                 child.state.get("id").as_deref() == Some(name)
                     || child.state.get("name").as_deref() == Some(name)
             })?;
@@ -2713,7 +2789,7 @@ mod tests {
 
         fn supported_names(&self) -> Vec<String> {
             let mut names = Vec::new();
-            for child in self.items.borrow().iter() {
+            for child in self.matching_items() {
                 for name in [child.state.get("id"), child.state.get("name")]
                     .into_iter()
                     .flatten()
@@ -2853,11 +2929,32 @@ mod tests {
                     self.identity,
                     HTMLCollectionHostProbe {
                         items: Rc::clone(&self.state.element_children),
+                        required_classes: None,
                         element_drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                         drops: Rc::clone(&self.state.html_collection_drops),
                     },
                 )
+            }
+        }
+
+        fn get_elements_by_class_name(&self, class_names: &str) -> HTMLCollectionHandle {
+            // SAFETY: Every test runtime exposing ElementHostProbe installs
+            // HTMLCollectionHostProbe. A fresh native allocation is also a
+            // unique cache key for this operation result.
+            unsafe {
+                HTMLCollectionHandle::new_unique(HTMLCollectionHostProbe {
+                    items: Rc::clone(&self.state.element_children),
+                    required_classes: Some(
+                        class_names
+                            .split_ascii_whitespace()
+                            .map(str::to_owned)
+                            .collect(),
+                    ),
+                    element_drops: Rc::clone(&self.drops),
+                    drop_reentry: self.drop_reentry.clone(),
+                    drops: Rc::clone(&self.state.html_collection_drops),
+                })
             }
         }
 
@@ -3398,11 +3495,62 @@ mod tests {
                     },
                     HTMLCollectionHostProbe {
                         items,
+                        required_classes: None,
                         element_drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                         drops: Rc::clone(&self.html_collection_drops),
                     },
                 )
+            }
+        }
+
+        fn get_elements_by_class_name(&self, class_names: &str) -> HTMLCollectionHandle {
+            let mut items = Vec::new();
+            if self.document_element_present {
+                items.push(ElementProbeChild {
+                    identity: Rc::clone(&self.element_identity),
+                    local_name: "html".to_owned(),
+                    tag_name: "HTML".to_owned(),
+                    state: Rc::clone(&self.element_state),
+                });
+            }
+            if self.head_present {
+                items.push(ElementProbeChild {
+                    identity: Rc::clone(&self.head_identity),
+                    local_name: "head".to_owned(),
+                    tag_name: "HEAD".to_owned(),
+                    state: Rc::clone(&self.head_state),
+                });
+            }
+            items.push(ElementProbeChild {
+                identity: Rc::clone(&self.id_element_identity),
+                local_name: "div".to_owned(),
+                tag_name: "DIV".to_owned(),
+                state: Rc::clone(&self.id_element_state),
+            });
+            items.extend(
+                self.id_element_state
+                    .element_children
+                    .borrow()
+                    .iter()
+                    .cloned(),
+            );
+            // SAFETY: Every test runtime exposing DocumentHostProbe installs
+            // HTMLCollectionHostProbe. Each call must create a distinct
+            // operation result, so its native allocation supplies the key.
+            unsafe {
+                HTMLCollectionHandle::new_unique(HTMLCollectionHostProbe {
+                    items: Rc::new(RefCell::new(items)),
+                    required_classes: Some(
+                        class_names
+                            .split_ascii_whitespace()
+                            .map(str::to_owned)
+                            .collect(),
+                    ),
+                    element_drops: Rc::clone(&self.element_drops),
+                    drop_reentry: self.element_drop_reentry.clone(),
+                    drops: Rc::clone(&self.html_collection_drops),
+                })
             }
         }
 
@@ -4322,9 +4470,46 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 2);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.keptClassCollection = \
+                     document.getElementsByClassName('alpha'); \
+                     keptClassCollection.length === 1",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 3);
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 3);
+        assert_eq!(collection_drops.get(), 1);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "globalThis.keptClassCollection = null; true")
+                .unwrap()
+        );
+        runtime.collect_garbage_for_testing();
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 2);
+        assert_eq!(collection_drops.get(), 2);
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.recreatedClassCollection = \
+                     document.getElementsByClassName('alpha'); \
+                     recreatedClassCollection.length === 1 && \
+                     recreatedClassCollection !== recreatedCollection",
+                )
+                .unwrap()
+        );
+        assert_eq!(runtime.wrapper_cache_size_for_testing(realm).unwrap(), 3);
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(element_drops.get(), 2);
-        assert_eq!(collection_drops.get(), 2);
+        assert_eq!(collection_drops.get(), 4);
         assert!(runtime.wrapper_cache_size_for_testing(realm).is_err());
     }
 
@@ -5452,6 +5637,187 @@ mod tests {
     }
 
     #[test]
+    fn get_elements_by_class_name_exposes_fresh_live_html_collections() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Element host vtable installs once");
+        runtime
+            .install_html_collection_host::<HTMLCollectionHostProbe>()
+            .expect("HTMLCollection host vtable installs once");
+
+        let realm = runtime.create_realm().unwrap();
+        let host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        let collection_drops = Rc::clone(&host.html_collection_drops);
+        let element_collection_drops = Rc::clone(&host.id_element_state.html_collection_drops);
+        runtime.install_document_host(realm, host).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"
+            (() => {
+              const target = document.getElementById('target');
+              const childCollection = target.children;
+              const first = childCollection[0];
+              const second = childCollection[1];
+              first.className = 'alpha beta';
+              second.className = 'alpha gamma';
+
+              const collection = target.getElementsByClassName(' alpha  beta alpha ');
+              const repeated = target.getElementsByClassName('alpha beta');
+              const documentCollection = document.getElementsByClassName('alpha beta');
+              const empty = target.getElementsByClassName(' \t\n ');
+              const elementPrototype = Object.getPrototypeOf(target);
+              const documentPrototype = Object.getPrototypeOf(document);
+              const elementDescriptor = Object.getOwnPropertyDescriptor(
+                elementPrototype, 'getElementsByClassName');
+              const documentDescriptor = Object.getOwnPropertyDescriptor(
+                documentPrototype, 'getElementsByClassName');
+
+              let conversions = 0;
+              const converted = target.getElementsByClassName({
+                toString() { conversions++; return 'alpha beta'; }
+              });
+              let wrongBrand = false;
+              let wrongBrandConverted = false;
+              try {
+                elementPrototype.getElementsByClassName.call({}, {
+                  toString() { wrongBrandConverted = true; return 'alpha'; }
+                });
+              } catch (error) { wrongBrand = error instanceof TypeError; }
+              let missing = false;
+              let symbol = false;
+              try { target.getElementsByClassName(); }
+              catch (error) { missing = error instanceof TypeError; }
+              try { target.getElementsByClassName(Symbol('x')); }
+              catch (error) { symbol = error instanceof TypeError; }
+
+              const initial =
+                collection !== repeated && collection instanceof HTMLCollection &&
+                collection.length === 1 && collection[0] === first &&
+                collection.item(0) === first &&
+                collection.namedItem('first-child') === first &&
+                repeated.length === 1 && repeated[0] === first &&
+                converted.length === 1 && converted[0] === first &&
+                documentCollection.length === 2 &&
+                documentCollection[0] === target && documentCollection[1] === first &&
+                empty.length === 0 &&
+                conversions === 1 && wrongBrand && !wrongBrandConverted && missing && symbol &&
+                elementDescriptor && elementDescriptor.value.length === 1 &&
+                elementDescriptor.value.name === 'getElementsByClassName' &&
+                elementDescriptor.writable && elementDescriptor.enumerable &&
+                elementDescriptor.configurable &&
+                documentDescriptor && documentDescriptor.value.length === 1 &&
+                documentDescriptor.value.name === 'getElementsByClassName' &&
+                documentDescriptor.writable && documentDescriptor.enumerable &&
+                documentDescriptor.configurable;
+
+              first.className = 'alpha';
+              const classMutationStayedLive =
+                collection.length === 0 && repeated.length === 0 &&
+                documentCollection.length === 1 && documentCollection[0] === target;
+              first.className = 'alpha beta';
+              const restored = collection.length === 1 && collection[0] === first;
+              target.textContent = '';
+              const treeMutationStayedLive =
+                collection.length === 0 && repeated.length === 0 &&
+                converted.length === 0 && !first.isConnected;
+
+              globalThis.keptClassCollections = [
+                childCollection, collection, repeated,
+                documentCollection, empty, converted,
+              ];
+              globalThis.getElementsByClassNameBindingProof =
+                initial && classMutationStayedLive && restored && treeMutationStayedLive;
+            })();
+            "#,
+            "get-elements-by-class-name-binding.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: The non-null token is lent only for this synchronous run.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "getElementsByClassNameBindingProof")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "globalThis.contextFreeDocumentCollection = \
+                       document.getElementsByClassName('alpha beta'); \
+                     globalThis.contextFreeElementCollection = \
+                       keptClassCollections[3][0].getElementsByClassName('alpha'); \
+                     contextFreeDocumentCollection.length === 1 && \
+                     contextFreeElementCollection.length === 0",
+                )
+                .unwrap(),
+            "class queries do not require a SpiderMonkey host context"
+        );
+
+        let document_drops_before_teardown = collection_drops.get();
+        let element_drops_before_teardown = element_collection_drops.get();
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(
+            collection_drops.get(),
+            document_drops_before_teardown + 2,
+            "realm teardown must release both live Document query collections exactly once"
+        );
+        assert_eq!(
+            element_collection_drops.get(),
+            element_drops_before_teardown + 6,
+            "realm teardown must release the children host and five live Element query hosts exactly once"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a unique HTMLCollection host must not be zero-sized")]
+    fn unique_html_collection_handles_reject_zero_sized_hosts() {
+        struct ZeroSizedCollectionHost;
+
+        // SAFETY: This host is used only to verify the stronger non-ZST
+        // precondition enforced by new_unique; none of its callbacks run.
+        unsafe impl HTMLCollectionHostBinding for ZeroSizedCollectionHost {
+            fn length(&self) -> u32 {
+                0
+            }
+
+            fn item(&self, _index: u32) -> Option<InterfaceHandle> {
+                None
+            }
+
+            fn named_item(&self, _name: &str) -> Option<InterfaceHandle> {
+                None
+            }
+
+            fn supported_names(&self) -> Vec<String> {
+                Vec::new()
+            }
+        }
+
+        // SAFETY: The constructor rejects the ZST before transferring it.
+        let _ = unsafe { HTMLCollectionHandle::new_unique(ZeroSizedCollectionHost) };
+    }
+
+    #[test]
     fn query_selector_all_exposes_static_iterable_node_lists() {
         let mut runtime = Runtime::new(Options {
             expose_gc: 1,
@@ -6208,6 +6574,8 @@ mod tests {
         let matches = element_host_matches::<ElementHostProbe>;
         let webkit_matches = element_host_webkit_matches_selector::<ElementHostProbe>;
         let query_all = element_host_query_selector_all::<ElementHostProbe>;
+        let get_by_class = element_host_get_elements_by_class_name::<ElementHostProbe>;
+        let collection_drops = Rc::clone(&document.id_element_state.html_collection_drops);
         let invalid_utf8 = [0xff];
         let mut element_output = RawSelectorElementOutcome {
             status: u32::MAX,
@@ -6362,9 +6730,46 @@ mod tests {
             assert_eq!(node_list_output.status, SELECTOR_RETURNED);
             assert!(!node_list_output.native.is_null());
             node_list_host_drop::<NodeListHostProbe>(node_list_output.native);
+
+            let mut collection_output = RawHTMLCollectionValue {
+                key: std::ptr::null(),
+                native: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                get_by_class(
+                    native,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut collection_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_by_class(native, std::ptr::null(), 1, &mut collection_output),
+                0,
+            );
+            assert_eq!(
+                get_by_class(native, std::ptr::null(), 0, std::ptr::null_mut()),
+                0,
+            );
+            let classes = b"alpha beta";
+            assert_eq!(
+                get_by_class(
+                    native,
+                    classes.as_ptr(),
+                    classes.len(),
+                    &mut collection_output,
+                ),
+                1,
+            );
+            assert!(!collection_output.key.is_null());
+            assert!(!collection_output.native.is_null());
+            assert_eq!(collection_output.key, collection_output.native.cast_const());
+            html_collection_host_drop::<HTMLCollectionHostProbe>(collection_output.native);
             element_host_drop::<ElementHostProbe>(native);
         }
         assert_eq!(element_drops.get(), 2);
+        assert_eq!(collection_drops.get(), 1);
     }
 
     #[test]

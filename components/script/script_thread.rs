@@ -113,6 +113,8 @@ use style::context::QuirksMode;
 use style::error_reporting::RustLogReporter;
 use style::media_queries::MediaList;
 use style::shared_lock::SharedRwLock;
+#[cfg(feature = "v8-shadow")]
+use style::str::split_html_space_chars;
 use style::stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet};
 use style::thread_state::{self, ThreadState};
 use stylo_atoms::Atom;
@@ -159,6 +161,8 @@ use crate::dom::document::{
 use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, ProcessingMode};
+#[cfg(feature = "v8-shadow")]
+use crate::dom::node::iterators::ShadowIncluding;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::servoparser::{ParserContext, ServoParser};
 use crate::dom::types::DebuggerGlobalScope;
@@ -253,36 +257,65 @@ struct V8StaticNodeListHost {
     elements: Vec<Trusted<Element>>,
 }
 
-/// One live `ParentNode.children` collection.
+/// The traversal and filtering strategy for one live V8 `HTMLCollection`.
+#[cfg(feature = "v8-shadow")]
+enum V8HTMLCollectionKind {
+    Children,
+    DescendantsByClass(Vec<Atom>),
+}
+
+/// One live V8 `HTMLCollection` backed by a Servo DOM node.
 ///
 /// The owner node is the collection's only cross-heap root. Collection reads
-/// traverse its direct element children each time, so a wrapper retained by
-/// V8 observes subsequent Servo DOM mutations.
+/// traverse and filter the current tree each time, so a wrapper retained by V8
+/// observes subsequent Servo DOM mutations.
 #[cfg(feature = "v8-shadow")]
-struct V8ChildrenCollectionHost {
+struct V8HTMLCollectionHost {
     root: Trusted<Node>,
+    kind: V8HTMLCollectionKind,
+}
+
+#[cfg(feature = "v8-shadow")]
+impl V8HTMLCollectionHost {
+    fn elements(&self) -> Vec<DomRoot<Element>> {
+        let root = self.root.root();
+        match &self.kind {
+            V8HTMLCollectionKind::Children => root.child_elements().collect(),
+            V8HTMLCollectionKind::DescendantsByClass(classes) => {
+                if classes.is_empty() {
+                    return Vec::new();
+                }
+
+                root.traverse_preorder(ShadowIncluding::No)
+                    .skip(1)
+                    .filter_map(DomRoot::downcast::<Element>)
+                    .filter(|element| {
+                        let case_sensitivity = element
+                            .owner_document()
+                            .quirks_mode()
+                            .classes_and_ids_case_sensitivity();
+                        classes
+                            .iter()
+                            .all(|class| element.has_class(class, case_sensitivity))
+                    })
+                    .collect()
+            },
+        }
+    }
 }
 
 #[cfg(feature = "v8-shadow")]
 #[expect(unsafe_code)]
 // SAFETY: The host and its Trusted root stay on the originating script
-// thread. Every operation is a synchronous read of the owner's direct
-// children, and every returned item uses the installed V8ElementHost type.
-unsafe impl servo_v8::HTMLCollectionHostBinding for V8ChildrenCollectionHost {
+// thread. Every operation synchronously traverses the owner's current tree,
+// and every returned item uses the installed V8ElementHost type.
+unsafe impl servo_v8::HTMLCollectionHostBinding for V8HTMLCollectionHost {
     fn length(&self) -> u32 {
-        self.root
-            .root()
-            .child_elements()
-            .count()
-            .min(u32::MAX as usize) as u32
+        self.elements().len().min(u32::MAX as usize) as u32
     }
 
     fn item(&self, index: u32) -> Option<servo_v8::InterfaceHandle> {
-        let element = self
-            .root
-            .root()
-            .child_elements()
-            .nth(index as usize)?;
+        let element = self.elements().into_iter().nth(index as usize)?;
         Some(v8_element_interface_handle(&element))
     }
 
@@ -292,10 +325,12 @@ unsafe impl servo_v8::HTMLCollectionHostBinding for V8ChildrenCollectionHost {
         }
 
         let name = Atom::from(name);
-        let element = self.root.root().child_elements().find(|element| {
-            element.get_id().is_some_and(|id| id == name) ||
-                (element.namespace() == &ns!(html) &&
-                    element.get_name().is_some_and(|element_name| element_name == name))
+        let element = self.elements().into_iter().find(|element| {
+            element.get_id().is_some_and(|id| id == name)
+                || (element.namespace() == &ns!(html)
+                    && element
+                        .get_name()
+                        .is_some_and(|element_name| element_name == name))
         })?;
         Some(v8_element_interface_handle(&element))
     }
@@ -304,7 +339,7 @@ unsafe impl servo_v8::HTMLCollectionHostBinding for V8ChildrenCollectionHost {
         let mut result = Vec::new();
         let mut seen = HashSet::new();
 
-        for element in self.root.root().child_elements() {
+        for element in self.elements() {
             if let Some(id) = element.get_id() {
                 let id = id.to_string();
                 if !id.is_empty() && seen.insert(id.clone()) {
@@ -312,8 +347,8 @@ unsafe impl servo_v8::HTMLCollectionHostBinding for V8ChildrenCollectionHost {
                 }
             }
 
-            if element.namespace() == &ns!(html) &&
-                let Some(name) = element.get_name()
+            if element.namespace() == &ns!(html)
+                && let Some(name) = element.get_name()
             {
                 let name = name.to_string();
                 if !name.is_empty() && seen.insert(name.clone()) {
@@ -329,15 +364,33 @@ unsafe impl servo_v8::HTMLCollectionHostBinding for V8ChildrenCollectionHost {
 #[cfg(feature = "v8-shadow")]
 fn v8_children_collection_handle(root: &Node) -> servo_v8::HTMLCollectionHandle {
     // SAFETY: The cache key is the address of the owner Node rooted by the
-    // freshly boxed host. ScriptThread installs V8ChildrenCollectionHost as
+    // freshly boxed host. ScriptThread installs V8HTMLCollectionHost as
     // the runtime's sole HTMLCollection host type before creating any realm.
     unsafe {
         servo_v8::HTMLCollectionHandle::new(
             (root as *const Node).cast::<c_void>(),
-            V8ChildrenCollectionHost {
+            V8HTMLCollectionHost {
                 root: Trusted::new(root),
+                kind: V8HTMLCollectionKind::Children,
             },
         )
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
+fn v8_class_collection_handle(root: &Node, class_names: &str) -> servo_v8::HTMLCollectionHandle {
+    let classes = split_html_space_chars(class_names)
+        .map(Atom::from)
+        .collect();
+    // SAFETY: ScriptThread installs V8HTMLCollectionHost as the runtime's sole
+    // HTMLCollection host type before creating any realm. Each call receives a
+    // fresh wrapper identity while the host's Trusted root keeps its owner and
+    // current descendants reachable for live collection reads.
+    unsafe {
+        servo_v8::HTMLCollectionHandle::new_unique(V8HTMLCollectionHost {
+            root: Trusted::new(root),
+            kind: V8HTMLCollectionKind::DescendantsByClass(classes),
+        })
     }
 }
 
@@ -469,6 +522,11 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         let value = self.element.root().HasAttribute(cx, DOMString::from(name));
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
+    }
+
+    fn get_elements_by_class_name(&self, class_names: &str) -> servo_v8::HTMLCollectionHandle {
+        let element = self.element.root();
+        v8_class_collection_handle(element.upcast::<Node>(), class_names)
     }
 
     fn node_type(&self) -> u16 {
@@ -822,6 +880,11 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
 
     fn child_element_count(&self) -> u32 {
         self.document.root().ChildElementCount()
+    }
+
+    fn get_elements_by_class_name(&self, class_names: &str) -> servo_v8::HTMLCollectionHandle {
+        let document = self.document.root();
+        v8_class_collection_handle(document.upcast::<Node>(), class_names)
     }
 
     unsafe fn get_element_by_id(
@@ -2592,7 +2655,7 @@ impl ScriptThread {
                     panic!("V8 NodeList host installation failed: {error}");
                 }
                 if let Err(error) =
-                    runtime.install_html_collection_host::<V8ChildrenCollectionHost>()
+                    runtime.install_html_collection_host::<V8HTMLCollectionHost>()
                 {
                     panic!("V8 HTMLCollection host installation failed: {error}");
                 }

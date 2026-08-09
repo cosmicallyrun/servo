@@ -75,8 +75,10 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Node.nodeType`, `Document.documentElement`, `Document.head`, and
 `Document.children`, `Document.firstElementChild`, `Document.lastElementChild`,
 `Document.childElementCount`, `Document.getElementById`, and
-`Document.querySelector`, `Document.querySelectorAll`, plus
-`Element.children`, `Element.querySelectorAll`, `Element.closest`,
+`Document.querySelector`, `Document.querySelectorAll`, and
+`Document.getElementsByClassName`, plus
+`Element.children`, `Element.querySelectorAll`,
+`Element.getElementsByClassName`, `Element.closest`,
 `Element.matches`, and `Element.webkitMatchesSelector`, declarations in
 Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
@@ -143,7 +145,7 @@ the other Element-returning paths.
 
 `Document.querySelectorAll` and `Element.querySelectorAll` reuse that parser
 without constructing an unused SpiderMonkey `NodeList`. Servo first roots the
-matched `Element` vector as a static snapshot, then ABI v28 transfers one
+matched `Element` vector as a static snapshot, then ABI v27 transfers one
 fresh, uncached NodeList host to V8. The wrapper exposes `length`, `item`,
 enumerable indexed values, and Web IDL's realm-local Array iterator/forEach
 intrinsics. Its items still converge on the Element wrapper cache, while the
@@ -165,6 +167,16 @@ enumerability split. It intentionally has no NodeList iterator or `forEach`.
 Like the NodeList facade, it does not yet reproduce every
 `LegacyPlatformObject` edge case around `defineProperty`, deletion, or
 `preventExtensions`.
+
+ABI v29 adds `Document.getElementsByClassName` and
+`Element.getElementsByClassName`. Each call owns a fresh live collection host
+rooted at its Document or Element receiver. The host parses an ASCII-whitespace
+class set and walks current descendants in tree order on every callback; it
+excludes the Element receiver itself, requires every requested class, and uses
+the document's standards/quirks class-matching mode. These results share the
+existing `HTMLCollection` facade and Element wrapper cache, but not the
+`children` `[SameObject]` key: a unique per-call native-host key prevents one
+class filter from aliasing another or either from aliasing `children`.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -311,10 +323,14 @@ surface is deliberately limited to `window`, the `console` logging slice,
 string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
 `document.head`, the ParentNode `children`/first/last/count getters, and
-`document.getElementById()`. Elements returned through that
+`document.getElementById()`, `document.querySelector()`,
+`document.querySelectorAll()`, and `document.getElementsByClassName()`.
+Elements returned through that
 surface share a per-realm prototype implementing `localName`, `tagName`, `id`,
 `className`, `hasAttributes()`, `getAttribute()`, `hasAttribute()`, `children`,
-`firstElementChild`, `lastElementChild`, and `childElementCount`. That
+`firstElementChild`, `lastElementChild`, `childElementCount`, `querySelector()`,
+`querySelectorAll()`, `getElementsByClassName()`, `closest()`, `matches()`, and
+`webkitMatchesSelector()`. That
 prototype inherits from a shared Node prototype implementing `nodeType`,
 `nodeName`, `isConnected`, `textContent`, and `hasChildNodes()`.
 
@@ -414,6 +430,7 @@ The proof suite uses that same counting argument:
 | `authoritative_element_selector_methods_proof.html` | Element matching and closest operations preserve conversion, SyntaxError, and identity semantics |
 | `authoritative_query_selector_all_proof.html` | static rooted NodeLists survive real tree mutation and expose indexed/iterable WebIDL behavior |
 | `authoritative_children_collection_proof.html` | live SameObject HTMLCollections track tree/name mutation with indexed and named legacy properties |
+| `authoritative_get_elements_by_class_name_proof.html` | Document/Element class queries produce independently rooted live HTMLCollections with correct scope, conversion, identity, and mutation behavior |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -437,7 +454,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 27 and remains experimental. The original
+The current exported C ABI is version 29 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume
