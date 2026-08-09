@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 25;
+const ABI_VERSION: u32 = 26;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -183,13 +183,23 @@ impl InterfaceHandle {
     }
 }
 
-/// The complete native result space for ParentNode.querySelector.
+/// The complete native result space for a selector operation returning Element?.
 ///
 /// Servo's scope-match algorithm reports selector parse failure as a
 /// `SyntaxError` DOMException. Keeping that as a typed status prevents a
 /// SpiderMonkey exception object or pending exception from crossing into V8.
-pub enum QuerySelectorResult {
+pub enum SelectorElementResult {
     Match(Option<InterfaceHandle>),
+    SyntaxError,
+    HostFailure,
+}
+
+/// The complete native result space for a selector operation returning boolean.
+///
+/// Syntax failures remain typed data until V8 creates the realm-local
+/// `DOMException`; internal host failures become a V8 `TypeError`.
+pub enum SelectorBooleanResult {
+    Match(bool),
     SyntaxError,
     HostFailure,
 }
@@ -229,7 +239,14 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
         &self,
         host_context: *mut c_void,
         selectors: &str,
-    ) -> QuerySelectorResult;
+    ) -> SelectorElementResult;
+    unsafe fn closest(&self, host_context: *mut c_void, selectors: &str) -> SelectorElementResult;
+    unsafe fn matches(&self, host_context: *mut c_void, selectors: &str) -> SelectorBooleanResult;
+    unsafe fn webkit_matches_selector(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> SelectorBooleanResult;
 }
 
 #[repr(C)]
@@ -277,7 +294,34 @@ pub struct ElementHostVTable {
             *mut c_void,
             *const u8,
             usize,
-            *mut RawQuerySelectorOutcome,
+            *mut RawSelectorElementOutcome,
+        ) -> u8,
+    >,
+    pub closest: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut RawSelectorElementOutcome,
+        ) -> u8,
+    >,
+    pub matches: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut RawSelectorBooleanOutcome,
+        ) -> u8,
+    >,
+    pub webkit_matches_selector: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut RawSelectorBooleanOutcome,
         ) -> u8,
     >,
     pub drop: Option<DropCallback>,
@@ -588,11 +632,11 @@ unsafe fn element_host_write_interface_value(
     1
 }
 
-fn raw_query_selector_outcome(result: QuerySelectorResult) -> RawQuerySelectorOutcome {
+fn raw_selector_element_outcome(result: SelectorElementResult) -> RawSelectorElementOutcome {
     let (status, handle) = match result {
-        QuerySelectorResult::Match(handle) => (QUERY_SELECTOR_RETURNED, handle),
-        QuerySelectorResult::SyntaxError => (QUERY_SELECTOR_SYNTAX_ERROR, None),
-        QuerySelectorResult::HostFailure => (QUERY_SELECTOR_HOST_FAILURE, None),
+        SelectorElementResult::Match(handle) => (SELECTOR_RETURNED, handle),
+        SelectorElementResult::SyntaxError => (SELECTOR_SYNTAX_ERROR, None),
+        SelectorElementResult::HostFailure => (SELECTOR_HOST_FAILURE, None),
     };
     let value = match handle {
         Some(handle) => RawInterfaceValue {
@@ -606,7 +650,24 @@ fn raw_query_selector_outcome(result: QuerySelectorResult) -> RawQuerySelectorOu
             native: std::ptr::null_mut(),
         },
     };
-    RawQuerySelectorOutcome { status, value }
+    RawSelectorElementOutcome { status, value }
+}
+
+fn raw_selector_boolean_outcome(result: SelectorBooleanResult) -> RawSelectorBooleanOutcome {
+    match result {
+        SelectorBooleanResult::Match(value) => RawSelectorBooleanOutcome {
+            status: SELECTOR_RETURNED,
+            value: u8::from(value),
+        },
+        SelectorBooleanResult::SyntaxError => RawSelectorBooleanOutcome {
+            status: SELECTOR_SYNTAX_ERROR,
+            value: 0,
+        },
+        SelectorBooleanResult::HostFailure => RawSelectorBooleanOutcome {
+            status: SELECTOR_HOST_FAILURE,
+            value: 0,
+        },
+    }
 }
 
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
@@ -822,7 +883,7 @@ unsafe extern "C" fn element_host_query_selector<T: ElementHostBinding>(
     host_context: *mut c_void,
     selectors: *const u8,
     selectors_length: usize,
-    output: *mut RawQuerySelectorOutcome,
+    output: *mut RawSelectorElementOutcome,
 ) -> u8 {
     if native.is_null()
         || host_context.is_null()
@@ -838,8 +899,111 @@ unsafe extern "C" fn element_host_query_selector<T: ElementHostBinding>(
     // SAFETY: The vtable contract supplies this exact host and live context.
     let result = unsafe { (&*native.cast::<T>()).query_selector(host_context, selectors) };
     // SAFETY: output is non-null and points to caller-owned writable storage.
-    unsafe { *output = raw_query_selector_outcome(result) };
+    unsafe { *output = raw_selector_element_outcome(result) };
     1
+}
+
+unsafe extern "C" fn element_host_closest<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    selectors: *const u8,
+    selectors_length: usize,
+    output: *mut RawSelectorElementOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || output.is_null()
+        || (selectors.is_null() && selectors_length != 0)
+    {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(selectors) = (unsafe { element_host_utf8(selectors, selectors_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).closest(host_context, selectors) };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = raw_selector_element_outcome(result) };
+    1
+}
+
+unsafe extern "C" fn element_host_matches<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    selectors: *const u8,
+    selectors_length: usize,
+    output: *mut RawSelectorBooleanOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || output.is_null()
+        || (selectors.is_null() && selectors_length != 0)
+    {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(selectors) = (unsafe { element_host_utf8(selectors, selectors_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).matches(host_context, selectors) };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = raw_selector_boolean_outcome(result) };
+    1
+}
+
+unsafe extern "C" fn element_host_webkit_matches_selector<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    selectors: *const u8,
+    selectors_length: usize,
+    output: *mut RawSelectorBooleanOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || output.is_null()
+        || (selectors.is_null() && selectors_length != 0)
+    {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(selectors) = (unsafe { element_host_utf8(selectors, selectors_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result = unsafe { (&*native.cast::<T>()).webkit_matches_selector(host_context, selectors) };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = raw_selector_boolean_outcome(result) };
+    1
+}
+
+fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
+    ElementHostVTable {
+        get_local_name: Some(element_host_get_local_name::<T>),
+        get_tag_name: Some(element_host_get_tag_name::<T>),
+        get_id: Some(element_host_get_id::<T>),
+        set_id: Some(element_host_set_id::<T>),
+        get_class_name: Some(element_host_get_class_name::<T>),
+        set_class_name: Some(element_host_set_class_name::<T>),
+        has_attributes: Some(element_host_has_attributes::<T>),
+        get_attribute: Some(element_host_get_attribute::<T>),
+        has_attribute: Some(element_host_has_attribute::<T>),
+        get_node_type: Some(element_host_get_node_type::<T>),
+        get_node_name: Some(element_host_get_node_name::<T>),
+        get_is_connected: Some(element_host_get_is_connected::<T>),
+        get_text_content: Some(element_host_get_text_content::<T>),
+        set_text_content: Some(element_host_set_text_content::<T>),
+        has_child_nodes: Some(element_host_has_child_nodes::<T>),
+        get_first_element_child: Some(element_host_get_first_element_child::<T>),
+        get_last_element_child: Some(element_host_get_last_element_child::<T>),
+        get_child_element_count: Some(element_host_get_child_element_count::<T>),
+        query_selector: Some(element_host_query_selector::<T>),
+        closest: Some(element_host_closest::<T>),
+        matches: Some(element_host_matches::<T>),
+        webkit_matches_selector: Some(element_host_webkit_matches_selector::<T>),
+        drop: Some(element_host_drop::<T>),
+    }
 }
 
 unsafe extern "C" fn element_host_drop<T: ElementHostBinding>(native: *mut c_void) {
@@ -1462,28 +1626,7 @@ impl Runtime {
     /// The vtable is type-level; the hosts it describes are per DOM object and
     /// are handed over one at a time by an interface-typed getter.
     pub fn install_element_host<T: ElementHostBinding>(&mut self) -> Result<(), Error> {
-        let vtable = ElementHostVTable {
-            get_local_name: Some(element_host_get_local_name::<T>),
-            get_tag_name: Some(element_host_get_tag_name::<T>),
-            get_id: Some(element_host_get_id::<T>),
-            set_id: Some(element_host_set_id::<T>),
-            get_class_name: Some(element_host_get_class_name::<T>),
-            set_class_name: Some(element_host_set_class_name::<T>),
-            has_attributes: Some(element_host_has_attributes::<T>),
-            get_attribute: Some(element_host_get_attribute::<T>),
-            has_attribute: Some(element_host_has_attribute::<T>),
-            get_node_type: Some(element_host_get_node_type::<T>),
-            get_node_name: Some(element_host_get_node_name::<T>),
-            get_is_connected: Some(element_host_get_is_connected::<T>),
-            get_text_content: Some(element_host_get_text_content::<T>),
-            set_text_content: Some(element_host_set_text_content::<T>),
-            has_child_nodes: Some(element_host_has_child_nodes::<T>),
-            get_first_element_child: Some(element_host_get_first_element_child::<T>),
-            get_last_element_child: Some(element_host_get_last_element_child::<T>),
-            get_child_element_count: Some(element_host_get_child_element_count::<T>),
-            query_selector: Some(element_host_query_selector::<T>),
-            drop: Some(element_host_drop::<T>),
-        };
+        let vtable = element_host_vtable::<T>();
         let mut storage = [0; ERROR_CAPACITY];
         let mut error = error_buffer(&mut storage);
         // SAFETY: The runtime is live and both the vtable and error buffer
@@ -2079,6 +2222,7 @@ mod tests {
     struct ElementHostProbe {
         local_name: String,
         tag_name: String,
+        identity: *const c_void,
         state: Rc<ElementProbeState>,
         // Child probes own their stand-in DOM identity through the host. The
         // top-level identities remain owned by DocumentHostProbe instead.
@@ -2219,10 +2363,10 @@ mod tests {
             &self,
             host_context: *mut c_void,
             selectors: &str,
-        ) -> QuerySelectorResult {
+        ) -> SelectorElementResult {
             assert!(!host_context.is_null());
             if selectors == "[" || selectors.is_empty() {
-                return QuerySelectorResult::SyntaxError;
+                return SelectorElementResult::SyntaxError;
             }
             let children = self.state.element_children.borrow();
             let index = children.iter().position(|child| {
@@ -2232,11 +2376,81 @@ mod tests {
                         .is_some_and(|id| child.state.get("id").as_deref() == Some(id))
             });
             drop(children);
-            QuerySelectorResult::Match(index.and_then(|index| self.element_child(index)))
+            SelectorElementResult::Match(index.and_then(|index| self.element_child(index)))
+        }
+
+        unsafe fn closest(
+            &self,
+            host_context: *mut c_void,
+            selectors: &str,
+        ) -> SelectorElementResult {
+            assert!(!host_context.is_null());
+            match self.selector_matches(selectors) {
+                Err(()) => SelectorElementResult::SyntaxError,
+                Ok(true) => SelectorElementResult::Match(Some(self.interface_handle())),
+                Ok(false) => SelectorElementResult::Match(None),
+            }
+        }
+
+        unsafe fn matches(
+            &self,
+            host_context: *mut c_void,
+            selectors: &str,
+        ) -> SelectorBooleanResult {
+            assert!(!host_context.is_null());
+            match self.selector_matches(selectors) {
+                Ok(value) => SelectorBooleanResult::Match(value),
+                Err(()) => SelectorBooleanResult::SyntaxError,
+            }
+        }
+
+        unsafe fn webkit_matches_selector(
+            &self,
+            host_context: *mut c_void,
+            selectors: &str,
+        ) -> SelectorBooleanResult {
+            // SAFETY: This historical alias has the exact same WebIDL and
+            // host-context contract as matches().
+            unsafe { self.matches(host_context, selectors) }
         }
     }
 
     impl ElementHostProbe {
+        fn selector_matches(&self, selectors: &str) -> Result<bool, ()> {
+            if selectors == "[" || selectors.is_empty() {
+                return Err(());
+            }
+            Ok(selectors.eq_ignore_ascii_case(&self.local_name)
+                || selectors.eq_ignore_ascii_case(&self.tag_name)
+                || selectors
+                    .strip_prefix('#')
+                    .is_some_and(|id| self.state.get("id").as_deref() == Some(id))
+                || selectors.strip_prefix('.').is_some_and(|class| {
+                    self.state
+                        .get("class")
+                        .is_some_and(|classes| classes.split_ascii_whitespace().any(|c| c == class))
+                }))
+        }
+
+        fn interface_handle(&self) -> InterfaceHandle {
+            // SAFETY: identity names the same stand-in DOM allocation rooted
+            // by this cloned probe host for the lifetime of the wrapper.
+            unsafe {
+                InterfaceHandle::new(
+                    self.identity,
+                    ElementHostProbe {
+                        local_name: self.local_name.clone(),
+                        tag_name: self.tag_name.clone(),
+                        identity: self.identity,
+                        state: Rc::clone(&self.state),
+                        _owned_identity: self._owned_identity.clone(),
+                        drops: Rc::clone(&self.drops),
+                        drop_reentry: self.drop_reentry.clone(),
+                    },
+                )
+            }
+        }
+
         fn element_child(&self, index: usize) -> Option<InterfaceHandle> {
             let child = self.state.element_children.borrow().get(index)?.clone();
             // SAFETY: The returned host owns the Rc allocation used as its key
@@ -2247,6 +2461,7 @@ mod tests {
                     ElementHostProbe {
                         local_name: child.local_name,
                         tag_name: child.tag_name,
+                        identity: Rc::as_ptr(&child.identity).cast::<c_void>(),
                         state: child.state,
                         _owned_identity: Some(child.identity),
                         drops: Rc::clone(&self.drops),
@@ -2555,6 +2770,7 @@ mod tests {
                     ElementHostProbe {
                         local_name: "html".to_owned(),
                         tag_name: "HTML".to_owned(),
+                        identity: (&*self.element_identity as *const u8).cast(),
                         state: Rc::clone(&self.element_state),
                         _owned_identity: None,
                         drops: Rc::clone(&self.element_drops),
@@ -2576,6 +2792,7 @@ mod tests {
                     ElementHostProbe {
                         local_name: "head".to_owned(),
                         tag_name: "HEAD".to_owned(),
+                        identity: (&*self.head_identity as *const u8).cast(),
                         state: Rc::clone(&self.head_state),
                         _owned_identity: None,
                         drops: Rc::clone(&self.element_drops),
@@ -2617,6 +2834,7 @@ mod tests {
                     ElementHostProbe {
                         local_name: "div".to_owned(),
                         tag_name: "DIV".to_owned(),
+                        identity: (&*self.id_element_identity as *const u8).cast(),
                         state: Rc::clone(&self.id_element_state),
                         _owned_identity: None,
                         drops: Rc::clone(&self.element_drops),
@@ -2630,18 +2848,18 @@ mod tests {
             &self,
             host_context: *mut c_void,
             selectors: &str,
-        ) -> QuerySelectorResult {
+        ) -> SelectorElementResult {
             assert!(!host_context.is_null());
             match selectors {
-                "[" | "" => QuerySelectorResult::SyntaxError,
-                "#target" | "div" => QuerySelectorResult::Match(
+                "[" | "" => SelectorElementResult::SyntaxError,
+                "#target" | "div" => SelectorElementResult::Match(
                     // SAFETY: The probe's host context and identity remain
                     // live for the synchronous call.
                     unsafe { self.get_element_by_id(host_context, "target") },
                 ),
-                "html" => QuerySelectorResult::Match(self.document_element()),
-                "head" => QuerySelectorResult::Match(self.head()),
-                _ => QuerySelectorResult::Match(None),
+                "html" => SelectorElementResult::Match(self.document_element()),
+                "head" => SelectorElementResult::Match(self.head()),
+                _ => SelectorElementResult::Match(None),
             }
         }
 
@@ -2665,7 +2883,7 @@ mod tests {
         host_context: *mut c_void,
         selectors: *const u8,
         selectors_length: usize,
-        output: *mut RawQuerySelectorOutcome,
+        output: *mut RawSelectorElementOutcome,
     ) -> u8 {
         if native.is_null()
             || host_context.is_null()
@@ -2707,46 +2925,100 @@ mod tests {
             native: std::ptr::null_mut(),
         };
         let outcome = match selectors {
-            "host-failure" => raw_query_selector_outcome(QuerySelectorResult::HostFailure),
-            "invalid-status" => RawQuerySelectorOutcome {
+            "host-failure" => raw_selector_element_outcome(SelectorElementResult::HostFailure),
+            "invalid-status" => RawSelectorElementOutcome {
                 status: u32::MAX,
                 value: target_value(),
             },
-            "syntax-with-value" => RawQuerySelectorOutcome {
-                status: QUERY_SELECTOR_SYNTAX_ERROR,
+            "syntax-with-value" => RawSelectorElementOutcome {
+                status: SELECTOR_SYNTAX_ERROR,
                 value: target_value(),
             },
             "null-with-value" => {
                 let mut value = target_value();
                 value.is_null = 1;
-                RawQuerySelectorOutcome {
-                    status: QUERY_SELECTOR_RETURNED,
+                RawSelectorElementOutcome {
+                    status: SELECTOR_RETURNED,
                     value,
                 }
             },
             "native-without-key" => {
                 let mut value = target_value();
                 value.key = std::ptr::null();
-                RawQuerySelectorOutcome {
-                    status: QUERY_SELECTOR_RETURNED,
+                RawSelectorElementOutcome {
+                    status: SELECTOR_RETURNED,
                     value,
                 }
             },
-            "key-without-native" => RawQuerySelectorOutcome {
-                status: QUERY_SELECTOR_RETURNED,
+            "key-without-native" => RawSelectorElementOutcome {
+                status: SELECTOR_RETURNED,
                 value: RawInterfaceValue {
                     is_null: 0,
                     key: (&*host.id_element_identity as *const u8).cast(),
                     native: std::ptr::null_mut(),
                 },
             },
-            "valid" => RawQuerySelectorOutcome {
-                status: QUERY_SELECTOR_RETURNED,
+            "valid" => RawSelectorElementOutcome {
+                status: SELECTOR_RETURNED,
                 value: target_value(),
             },
-            _ => RawQuerySelectorOutcome {
-                status: QUERY_SELECTOR_RETURNED,
+            _ => RawSelectorElementOutcome {
+                status: SELECTOR_RETURNED,
                 value: null_value(),
+            },
+        };
+        // SAFETY: output is non-null and writable for this callback.
+        unsafe { *output = outcome };
+        1
+    }
+
+    unsafe extern "C" fn adversarial_element_matches(
+        native: *mut c_void,
+        host_context: *mut c_void,
+        selectors: *const u8,
+        selectors_length: usize,
+        output: *mut RawSelectorBooleanOutcome,
+    ) -> u8 {
+        if native.is_null()
+            || host_context.is_null()
+            || output.is_null()
+            || (selectors.is_null() && selectors_length != 0)
+        {
+            return 0;
+        }
+        let bytes = if selectors_length == 0 {
+            &[]
+        } else {
+            // SAFETY: The ABI lends this byte range for the synchronous call.
+            unsafe { std::slice::from_raw_parts(selectors, selectors_length) }
+        };
+        let Ok(selectors) = std::str::from_utf8(bytes) else {
+            return 0;
+        };
+        if selectors == "callback-failure" {
+            return 0;
+        }
+        let outcome = match selectors {
+            "host-failure" => raw_selector_boolean_outcome(SelectorBooleanResult::HostFailure),
+            "invalid-status" => RawSelectorBooleanOutcome {
+                status: u32::MAX,
+                value: 0,
+            },
+            "invalid-value" => RawSelectorBooleanOutcome {
+                status: SELECTOR_RETURNED,
+                value: 2,
+            },
+            "syntax-with-value" => RawSelectorBooleanOutcome {
+                status: SELECTOR_SYNTAX_ERROR,
+                value: 1,
+            },
+            _ => {
+                // SAFETY: The custom vtable is installed with this exact host
+                // type and the context remains live for the callback.
+                let result = unsafe {
+                    (&*native.cast::<ElementHostProbe>()).matches(host_context, selectors)
+                };
+                raw_selector_boolean_outcome(result)
             },
         };
         // SAFETY: output is non-null and writable for this callback.
@@ -3754,6 +4026,9 @@ mod tests {
                target.queryMarker = 47;\n\
                const elementDescriptor = Object.getOwnPropertyDescriptor(\n\
                  Object.getPrototypeOf(target), 'querySelector');\n\
+               const selectorDescriptors = ['closest', 'matches', 'webkitMatchesSelector']\n\
+                 .map(name => [name, Object.getOwnPropertyDescriptor(\n\
+                   Object.getPrototypeOf(target), name)]);\n\
                globalThis.elementQueryWrongBrandStringified = false;\n\
                let elementWrongBrand = false;\n\
                try { elementDescriptor.value.call({}, { toString() {\n\
@@ -3768,11 +4043,31 @@ mod tests {
                let elementMissing = false;\n\
                try { target.querySelector(); }\n\
                catch (error) { elementMissing = error instanceof TypeError; }\n\
+               globalThis.selectorWrongBrandStringified = false;\n\
+               const selectorWrongBrand = selectorDescriptors.every(([, descriptor]) => {\n\
+                 try { descriptor.value.call({}, { toString() {\n\
+                   selectorWrongBrandStringified = true; return '#target';\n\
+                 }}); return false; }\n\
+                 catch (error) { return error instanceof TypeError; }\n\
+               });\n\
+               const selectorMissing = selectorDescriptors.every(([, descriptor]) => {\n\
+                 try { descriptor.value.call(target); return false; }\n\
+                 catch (error) { return error instanceof TypeError; }\n\
+               });\n\
+               let matchesConversion = false;\n\
+               try { target.matches({ toString() { throw conversionError; }}); }\n\
+               catch (error) { matchesConversion = error === conversionError; }\n\
+               let closestSymbol = false;\n\
+               try { target.closest(Symbol('target')); }\n\
+               catch (error) { closestSymbol = error instanceof TypeError; }\n\
                const syntaxChecks = [];\n\
                for (const callback of [\n\
                  () => document.querySelector('['),\n\
                  () => document.querySelector(''),\n\
                  () => target.querySelector('['),\n\
+                 () => target.closest('['),\n\
+                 () => target.matches('['),\n\
+                 () => target.webkitMatchesSelector('['),\n\
                ]) {\n\
                  try { callback(); syntaxChecks.push(false); }\n\
                  catch (error) {\n\
@@ -3811,12 +4106,17 @@ mod tests {
                  elementDescriptor && elementDescriptor.value.name === 'querySelector' &&\n\
                  elementDescriptor.value.length === 1 && elementDescriptor.writable &&\n\
                  elementDescriptor.enumerable && elementDescriptor.configurable &&\n\
+                 selectorDescriptors.every(([name, descriptor]) => descriptor &&\n\
+                   descriptor.value.name === name && descriptor.value.length === 1 &&\n\
+                   descriptor.writable && descriptor.enumerable && descriptor.configurable) &&\n\
                  !Object.hasOwn(document, 'querySelector') &&\n\
                  !Object.hasOwn(target, 'querySelector') && documentWrongBrand &&\n\
                  !documentQueryWrongBrandStringified && documentConversion &&\n\
                  documentSymbol && documentMissing && elementWrongBrand &&\n\
                  !elementQueryWrongBrandStringified && elementConversion &&\n\
-                 elementSymbol && elementMissing && syntaxChecks.every(Boolean) &&\n\
+                 elementSymbol && elementMissing && selectorWrongBrand &&\n\
+                 !selectorWrongBrandStringified && selectorMissing &&\n\
+                 matchesConversion && closestSymbol && syntaxChecks.every(Boolean) &&\n\
                  document.querySelector('#target') === target &&\n\
                  document.getElementById('target') === target && target.queryMarker === 47 &&\n\
                  document.querySelector('missing') === null &&\n\
@@ -3825,6 +4125,10 @@ mod tests {
                  target.querySelector('span') === target.firstElementChild &&\n\
                  target.querySelector('#last-child') === target.lastElementChild &&\n\
                  target.querySelector('missing') === null &&\n\
+                 target.closest('#target') === target && target.closest('missing') === null &&\n\
+                 target.matches('#target') && target.matches('div') &&\n\
+                 !target.matches('span') && target.webkitMatchesSelector('.alpha') &&\n\
+                 !target.webkitMatchesSelector('.missing') &&\n\
                  typeof DOMException === 'function' && DOMException.name === 'DOMException' &&\n\
                  DOMException.length === 0 && DOMException.prototype.constructor === DOMException &&\n\
                  Object.getPrototypeOf(DOMException.prototype) === Error.prototype &&\n\
@@ -4617,7 +4921,7 @@ mod tests {
             );
             assert_eq!(output.is_null, 1);
 
-            let mut query_output = RawQuerySelectorOutcome {
+            let mut query_output = RawSelectorElementOutcome {
                 status: u32::MAX,
                 value: RawInterfaceValue {
                     is_null: 0,
@@ -4670,18 +4974,228 @@ mod tests {
                 ),
                 1,
             );
-            assert_eq!(query_output.status, QUERY_SELECTOR_RETURNED);
+            assert_eq!(query_output.status, SELECTOR_RETURNED);
             assert_eq!(query_output.value.is_null, 1);
             assert_eq!(
                 query_callback(native, host_context, std::ptr::null(), 0, &mut query_output,),
                 1,
             );
-            assert_eq!(query_output.status, QUERY_SELECTOR_SYNTAX_ERROR);
+            assert_eq!(query_output.status, SELECTOR_SYNTAX_ERROR);
             assert_eq!(query_output.value.is_null, 1);
             vtable.drop.unwrap()(native);
         }
         assert_eq!(&*calls.borrow(), &[""]);
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn element_selector_operation_thunks_validate_abi_inputs() {
+        let element_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        let mut host_context_token = 0_u8;
+        let host_context = (&mut host_context_token as *mut u8).cast::<c_void>();
+        // SAFETY: document and the stand-in Element identity remain live for
+        // this entire synchronous thunk probe.
+        let handle = unsafe { document.get_element_by_id(host_context, "target") }.unwrap();
+        let native = handle.native;
+        let closest = element_host_closest::<ElementHostProbe>;
+        let matches = element_host_matches::<ElementHostProbe>;
+        let webkit_matches = element_host_webkit_matches_selector::<ElementHostProbe>;
+        let invalid_utf8 = [0xff];
+        let mut element_output = RawSelectorElementOutcome {
+            status: u32::MAX,
+            value: RawInterfaceValue {
+                is_null: 0,
+                key: std::ptr::null(),
+                native: std::ptr::null_mut(),
+            },
+        };
+        let mut boolean_output = RawSelectorBooleanOutcome {
+            status: u32::MAX,
+            value: u8::MAX,
+        };
+
+        // SAFETY: Each invalid pointer combination is intentional and every
+        // valid byte range and output remains live for the call.
+        unsafe {
+            assert_eq!(
+                closest(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut element_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                closest(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut element_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                matches(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    1,
+                    &mut boolean_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                webkit_matches(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                0,
+            );
+
+            let self_selector = b"#target";
+            assert_eq!(
+                closest(
+                    native,
+                    host_context,
+                    self_selector.as_ptr(),
+                    self_selector.len(),
+                    &mut element_output,
+                ),
+                1,
+            );
+            assert_eq!(element_output.status, SELECTOR_RETURNED);
+            assert_eq!(element_output.value.is_null, 0);
+            assert_eq!(element_output.value.key, handle.key);
+            assert!(!element_output.value.native.is_null());
+            element_host_drop::<ElementHostProbe>(element_output.value.native);
+
+            assert_eq!(
+                matches(
+                    native,
+                    host_context,
+                    self_selector.as_ptr(),
+                    self_selector.len(),
+                    &mut boolean_output,
+                ),
+                1,
+            );
+            assert_eq!(boolean_output.status, SELECTOR_RETURNED);
+            assert_eq!(boolean_output.value, 1);
+
+            let miss = b"span";
+            assert_eq!(
+                webkit_matches(
+                    native,
+                    host_context,
+                    miss.as_ptr(),
+                    miss.len(),
+                    &mut boolean_output,
+                ),
+                1,
+            );
+            assert_eq!(boolean_output.status, SELECTOR_RETURNED);
+            assert_eq!(boolean_output.value, 0);
+
+            let syntax = b"[";
+            assert_eq!(
+                matches(
+                    native,
+                    host_context,
+                    syntax.as_ptr(),
+                    syntax.len(),
+                    &mut boolean_output,
+                ),
+                1,
+            );
+            assert_eq!(boolean_output.status, SELECTOR_SYNTAX_ERROR);
+            assert_eq!(boolean_output.value, 0);
+            element_host_drop::<ElementHostProbe>(native);
+        }
+        assert_eq!(element_drops.get(), 2);
+    }
+
+    #[test]
+    fn selector_boolean_outcomes_reject_host_failures_and_malformed_values() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let mut vtable = element_host_vtable::<ElementHostProbe>();
+        vtable.matches = Some(adversarial_element_matches);
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The complete vtable contains callbacks for one exact host
+        // type and C++ copies it synchronously.
+        let installed =
+            unsafe { servo_v8_install_element_host(runtime.raw.as_ptr(), &vtable, &mut error) };
+        assert_eq!(
+            installed,
+            1,
+            "custom Element vtable install failed: {:?}",
+            error_from(&storage, &error)
+        );
+
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let element_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               const target = document.getElementById('target');\n\
+               const rejected = [\n\
+                 'host-failure', 'invalid-status', 'invalid-value',\n\
+                 'syntax-with-value', 'callback-failure'\n\
+               ].every(selector => {\n\
+                 try { target.matches(selector); return false; }\n\
+                 catch (error) { return error instanceof TypeError; }\n\
+               });\n\
+               globalThis.selectorBooleanOutcomeProof =\n\
+                 rejected && target.matches('#target') && !target.matches('span');\n\
+             })();",
+            "selector-boolean-adversarial.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token remains live for this synchronous probe.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "selectorBooleanOutcomeProof")
+                .unwrap()
+        );
+        assert_eq!(element_drops.get(), 0);
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(element_drops.get(), 1);
+        assert_eq!(document_drops.get(), 1);
     }
 
     #[test]

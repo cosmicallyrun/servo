@@ -242,6 +242,22 @@ class ProductionElementTests(unittest.TestCase):
         child_count = members[production_webidl.ELEMENT_CHILD_ELEMENT_COUNT]
         self.assertTrue(child_count.readonly)
         self.assertEqual(child_count.type.prettyName(), "unsigned long")
+        closest_return, closest_arguments = members[
+            production_webidl.ELEMENT_CLOSEST
+        ].signatures()[0]
+        self.assertTrue(closest_return.nullable())
+        self.assertEqual(closest_return.inner.name, "Element")
+        self.assertEqual(closest_arguments[0].identifier.name, "selectors")
+        for qualified_name in (
+            production_webidl.ELEMENT_MATCHES,
+            production_webidl.ELEMENT_WEBKIT_MATCHES_SELECTOR,
+        ):
+            with self.subTest(member=qualified_name):
+                method = members[qualified_name]
+                return_type, arguments = method.signatures()[0]
+                self.assertTrue(return_type.isBoolean())
+                self.assertEqual(arguments[0].identifier.name, "selectors")
+                self.assertEqual(set(method._extendedAttrDict), {"Pure", "Throws"})
 
 
 class ProductionNodeTests(unittest.TestCase):
@@ -730,6 +746,67 @@ class SyntheticSelectionTests(unittest.TestCase):
         self.assert_query_selector_rejected(
             "[Pure, Throws] Element? querySelector(optional DOMString selectors);",
             "`Document.querySelector` argument `selectors` must be required and non-variadic",
+        )
+
+    def assert_boolean_selector_rejected(
+        self, declaration: str, member_name: str, expected: str
+    ) -> None:
+        qualified_name = f"Element.{member_name}"
+        parser_results = self.parse(
+            {
+                "Element.webidl": f"interface Element {{ {declaration} }};",
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_pure_throws_domstring_to_boolean_operation(
+                parser_results,
+                qualified_name,
+            )
+
+    def test_selects_exact_boolean_selector_operations(self) -> None:
+        parser_results = self.parse(
+            {
+                "Element.webidl": """
+                    interface Element {
+                      [Pure, Throws] boolean matches(DOMString selectors);
+                      [Pure, Throws] boolean webkitMatchesSelector(DOMString selectors);
+                    };
+                """,
+            }
+        )
+        for qualified_name in (
+            production_webidl.ELEMENT_MATCHES,
+            production_webidl.ELEMENT_WEBKIT_MATCHES_SELECTOR,
+        ):
+            with self.subTest(member=qualified_name):
+                method = production_webidl.select_pure_throws_domstring_to_boolean_operation(
+                    parser_results,
+                    qualified_name,
+                )
+                self.assertEqual(set(method._extendedAttrDict), {"Pure", "Throws"})
+
+    def test_rejects_boolean_selector_without_throws(self) -> None:
+        self.assert_boolean_selector_rejected(
+            "[Pure] boolean matches(DOMString selectors);",
+            "matches",
+            "`Element.matches` must carry exactly ['Pure', 'Throws'], got ['Pure']",
+        )
+
+    def test_rejects_boolean_selector_return_drift(self) -> None:
+        self.assert_boolean_selector_rejected(
+            "[Pure, Throws] Element? matches(DOMString selectors);",
+            "matches",
+            "`Element.matches` must return non-nullable `boolean`, got `Element?`",
+        )
+
+    def test_rejects_boolean_selector_argument_drift(self) -> None:
+        self.assert_boolean_selector_rejected(
+            "[Pure, Throws] boolean matches(optional DOMString selectors);",
+            "matches",
+            "`Element.matches` argument `selectors` must be required and non-variadic",
         )
 
     def test_rejects_changed_ready_state_enum_values(self) -> None:

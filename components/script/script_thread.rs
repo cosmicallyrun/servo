@@ -410,9 +410,9 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         &self,
         host_context: *mut c_void,
         selectors: &str,
-    ) -> servo_v8::QuerySelectorResult {
+    ) -> servo_v8::SelectorElementResult {
         if host_context.is_null() {
-            return servo_v8::QuerySelectorResult::HostFailure;
+            return servo_v8::SelectorElementResult::HostFailure;
         }
         // SAFETY: The authoritative entry lends its live owner-thread context
         // only for this synchronous call.
@@ -426,16 +426,91 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // page execution. Surface an internal V8-side failure and clear it.
         if unsafe { JS_IsExceptionPending(cx) } {
             unsafe { JS_ClearPendingException(cx) };
-            return servo_v8::QuerySelectorResult::HostFailure;
+            return servo_v8::SelectorElementResult::HostFailure;
         }
         match result {
-            Ok(element) => servo_v8::QuerySelectorResult::Match(
+            Ok(element) => servo_v8::SelectorElementResult::Match(
                 element.as_deref().map(v8_element_interface_handle),
             ),
             // Scope-match's only error branch is selector parse failure. Keep
             // it as POD so V8, not SpiderMonkey, owns the thrown exception.
-            Err(Error::Syntax(_)) => servo_v8::QuerySelectorResult::SyntaxError,
-            Err(_) => servo_v8::QuerySelectorResult::HostFailure,
+            Err(Error::Syntax(_)) => servo_v8::SelectorElementResult::SyntaxError,
+            Err(_) => servo_v8::SelectorElementResult::HostFailure,
+        }
+    }
+
+    unsafe fn closest(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> servo_v8::SelectorElementResult {
+        if host_context.is_null() {
+            return servo_v8::SelectorElementResult::HostFailure;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context
+        // only for this synchronous selector call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let result = self.element.root().Closest(DOMString::from(selectors));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::SelectorElementResult::HostFailure;
+        }
+        match result {
+            Ok(element) => servo_v8::SelectorElementResult::Match(
+                element.as_deref().map(v8_element_interface_handle),
+            ),
+            Err(Error::Syntax(_)) => servo_v8::SelectorElementResult::SyntaxError,
+            Err(_) => servo_v8::SelectorElementResult::HostFailure,
+        }
+    }
+
+    unsafe fn matches(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> servo_v8::SelectorBooleanResult {
+        if host_context.is_null() {
+            return servo_v8::SelectorBooleanResult::HostFailure;
+        }
+        // SAFETY: The pointer is the live owner-thread SpiderMonkey context
+        // lent for this synchronous call and is used only to audit exception
+        // state after Servo's production selector parser returns.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let result = self.element.root().Matches(DOMString::from(selectors));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::SelectorBooleanResult::HostFailure;
+        }
+        match result {
+            Ok(value) => servo_v8::SelectorBooleanResult::Match(value),
+            Err(Error::Syntax(_)) => servo_v8::SelectorBooleanResult::SyntaxError,
+            Err(_) => servo_v8::SelectorBooleanResult::HostFailure,
+        }
+    }
+
+    unsafe fn webkit_matches_selector(
+        &self,
+        host_context: *mut c_void,
+        selectors: &str,
+    ) -> servo_v8::SelectorBooleanResult {
+        if host_context.is_null() {
+            return servo_v8::SelectorBooleanResult::HostFailure;
+        }
+        // SAFETY: See matches(); the alias is independently routed through
+        // Servo's production WebIDL method so signature drift stays visible.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let result = self
+            .element
+            .root()
+            .WebkitMatchesSelector(DOMString::from(selectors));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::SelectorBooleanResult::HostFailure;
+        }
+        match result {
+            Ok(value) => servo_v8::SelectorBooleanResult::Match(value),
+            Err(Error::Syntax(_)) => servo_v8::SelectorBooleanResult::SyntaxError,
+            Err(_) => servo_v8::SelectorBooleanResult::HostFailure,
         }
     }
 }
@@ -608,9 +683,9 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         &self,
         host_context: *mut c_void,
         selectors: &str,
-    ) -> servo_v8::QuerySelectorResult {
+    ) -> servo_v8::SelectorElementResult {
         if host_context.is_null() {
-            return servo_v8::QuerySelectorResult::HostFailure;
+            return servo_v8::SelectorElementResult::HostFailure;
         }
         // SAFETY: The authoritative run API lends its live owner-thread
         // context for this synchronous production DOM call.
@@ -621,14 +696,14 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             .QuerySelector(cx, DOMString::from(selectors));
         if unsafe { JS_IsExceptionPending(cx) } {
             unsafe { JS_ClearPendingException(cx) };
-            return servo_v8::QuerySelectorResult::HostFailure;
+            return servo_v8::SelectorElementResult::HostFailure;
         }
         match result {
-            Ok(element) => servo_v8::QuerySelectorResult::Match(
+            Ok(element) => servo_v8::SelectorElementResult::Match(
                 element.as_deref().map(v8_element_interface_handle),
             ),
-            Err(Error::Syntax(_)) => servo_v8::QuerySelectorResult::SyntaxError,
-            Err(_) => servo_v8::QuerySelectorResult::HostFailure,
+            Err(Error::Syntax(_)) => servo_v8::SelectorElementResult::SyntaxError,
+            Err(_) => servo_v8::SelectorElementResult::HostFailure,
         }
     }
 

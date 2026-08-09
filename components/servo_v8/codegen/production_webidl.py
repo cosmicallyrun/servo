@@ -74,6 +74,9 @@ ELEMENT_FIRST_ELEMENT_CHILD = "Element.firstElementChild"
 ELEMENT_LAST_ELEMENT_CHILD = "Element.lastElementChild"
 ELEMENT_CHILD_ELEMENT_COUNT = "Element.childElementCount"
 ELEMENT_QUERY_SELECTOR = "Element.querySelector"
+ELEMENT_CLOSEST = "Element.closest"
+ELEMENT_MATCHES = "Element.matches"
+ELEMENT_WEBKIT_MATCHES_SELECTOR = "Element.webkitMatchesSelector"
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -116,6 +119,9 @@ READONLY_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 # classification; accepting it is therefore part of the generated semantics.
 PURE_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"Pure"})
 PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE_EXTENDED_ATTRIBUTES = frozenset(
+    {"Pure", "Throws"}
+)
+PURE_THROWS_DOMSTRING_TO_BOOLEAN_EXTENDED_ATTRIBUTES = frozenset(
     {"Pure", "Throws"}
 )
 
@@ -243,6 +249,9 @@ ELEMENT_HOST = (
     ELEMENT_LAST_ELEMENT_CHILD,
     ELEMENT_CHILD_ELEMENT_COUNT,
     ELEMENT_QUERY_SELECTOR,
+    ELEMENT_CLOSEST,
+    ELEMENT_MATCHES,
+    ELEMENT_WEBKIT_MATCHES_SELECTOR,
 )
 
 # Inherited scalar behavior installed on the Node prototype shared by Element
@@ -616,6 +625,85 @@ def select_pure_throws_domstring_to_nullable_interface_operation(
     )
 
 
+def select_pure_throws_domstring_to_boolean_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLMethod:
+    """Select one exact throwing selector operation returning a boolean."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{interface_name}`, found {len(interfaces)}"
+        )
+    members = [
+        member
+        for member in interfaces[0].members
+        if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+
+    member = members[0]
+    if not member.isMethod():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an operation")
+    if member.isStatic():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an instance operation")
+    if member.isSpecial():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an ordinary operation")
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != PURE_THROWS_DOMSTRING_TO_BOOLEAN_EXTENDED_ATTRIBUTES:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly "
+            f"{sorted(PURE_THROWS_DOMSTRING_TO_BOOLEAN_EXTENDED_ATTRIBUTES)}, "
+            f"got {sorted(actual_attributes)}"
+        )
+
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if return_type.nullable() or not return_type.isBoolean():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `boolean`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if len(arguments) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly one argument, found {len(arguments)}"
+        )
+    argument = arguments[0]
+    if argument.optional or argument.variadic:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument.identifier.name}` "
+            "must be required and non-variadic"
+        )
+    if argument.type.nullable() or not argument.type.isDOMString():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument.identifier.name}` must use "
+            f"non-nullable `DOMString`, got `{argument.type.prettyName()}`"
+        )
+    argument_attributes = set(argument._extendedAttrDict) | set(
+        argument.type._extendedAttrDict
+    )
+    if argument_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `{argument.identifier.name}` carries "
+            "extended attributes that are not implemented: "
+            + ", ".join(sorted(argument_attributes))
+        )
+    return member
+
+
 def _select_domstring_to_nullable_interface_operation(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
     qualified_name: str,
@@ -987,12 +1075,16 @@ def _select_element_host_member(
         raise WebIDLSelectionError(
             f"`{qualified_name}` must be an ordinary instance operation"
         )
-    if member_name == "querySelector":
+    if member_name in {"querySelector", "closest"}:
         # The parser resolves ParentNode's included members onto Element. Reuse
         # the same exact operation selector as Document so the mixin cannot
         # drift independently across the two native hosts.
         return select_pure_throws_domstring_to_nullable_interface_operation(
             parser_results, qualified_name, "Element"
+        )
+    if member_name in {"matches", "webkitMatchesSelector"}:
+        return select_pure_throws_domstring_to_boolean_operation(
+            parser_results, qualified_name
         )
     expected_attributes = (
         {"Pure"} if member_name in {"hasAttributes", "getAttribute"} else set()

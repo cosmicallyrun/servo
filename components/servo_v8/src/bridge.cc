@@ -1004,10 +1004,10 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
     v8::Local<v8::Context> context,
     const ServoV8InterfaceValue& value);
 
-void ReturnQuerySelectorOutcome(
+void ReturnSelectorElementOutcome(
     ServoV8RealmState* realm,
     v8::Local<v8::Context> context,
-    const ServoV8QuerySelectorOutcome& outcome,
+    const ServoV8SelectorElementOutcome& outcome,
     const char* member_name,
     v8::ReturnValue<v8::Value> return_value) {
   v8::Isolate* isolate = realm->runtime->isolate;
@@ -1017,20 +1017,20 @@ void ReturnQuerySelectorOutcome(
       (value.is_null != 0 && (value.key || value.native)) ||
       (value.is_null == 0 && (!value.key || !value.native));
   const bool error_has_value =
-      outcome.status != SERVO_V8_QUERY_SELECTOR_RETURNED &&
+      outcome.status != SERVO_V8_SELECTOR_RETURNED &&
       (value.is_null != 1 || value.key || value.native);
-  if (outcome.status > SERVO_V8_QUERY_SELECTOR_HOST_FAILURE ||
+  if (outcome.status > SERVO_V8_SELECTOR_HOST_FAILURE ||
       malformed_value || error_has_value) {
     DropUnownedElementHost(realm->runtime, value.native,
                            realm->runtime->element_host_vtable.drop);
-    ThrowTypeError(isolate, "invalid querySelector outcome");
+    ThrowTypeError(isolate, "invalid selector element outcome");
     return;
   }
-  if (outcome.status == SERVO_V8_QUERY_SELECTOR_SYNTAX_ERROR) {
+  if (outcome.status == SERVO_V8_SELECTOR_SYNTAX_ERROR) {
     ThrowSyntaxErrorDomException(realm, context);
     return;
   }
-  if (outcome.status == SERVO_V8_QUERY_SELECTOR_HOST_FAILURE) {
+  if (outcome.status == SERVO_V8_SELECTOR_HOST_FAILURE) {
     ThrowTypeError(isolate, member_name);
     return;
   }
@@ -1041,10 +1041,35 @@ void ReturnQuerySelectorOutcome(
   v8::Local<v8::Object> wrapper =
       WrapperForInterfaceValue(realm, isolate, context, value);
   if (wrapper.IsEmpty()) {
-    ThrowTypeError(isolate, "querySelector wrapper could not be created");
+    ThrowTypeError(isolate, "selector result wrapper could not be created");
     return;
   }
   return_value.Set(wrapper);
+}
+
+void ReturnSelectorBooleanOutcome(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    const ServoV8SelectorBooleanOutcome& outcome,
+    const char* member_name,
+    v8::ReturnValue<v8::Value> return_value) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  const bool error_has_value =
+      outcome.status != SERVO_V8_SELECTOR_RETURNED && outcome.value != 0;
+  if (outcome.status > SERVO_V8_SELECTOR_HOST_FAILURE || outcome.value > 1 ||
+      error_has_value) {
+    ThrowTypeError(isolate, "invalid selector boolean outcome");
+    return;
+  }
+  if (outcome.status == SERVO_V8_SELECTOR_SYNTAX_ERROR) {
+    ThrowSyntaxErrorDomException(realm, context);
+    return;
+  }
+  if (outcome.status == SERVO_V8_SELECTOR_HOST_FAILURE) {
+    ThrowTypeError(isolate, member_name);
+    return;
+  }
+  return_value.Set(outcome.value != 0);
 }
 
 #include "servo_v8_generated.inc"
@@ -1356,35 +1381,122 @@ void ElementHostHasAttribute(
   info.GetReturnValue().Set(result != 0);
 }
 
-void ElementHostQuerySelector(
-    const v8::FunctionCallbackInfo<v8::Value>& info) {
+using ElementSelectorElementOperation = uint8_t (*)(
+    void* native,
+    void* host_context,
+    const uint8_t* selectors,
+    size_t selectors_length,
+    ServoV8SelectorElementOutcome* output);
+using ElementSelectorElementOperationSlot =
+    ElementSelectorElementOperation ServoV8ElementHostVTable::*;
+
+void ElementHostCallSelectorElement(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ElementSelectorElementOperationSlot operation_slot,
+    const char* required_argument_message,
+    const char* failure_message) {
   v8::Isolate* isolate = info.GetIsolate();
   ServoV8RealmState* realm = nullptr;
   void* native = nullptr;
   v8::Local<v8::String> selectors_string;
-  if (!ElementHostOperationName(
-          info, "Element.querySelector requires 1 argument", &realm, &native,
-          &selectors_string)) {
+  if (!ElementHostOperationName(info, required_argument_message, &realm, &native,
+                                &selectors_string)) {
     return;
   }
   v8::String::Utf8Value selectors(isolate, selectors_string);
   if (!*selectors && selectors.length() != 0) return;
-  ServoV8QuerySelectorOutcome outcome{};
+  const ElementSelectorElementOperation operation =
+      realm->runtime->element_host_vtable.*operation_slot;
+  if (!operation) {
+    ThrowTypeError(isolate, "Element selector operation is not installed");
+    return;
+  }
+  ServoV8SelectorElementOutcome outcome{};
   {
     RustCallbackScope callback_scope(realm->runtime);
-    if (!realm->runtime->element_host_vtable.query_selector(
-            native, realm->document_host.active_host_context,
-            reinterpret_cast<const uint8_t*>(*selectors), selectors.length(),
-            &outcome)) {
+    if (!operation(native, realm->document_host.active_host_context,
+                   reinterpret_cast<const uint8_t*>(*selectors),
+                   selectors.length(), &outcome)) {
       DropUnownedElementHost(realm->runtime, outcome.value.native,
                              realm->runtime->element_host_vtable.drop);
-      ThrowTypeError(isolate, "Element.querySelector host callback failed");
+      ThrowTypeError(isolate, failure_message);
       return;
     }
   }
-  ReturnQuerySelectorOutcome(realm, isolate->GetCurrentContext(), outcome,
-                             "Element.querySelector host callback failed",
-                             info.GetReturnValue());
+  ReturnSelectorElementOutcome(realm, isolate->GetCurrentContext(), outcome,
+                               failure_message, info.GetReturnValue());
+}
+
+void ElementHostQuerySelector(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostCallSelectorElement(
+      info, &ServoV8ElementHostVTable::query_selector,
+      "Element.querySelector requires 1 argument",
+      "Element.querySelector host callback failed");
+}
+
+void ElementHostClosest(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostCallSelectorElement(info, &ServoV8ElementHostVTable::closest,
+                                 "Element.closest requires 1 argument",
+                                 "Element.closest host callback failed");
+}
+
+using ElementSelectorBooleanOperation = uint8_t (*)(
+    void* native,
+    void* host_context,
+    const uint8_t* selectors,
+    size_t selectors_length,
+    ServoV8SelectorBooleanOutcome* output);
+using ElementSelectorBooleanOperationSlot =
+    ElementSelectorBooleanOperation ServoV8ElementHostVTable::*;
+
+void ElementHostCallSelectorBoolean(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ElementSelectorBooleanOperationSlot operation_slot,
+    const char* required_argument_message,
+    const char* failure_message) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  v8::Local<v8::String> selectors_string;
+  if (!ElementHostOperationName(info, required_argument_message, &realm, &native,
+                                &selectors_string)) {
+    return;
+  }
+  v8::String::Utf8Value selectors(isolate, selectors_string);
+  if (!*selectors && selectors.length() != 0) return;
+  const ElementSelectorBooleanOperation operation =
+      realm->runtime->element_host_vtable.*operation_slot;
+  if (!operation) {
+    ThrowTypeError(isolate, "Element selector operation is not installed");
+    return;
+  }
+  ServoV8SelectorBooleanOutcome outcome{};
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!operation(native, realm->document_host.active_host_context,
+                   reinterpret_cast<const uint8_t*>(*selectors),
+                   selectors.length(), &outcome)) {
+      ThrowTypeError(isolate, failure_message);
+      return;
+    }
+  }
+  ReturnSelectorBooleanOutcome(realm, isolate->GetCurrentContext(), outcome,
+                               failure_message, info.GetReturnValue());
+}
+
+void ElementHostMatches(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostCallSelectorBoolean(info, &ServoV8ElementHostVTable::matches,
+                                 "Element.matches requires 1 argument",
+                                 "Element.matches host callback failed");
+}
+
+void ElementHostWebkitMatchesSelector(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostCallSelectorBoolean(
+      info, &ServoV8ElementHostVTable::webkit_matches_selector,
+      "Element.webkitMatchesSelector requires 1 argument",
+      "Element.webkitMatchesSelector host callback failed");
 }
 
 using ElementInterfaceGetter =
@@ -1715,6 +1827,12 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"hasAttribute", &ElementHostHasAttribute, 1,
        v8::SideEffectType::kHasSideEffect},
       {"querySelector", &ElementHostQuerySelector, 1,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"closest", &ElementHostClosest, 1,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"matches", &ElementHostMatches, 1,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"webkitMatchesSelector", &ElementHostWebkitMatchesSelector, 1,
        v8::SideEffectType::kHasNoSideEffect},
   };
   for (const auto& operation : operations) {
@@ -3037,6 +3155,8 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->set_text_content || !vtable->has_child_nodes ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
       !vtable->get_child_element_count || !vtable->query_selector ||
+      !vtable->closest || !vtable->matches ||
+      !vtable->webkit_matches_selector ||
       !vtable->drop) {
     WriteError(error, "Element host vtable is incomplete");
     return 0;

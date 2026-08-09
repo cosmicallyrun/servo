@@ -1344,28 +1344,39 @@ def _pure_domstring_to_nullable_interface_cpp_vtable_terms(
 # JavaScript null and a DOMException are distinct results. The status is POD
 # and the only specified Servo failure for scope-match is SyntaxError, so no
 # SpiderMonkey exception object or pending-exception state crosses the ABI.
-_QUERY_SELECTOR_C_TYPE: Block = [
-    "enum ServoV8QuerySelectorStatus {",
-    "  SERVO_V8_QUERY_SELECTOR_RETURNED = 0,",
-    "  SERVO_V8_QUERY_SELECTOR_SYNTAX_ERROR = 1,",
-    "  SERVO_V8_QUERY_SELECTOR_HOST_FAILURE = 2,",
+_SELECTOR_OUTCOME_C_TYPES: Block = [
+    "enum ServoV8SelectorStatus {",
+    "  SERVO_V8_SELECTOR_RETURNED = 0,",
+    "  SERVO_V8_SELECTOR_SYNTAX_ERROR = 1,",
+    "  SERVO_V8_SELECTOR_HOST_FAILURE = 2,",
     "};",
     "",
-    "typedef struct ServoV8QuerySelectorOutcome {",
+    "typedef struct ServoV8SelectorElementOutcome {",
     "  uint32_t status;",
     "  ServoV8InterfaceValue value;",
-    "} ServoV8QuerySelectorOutcome;",
+    "} ServoV8SelectorElementOutcome;",
+    "",
+    "typedef struct ServoV8SelectorBooleanOutcome {",
+    "  uint32_t status;",
+    "  uint8_t value;",
+    "} ServoV8SelectorBooleanOutcome;",
 ]
 
-_QUERY_SELECTOR_RUST_TYPE: Block = [
-    "const QUERY_SELECTOR_RETURNED: u32 = 0;",
-    "const QUERY_SELECTOR_SYNTAX_ERROR: u32 = 1;",
-    "const QUERY_SELECTOR_HOST_FAILURE: u32 = 2;",
+_SELECTOR_OUTCOME_RUST_TYPES: Block = [
+    "const SELECTOR_RETURNED: u32 = 0;",
+    "const SELECTOR_SYNTAX_ERROR: u32 = 1;",
+    "const SELECTOR_HOST_FAILURE: u32 = 2;",
     "",
     "#[repr(C)]",
-    "pub struct RawQuerySelectorOutcome {",
+    "pub struct RawSelectorElementOutcome {",
     "    pub status: u32,",
     "    pub value: RawInterfaceValue,",
+    "}",
+    "",
+    "#[repr(C)]",
+    "pub struct RawSelectorBooleanOutcome {",
+    "    pub status: u32,",
+    "    pub value: u8,",
     "}",
 ]
 
@@ -1381,7 +1392,7 @@ def _pure_throws_domstring_to_nullable_interface_header_slots(
         f"  uint8_t (*{name})(void* native, void* host_context,",
         f"{C_SIGNATURE_INDENT}const uint8_t* {argument},",
         f"{C_SIGNATURE_INDENT}size_t {argument}_length,",
-        f"{C_SIGNATURE_INDENT}ServoV8QuerySelectorOutcome* output);",
+        f"{C_SIGNATURE_INDENT}ServoV8SelectorElementOutcome* output);",
     ]
 
 
@@ -1399,7 +1410,7 @@ def _pure_throws_domstring_to_nullable_interface_rust_trait_members(
         "        &self,",
         "        host_context: *mut c_void,",
         f"        {argument}: &str,",
-        "    ) -> QuerySelectorResult;",
+        "    ) -> SelectorElementResult;",
     ]
 
 
@@ -1414,7 +1425,7 @@ def _pure_throws_domstring_to_nullable_interface_rust_vtable_fields(
         "            *mut c_void,",
         "            *const u8,",
         "            usize,",
-        "            *mut RawQuerySelectorOutcome,",
+        "            *mut RawSelectorElementOutcome,",
         "        ) -> u8,",
         "    >,",
     ]
@@ -1434,7 +1445,7 @@ def _pure_throws_domstring_to_nullable_interface_rust_thunks(
             "    host_context: *mut c_void,",
             f"    {argument}: *const u8,",
             f"    {argument}_length: usize,",
-            "    output: *mut RawQuerySelectorOutcome,",
+            "    output: *mut RawSelectorElementOutcome,",
             ") -> u8 {",
             "    if native.is_null() || host_context.is_null() || output.is_null() ||",
             f"        ({argument}.is_null() && {argument}_length != 0)",
@@ -1456,7 +1467,7 @@ def _pure_throws_domstring_to_nullable_interface_rust_thunks(
             f"        (&*native.cast::<T>()).{name}(host_context, {argument})",
             "    };",
             "    // SAFETY: output is non-null and points to caller-owned writable storage.",
-            "    unsafe { *output = raw_query_selector_outcome(result) };",
+            "    unsafe { *output = raw_selector_element_outcome(result) };",
             "    1",
             "}",
         ],
@@ -1513,7 +1524,7 @@ def _pure_throws_domstring_to_nullable_interface_cpp_bodies(
             f'    ThrowTypeError(isolate, "{qualified_name} argument conversion failed");',
             "    return;",
             "  }",
-            "  ServoV8QuerySelectorOutcome outcome{};",
+            "  ServoV8SelectorElementOutcome outcome{};",
             "  bool succeeded = false;",
             "  {",
             "    if (state->runtime->rust_callback_depth != 0) {",
@@ -1533,7 +1544,7 @@ def _pure_throws_domstring_to_nullable_interface_cpp_bodies(
             f'    ThrowTypeError(isolate, "{qualified_name} host callback failed");',
             "    return;",
             "  }",
-            f'  ReturnQuerySelectorOutcome(realm, context, outcome, "{qualified_name}",',
+            f'  ReturnSelectorElementOutcome(realm, context, outcome, "{qualified_name}",',
             "                             info.GetReturnValue());",
             "}",
         ],
@@ -1726,9 +1737,9 @@ SHAPE_EMITTERS = {
         cpp_vtable_terms=_pure_domstring_to_nullable_interface_cpp_vtable_terms,
     ),
     production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE: ShapeEmitter(
-        header_type_blocks=(_QUERY_SELECTOR_C_TYPE,),
+        header_type_blocks=(_SELECTOR_OUTCOME_C_TYPES,),
         header_slots=_pure_throws_domstring_to_nullable_interface_header_slots,
-        rust_type_blocks=(_QUERY_SELECTOR_RUST_TYPE,),
+        rust_type_blocks=(_SELECTOR_OUTCOME_RUST_TYPES,),
         rust_trait_members=_pure_throws_domstring_to_nullable_interface_rust_trait_members,
         rust_vtable_fields=_pure_throws_domstring_to_nullable_interface_rust_vtable_fields,
         rust_thunk_blocks=(),
