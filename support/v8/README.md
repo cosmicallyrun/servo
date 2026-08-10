@@ -81,8 +81,8 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Element.getElementsByClassName`, `Element.remove`,
 `Element.previousElementSibling`, `Element.nextElementSibling`, `Element.closest`,
 `Element.matches`, `Element.webkitMatchesSelector`, `Element.namespaceURI`, and
-`Element.prefix`, declarations in
-Servo's real production WebIDL
+`Element.prefix`, `Element.getAttributeNS`, and `Element.hasAttributeNS`,
+declarations in Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
 shape, exact returned interface)` records, with the interface field absent for
 non-interface values. One selector and one emitter are registered per shape,
@@ -204,6 +204,13 @@ ABI v33 adds inherited `Node.parentElement` to Element wrappers. The read-only,
 brand-checked nullable Element accessor stays on the shared Node prototype and
 uses Servo's production `GetParentElement`; a non-null parent reuses the
 per-realm Element wrapper cache, while a retained removed child reads `null`.
+
+ABI v34 adds `Element.getAttributeNS` and `Element.hasAttributeNS`. These
+brand-checked two-argument operations use Servo's production namespace-aware
+attribute getters with an ephemeral SpiderMonkey context. They preserve WebIDL
+nullable namespace conversion, DOMString conversion order, nullable string
+results, and the distinction between an unnamespaced HTML/SVG attribute and an
+XLink namespaced attribute.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -462,6 +469,7 @@ The proof suite uses that same counting argument:
 | `authoritative_element_sibling_proof.html` | Element-only sibling traversal skips text nodes, preserves wrapper identity, and updates after Element.remove |
 | `authoritative_element_namespace_proof.html` | HTML and inline SVG Element namespaceURI and null prefix accessors preserve descriptors, brands, and nullable-string values |
 | `authoritative_parent_element_proof.html` | inherited Node.parentElement stays on Node.prototype, preserves parent identity, and becomes null after Element.remove |
+| `authoritative_attribute_namespace_proof.html` | HTML/SVG namespace-aware attribute reads preserve receiver brands, ordered conversion, nullable values, and XLink distinction |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the

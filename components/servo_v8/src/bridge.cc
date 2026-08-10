@@ -2021,6 +2021,50 @@ bool ElementHostOperationName(
   return info[0]->ToString(isolate->GetCurrentContext()).ToLocal(name_output);
 }
 
+void ElementHostSetOptionalStringResult(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ServoV8RealmState* realm,
+    ServoV8OptionalOwnedUtf8* result,
+    bool callback_succeeded,
+    const char* callback_failure_message,
+    const char* invalid_result_message) {
+  v8::Isolate* isolate = info.GetIsolate();
+  // Take ownership even when the callback reports failure: an adversarial or
+  // partially-failed host may already have transferred an owner into output.
+  DocumentHostOwnedUtf8Scope result_scope(realm->runtime, &result->value);
+  if (!callback_succeeded) {
+    ThrowTypeError(isolate, callback_failure_message);
+    return;
+  }
+  const bool malformed_null =
+      result->is_null != 0 &&
+      (result->value.data || result->value.length != 0 || result->value.owner ||
+       result->value.drop_owner);
+  const bool malformed_non_null =
+      result->is_null == 0 &&
+      (!result->value.data || !result->value.owner ||
+       !result->value.drop_owner);
+  if (result->is_null > 1 || malformed_null || malformed_non_null ||
+      result->value.length >
+          static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(isolate, invalid_result_message);
+    return;
+  }
+  if (result->is_null) {
+    info.GetReturnValue().Set(v8::Null(isolate));
+    return;
+  }
+  v8::Local<v8::String> value;
+  if (!v8::String::NewFromUtf8(
+           isolate, reinterpret_cast<const char*>(result->value.data),
+           v8::NewStringType::kNormal,
+           static_cast<int>(result->value.length))
+           .ToLocal(&value)) {
+    return;
+  }
+  info.GetReturnValue().Set(value);
+}
+
 void ElementHostGetAttribute(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
@@ -2034,41 +2078,17 @@ void ElementHostGetAttribute(
   v8::String::Utf8Value name(isolate, name_string);
   if (!*name && name.length() != 0) return;
   ServoV8OptionalOwnedUtf8 result{};
+  bool succeeded = false;
   {
     RustCallbackScope callback_scope(realm->runtime);
-    if (!realm->runtime->element_host_vtable.get_attribute(
-            native, realm->document_host.active_host_context,
-            reinterpret_cast<const uint8_t*>(*name), name.length(), &result)) {
-      ThrowTypeError(isolate, "Element.getAttribute host callback failed");
-      return;
-    }
+    succeeded = realm->runtime->element_host_vtable.get_attribute(
+        native, realm->document_host.active_host_context,
+        reinterpret_cast<const uint8_t*>(*name), name.length(), &result);
   }
-  DocumentHostOwnedUtf8Scope result_scope(realm->runtime, &result.value);
-  const bool malformed_null =
-      result.is_null != 0 &&
-      (result.value.data || result.value.length != 0 || result.value.owner ||
-       result.value.drop_owner);
-  const bool malformed_non_null =
-      result.is_null == 0 &&
-      (!result.value.data || !result.value.owner || !result.value.drop_owner);
-  if (result.is_null > 1 || malformed_null || malformed_non_null ||
-      result.value.length >
-          static_cast<size_t>(std::numeric_limits<int>::max())) {
-    ThrowTypeError(isolate, "invalid Element.getAttribute result");
-    return;
-  }
-  if (result.is_null) {
-    info.GetReturnValue().Set(v8::Null(isolate));
-    return;
-  }
-  v8::Local<v8::String> value;
-  if (!v8::String::NewFromUtf8(
-           isolate, reinterpret_cast<const char*>(result.value.data),
-           v8::NewStringType::kNormal, static_cast<int>(result.value.length))
-           .ToLocal(&value)) {
-    return;
-  }
-  info.GetReturnValue().Set(value);
+  ElementHostSetOptionalStringResult(
+      info, realm, &result, succeeded,
+      "Element.getAttribute host callback failed",
+      "invalid Element.getAttribute result");
 }
 
 void ElementHostHasAttribute(
@@ -2093,6 +2113,118 @@ void ElementHostHasAttribute(
       ThrowTypeError(isolate, "Element.hasAttribute host callback failed");
       return;
     }
+  }
+  info.GetReturnValue().Set(result != 0);
+}
+
+bool ElementHostNamespaceOperationArguments(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    const char* required_arguments_message,
+    ServoV8RealmState** realm_output,
+    void** native_output,
+    bool* namespace_is_null_output,
+    v8::Local<v8::String>* namespace_output,
+    v8::Local<v8::String>* local_name_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  // WebIDL checks the receiver brand and required argument count before it
+  // runs user-controlled conversion for either argument.
+  if (!ElementHostCallbackState(info, realm_output, native_output)) return false;
+  if (!(*realm_output)->document_host.active_host_context) {
+    ThrowTypeError(isolate, "Element operation requires a live host context");
+    return false;
+  }
+  if (info.Length() < 2) {
+    ThrowTypeError(isolate, required_arguments_message);
+    return false;
+  }
+  *namespace_is_null_output = info[0]->IsNullOrUndefined();
+  if (*namespace_is_null_output) {
+    *namespace_output = v8::String::Empty(isolate);
+  } else if (!info[0]
+                  ->ToString(isolate->GetCurrentContext())
+                  .ToLocal(namespace_output)) {
+    return false;
+  }
+  return info[1]
+      ->ToString(isolate->GetCurrentContext())
+      .ToLocal(local_name_output);
+}
+
+void ElementHostGetAttributeNS(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  bool namespace_is_null = false;
+  v8::Local<v8::String> namespace_string;
+  v8::Local<v8::String> local_name_string;
+  if (!ElementHostNamespaceOperationArguments(
+          info, "Element.getAttributeNS requires 2 arguments", &realm, &native,
+          &namespace_is_null, &namespace_string, &local_name_string)) {
+    return;
+  }
+  v8::String::Utf8Value namespace_utf8(isolate, namespace_string);
+  v8::String::Utf8Value local_name_utf8(isolate, local_name_string);
+  if ((!*namespace_utf8 && namespace_utf8.length() != 0) ||
+      (!*local_name_utf8 && local_name_utf8.length() != 0)) {
+    return;
+  }
+  ServoV8OptionalOwnedUtf8 result{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.get_attribute_ns(
+        native, realm->document_host.active_host_context,
+        namespace_is_null ? 1 : 0,
+        namespace_is_null
+            ? nullptr
+            : reinterpret_cast<const uint8_t*>(*namespace_utf8),
+        namespace_is_null ? 0 : static_cast<size_t>(namespace_utf8.length()),
+        reinterpret_cast<const uint8_t*>(*local_name_utf8),
+        static_cast<size_t>(local_name_utf8.length()), &result);
+  }
+  ElementHostSetOptionalStringResult(
+      info, realm, &result, succeeded,
+      "Element.getAttributeNS host callback failed",
+      "invalid Element.getAttributeNS result");
+}
+
+void ElementHostHasAttributeNS(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  bool namespace_is_null = false;
+  v8::Local<v8::String> namespace_string;
+  v8::Local<v8::String> local_name_string;
+  if (!ElementHostNamespaceOperationArguments(
+          info, "Element.hasAttributeNS requires 2 arguments", &realm, &native,
+          &namespace_is_null, &namespace_string, &local_name_string)) {
+    return;
+  }
+  v8::String::Utf8Value namespace_utf8(isolate, namespace_string);
+  v8::String::Utf8Value local_name_utf8(isolate, local_name_string);
+  if ((!*namespace_utf8 && namespace_utf8.length() != 0) ||
+      (!*local_name_utf8 && local_name_utf8.length() != 0)) {
+    return;
+  }
+  uint8_t result = 0;
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.has_attribute_ns(
+        native, realm->document_host.active_host_context,
+        namespace_is_null ? 1 : 0,
+        namespace_is_null
+            ? nullptr
+            : reinterpret_cast<const uint8_t*>(*namespace_utf8),
+        namespace_is_null ? 0 : static_cast<size_t>(namespace_utf8.length()),
+        reinterpret_cast<const uint8_t*>(*local_name_utf8),
+        static_cast<size_t>(local_name_utf8.length()), &result);
+  }
+  if (!succeeded || result > 1) {
+    ThrowTypeError(isolate, "Element.hasAttributeNS host callback failed");
+    return;
   }
   info.GetReturnValue().Set(result != 0);
 }
@@ -2537,7 +2669,6 @@ void ElementHostGetOptionalString(
     ElementOptionalStringGetterSlot getter_slot,
     const char* member_name,
     const char* invalid_result_message) {
-  v8::Isolate* isolate = info.GetIsolate();
   ServoV8RealmState* realm = nullptr;
   void* native = nullptr;
   if (!ElementHostCallbackState(info, &realm, &native)) return;
@@ -2549,36 +2680,8 @@ void ElementHostGetOptionalString(
     RustCallbackScope callback_scope(realm->runtime);
     succeeded = getter && getter(native, &result);
   }
-  DocumentHostOwnedUtf8Scope result_scope(realm->runtime, &result.value);
-  if (!succeeded) {
-    ThrowTypeError(isolate, member_name);
-    return;
-  }
-  const bool malformed_null =
-      result.is_null != 0 &&
-      (result.value.data || result.value.length != 0 || result.value.owner ||
-       result.value.drop_owner);
-  const bool malformed_non_null =
-      result.is_null == 0 &&
-      (!result.value.data || !result.value.owner || !result.value.drop_owner);
-  if (result.is_null > 1 || malformed_null || malformed_non_null ||
-      result.value.length >
-          static_cast<size_t>(std::numeric_limits<int>::max())) {
-    ThrowTypeError(isolate, invalid_result_message);
-    return;
-  }
-  if (result.is_null) {
-    info.GetReturnValue().Set(v8::Null(isolate));
-    return;
-  }
-  v8::Local<v8::String> value;
-  if (!v8::String::NewFromUtf8(
-           isolate, reinterpret_cast<const char*>(result.value.data),
-           v8::NewStringType::kNormal, static_cast<int>(result.value.length))
-           .ToLocal(&value)) {
-    return;
-  }
-  info.GetReturnValue().Set(value);
+  ElementHostSetOptionalStringResult(info, realm, &result, succeeded,
+                                     member_name, invalid_result_message);
 }
 
 void ElementHostGetNamespaceURI(
@@ -2972,6 +3075,10 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"getAttribute", &ElementHostGetAttribute, 1,
        v8::SideEffectType::kHasNoSideEffect},
       {"hasAttribute", &ElementHostHasAttribute, 1,
+       v8::SideEffectType::kHasSideEffect},
+      {"getAttributeNS", &ElementHostGetAttributeNS, 2,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"hasAttributeNS", &ElementHostHasAttributeNS, 2,
        v8::SideEffectType::kHasSideEffect},
       {"getElementsByClassName", &ElementHostGetElementsByClassName, 1,
        v8::SideEffectType::kHasSideEffect},
@@ -4321,6 +4428,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_id || !vtable->set_id || !vtable->get_class_name ||
       !vtable->set_class_name || !vtable->has_attributes ||
       !vtable->get_attribute || !vtable->has_attribute ||
+      !vtable->get_attribute_ns || !vtable->has_attribute_ns ||
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->get_parent_element ||

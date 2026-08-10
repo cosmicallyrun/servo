@@ -264,6 +264,32 @@ class ProductionElementTests(unittest.TestCase):
         self.assertTrue(return_type.nullable())
         self.assertTrue(return_type.inner.isDOMString())
         self.assertEqual(arguments[0].identifier.name, "name")
+        get_attribute_ns = members[production_webidl.ELEMENT_GET_ATTRIBUTE_NS]
+        get_ns_return, get_ns_arguments = get_attribute_ns.signatures()[0]
+        self.assertTrue(get_ns_return.nullable())
+        self.assertTrue(get_ns_return.inner.isDOMString())
+        self.assertEqual(
+            [argument.identifier.name for argument in get_ns_arguments],
+            ["namespace", "localName"],
+        )
+        self.assertTrue(get_ns_arguments[0].type.nullable())
+        self.assertTrue(get_ns_arguments[0].type.inner.isDOMString())
+        self.assertFalse(get_ns_arguments[1].type.nullable())
+        self.assertTrue(get_ns_arguments[1].type.isDOMString())
+        self.assertEqual(set(get_attribute_ns._extendedAttrDict), {"Pure"})
+        has_attribute_ns = members[production_webidl.ELEMENT_HAS_ATTRIBUTE_NS]
+        has_ns_return, has_ns_arguments = has_attribute_ns.signatures()[0]
+        self.assertTrue(has_ns_return.isBoolean())
+        self.assertFalse(has_ns_return.nullable())
+        self.assertEqual(
+            [argument.identifier.name for argument in has_ns_arguments],
+            ["namespace", "localName"],
+        )
+        self.assertTrue(has_ns_arguments[0].type.nullable())
+        self.assertTrue(has_ns_arguments[0].type.inner.isDOMString())
+        self.assertFalse(has_ns_arguments[1].type.nullable())
+        self.assertTrue(has_ns_arguments[1].type.isDOMString())
+        self.assertEqual(set(has_attribute_ns._extendedAttrDict), set())
         for qualified_name in (
             production_webidl.ELEMENT_FIRST_ELEMENT_CHILD,
             production_webidl.ELEMENT_LAST_ELEMENT_CHILD,
@@ -1605,6 +1631,114 @@ class SyntheticSelectionTests(unittest.TestCase):
             "getAttribute",
             "`Element.getAttribute` must return nullable `DOMString`, got `DOMString`",
         )
+
+    def test_selects_exact_namespace_attribute_operations(self) -> None:
+        parser_results = self.parse(
+            {
+                "Element.webidl": """
+                    interface Element {
+                      [Pure] DOMString? getAttributeNS(
+                        DOMString? namespace, DOMString localName
+                      );
+                      boolean hasAttributeNS(
+                        DOMString? namespace, DOMString localName
+                      );
+                    };
+                """,
+            }
+        )
+        for qualified_name in (
+            production_webidl.ELEMENT_GET_ATTRIBUTE_NS,
+            production_webidl.ELEMENT_HAS_ATTRIBUTE_NS,
+        ):
+            with self.subTest(member=qualified_name):
+                member = production_webidl._select_element_host_member(
+                    parser_results, qualified_name
+                )
+                return_type, arguments = member.signatures()[0]
+                self.assertEqual(
+                    [argument.identifier.name for argument in arguments],
+                    ["namespace", "localName"],
+                )
+                self.assertTrue(arguments[0].type.nullable())
+                self.assertTrue(arguments[0].type.inner.isDOMString())
+                self.assertFalse(arguments[1].type.nullable())
+                self.assertTrue(arguments[1].type.isDOMString())
+                if qualified_name == production_webidl.ELEMENT_GET_ATTRIBUTE_NS:
+                    self.assertTrue(return_type.nullable())
+                    self.assertTrue(return_type.inner.isDOMString())
+                    self.assertEqual(set(member._extendedAttrDict), {"Pure"})
+                else:
+                    self.assertTrue(return_type.isBoolean())
+                    self.assertFalse(return_type.nullable())
+                    self.assertEqual(set(member._extendedAttrDict), set())
+
+    def test_rejects_namespace_attribute_operation_drift(self) -> None:
+        cases = (
+            (
+                "DOMString? getAttributeNS(DOMString? namespace, DOMString localName);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` must carry exactly ['Pure'], got []",
+            ),
+            (
+                "[Pure, Throws] DOMString? getAttributeNS(DOMString? namespace, DOMString localName);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` must carry exactly ['Pure'], "
+                "got ['Pure', 'Throws']",
+            ),
+            (
+                "[Pure] DOMString getAttributeNS(DOMString? namespace, DOMString localName);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` must return nullable `DOMString`, got `DOMString`",
+            ),
+            (
+                "[Pure] DOMString? getAttributeNS(DOMString namespace, DOMString localName);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` first argument `namespace` must be "
+                "required, non-variadic nullable `DOMString`",
+            ),
+            (
+                "[Pure] DOMString? getAttributeNS(DOMString? namespace, optional DOMString localName);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` second argument `localName` must be "
+                "required, non-variadic non-nullable `DOMString`",
+            ),
+            (
+                "[Pure] DOMString? getAttributeNS(DOMString? namespace);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` must take exactly two arguments, found 1",
+            ),
+            (
+                "[Pure] DOMString? getAttributeNS(DOMString? namespace, DOMString localName, DOMString extra);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` must take exactly two arguments, found 3",
+            ),
+            (
+                "[Pure] DOMString? getAttributeNS(DOMString? namespace, USVString localName);",
+                "getAttributeNS",
+                "`Element.getAttributeNS` second argument `localName` must be "
+                "required, non-variadic non-nullable `DOMString`",
+            ),
+            (
+                "[Pure] boolean hasAttributeNS(DOMString? namespace, DOMString localName);",
+                "hasAttributeNS",
+                "`Element.hasAttributeNS` must carry exactly [], got ['Pure']",
+            ),
+            (
+                "DOMString hasAttributeNS(DOMString? namespace, DOMString localName);",
+                "hasAttributeNS",
+                "`Element.hasAttributeNS` must return non-nullable `boolean`, got `DOMString`",
+            ),
+            (
+                "boolean hasAttributeNS(DOMString namespace, DOMString localName);",
+                "hasAttributeNS",
+                "`Element.hasAttributeNS` first argument `namespace` must be "
+                "required, non-variadic nullable `DOMString`",
+            ),
+        )
+        for declaration, member, expected in cases:
+            with self.subTest(member=member, declaration=declaration):
+                self.assert_element_rejected(declaration, member, expected)
 
     def test_rejects_optional_has_attribute_name(self) -> None:
         self.assert_element_rejected(

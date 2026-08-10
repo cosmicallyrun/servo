@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 33;
+const ABI_VERSION: u32 = 34;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -353,6 +353,18 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
         name: &str,
     ) -> Result<Option<String>, ()>;
     unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool>;
+    unsafe fn get_attribute_ns(
+        &self,
+        host_context: *mut c_void,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Result<Option<String>, ()>;
+    unsafe fn has_attribute_ns(
+        &self,
+        host_context: *mut c_void,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Option<bool>;
     fn node_type(&self) -> u16;
     fn node_name(&self) -> String;
     fn is_connected(&self) -> bool;
@@ -416,6 +428,30 @@ pub struct ElementHostVTable {
     >,
     pub has_attribute:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize, *mut u8) -> u8>,
+    pub get_attribute_ns: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            u8,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut OptionalOwnedUtf8,
+        ) -> u8,
+    >,
+    pub has_attribute_ns: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            u8,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut u8,
+        ) -> u8,
+    >,
     pub get_node_type: Option<unsafe extern "C" fn(*mut c_void, *mut u16) -> u8>,
     pub get_node_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
     pub get_is_connected: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
@@ -713,6 +749,22 @@ unsafe fn element_host_utf8<'a>(value: *const u8, value_length: usize) -> Option
     std::str::from_utf8(bytes).ok()
 }
 
+unsafe fn element_host_nullable_utf8<'a>(
+    is_null: u8,
+    value: *const u8,
+    value_length: usize,
+) -> Option<Option<&'a str>> {
+    match is_null {
+        0 => {
+            // SAFETY: The caller lends this exact byte range for the
+            // synchronous ABI call.
+            unsafe { element_host_utf8(value, value_length) }.map(Some)
+        },
+        1 if value.is_null() && value_length == 0 => Some(None),
+        _ => None,
+    }
+}
+
 macro_rules! element_host_string_getter {
     ($function:ident, $method:ident) => {
         unsafe extern "C" fn $function<T: ElementHostBinding>(
@@ -953,6 +1005,73 @@ unsafe extern "C" fn element_host_has_attribute<T: ElementHostBinding>(
     };
     // SAFETY: The vtable contract supplies this exact host and live context.
     let result = unsafe { (&*native.cast::<T>()).has_attribute(host_context, name) };
+    let Some(value) = result else {
+        return 0;
+    };
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = value as u8 };
+    1
+}
+
+unsafe extern "C" fn element_host_get_attribute_ns<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    namespace_is_null: u8,
+    namespace: *const u8,
+    namespace_length: usize,
+    local_name: *const u8,
+    local_name_length: usize,
+    output: *mut OptionalOwnedUtf8,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends these byte ranges for the synchronous call.
+    let Some(namespace) =
+        (unsafe { element_host_nullable_utf8(namespace_is_null, namespace, namespace_length) })
+    else {
+        return 0;
+    };
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(local_name) = (unsafe { element_host_utf8(local_name, local_name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result =
+        unsafe { (&*native.cast::<T>()).get_attribute_ns(host_context, namespace, local_name) };
+    let Ok(value) = result else {
+        return 0;
+    };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_optional_owned_utf8(output, value) }
+}
+
+unsafe extern "C" fn element_host_has_attribute_ns<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    namespace_is_null: u8,
+    namespace: *const u8,
+    namespace_length: usize,
+    local_name: *const u8,
+    local_name_length: usize,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends these byte ranges for the synchronous call.
+    let Some(namespace) =
+        (unsafe { element_host_nullable_utf8(namespace_is_null, namespace, namespace_length) })
+    else {
+        return 0;
+    };
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(local_name) = (unsafe { element_host_utf8(local_name, local_name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    let result =
+        unsafe { (&*native.cast::<T>()).has_attribute_ns(host_context, namespace, local_name) };
     let Some(value) = result else {
         return 0;
     };
@@ -1446,6 +1565,8 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         has_attributes: Some(element_host_has_attributes::<T>),
         get_attribute: Some(element_host_get_attribute::<T>),
         has_attribute: Some(element_host_has_attribute::<T>),
+        get_attribute_ns: Some(element_host_get_attribute_ns::<T>),
+        has_attribute_ns: Some(element_host_has_attribute_ns::<T>),
         get_node_type: Some(element_host_get_node_type::<T>),
         get_node_name: Some(element_host_get_node_name::<T>),
         get_is_connected: Some(element_host_get_is_connected::<T>),
@@ -2674,6 +2795,7 @@ mod tests {
     #[derive(Default)]
     struct ElementProbeState {
         attributes: RefCell<Vec<(String, String)>>,
+        namespaced_attributes: RefCell<Vec<(String, String, String)>>,
         namespace_uri: RefCell<Option<String>>,
         prefix: RefCell<Option<String>>,
         text_content: RefCell<Option<String>>,
@@ -2701,6 +2823,7 @@ mod tests {
                         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                         .collect(),
                 ),
+                namespaced_attributes: RefCell::new(Vec::new()),
                 namespace_uri: RefCell::new(Some("http://www.w3.org/1999/xhtml".to_owned())),
                 prefix: RefCell::new(None),
                 text_content: RefCell::new(Some(text_content.to_owned())),
@@ -2719,6 +2842,26 @@ mod tests {
                 .iter()
                 .find(|(attribute, _)| attribute == &name)
                 .map(|(_, value)| value.clone())
+        }
+
+        fn get_ns(&self, namespace: Option<&str>, local_name: &str) -> Option<String> {
+            let namespace = namespace.filter(|namespace| !namespace.is_empty());
+            if namespace.is_none() {
+                return self
+                    .attributes
+                    .borrow()
+                    .iter()
+                    .find(|(attribute, _)| attribute == local_name)
+                    .map(|(_, value)| value.clone());
+            }
+            self.namespaced_attributes
+                .borrow()
+                .iter()
+                .find(|(attribute_namespace, attribute_local_name, _)| {
+                    Some(attribute_namespace.as_str()) == namespace
+                        && attribute_local_name == local_name
+                })
+                .map(|(_, _, value)| value.clone())
         }
 
         fn set(&self, name: &str, value: &str) {
@@ -3015,6 +3158,26 @@ mod tests {
         unsafe fn has_attribute(&self, host_context: *mut c_void, name: &str) -> Option<bool> {
             assert!(!host_context.is_null());
             Some(self.state.get(name).is_some())
+        }
+
+        unsafe fn get_attribute_ns(
+            &self,
+            host_context: *mut c_void,
+            namespace: Option<&str>,
+            local_name: &str,
+        ) -> Result<Option<String>, ()> {
+            assert!(!host_context.is_null());
+            Ok(self.state.get_ns(namespace, local_name))
+        }
+
+        unsafe fn has_attribute_ns(
+            &self,
+            host_context: *mut c_void,
+            namespace: Option<&str>,
+            local_name: &str,
+        ) -> Option<bool> {
+            assert!(!host_context.is_null());
+            Some(self.state.get_ns(namespace, local_name).is_some())
         }
 
         fn node_type(&self) -> u16 {
@@ -3531,10 +3694,16 @@ mod tests {
                     ("id", "target"),
                     ("class", "alpha beta"),
                     ("data-proof", "present"),
+                    ("data-empty", ""),
                 ],
                 "probe text",
                 true,
             );
+            id_element_state.namespaced_attributes.borrow_mut().push((
+                "http://www.w3.org/1999/xlink".to_owned(),
+                "href".to_owned(),
+                "#shape".to_owned(),
+            ));
             id_element_state.element_children.borrow_mut().extend([
                 ElementProbeChild {
                     identity: Rc::new(0),
@@ -4168,6 +4337,54 @@ mod tests {
         // SAFETY: output is non-null caller-owned writable storage.
         unsafe { *output = result };
         succeeded as u8
+    }
+
+    unsafe extern "C" fn adversarial_element_get_attribute_ns(
+        native: *mut c_void,
+        host_context: *mut c_void,
+        namespace_is_null: u8,
+        namespace: *const u8,
+        namespace_length: usize,
+        local_name: *const u8,
+        local_name_length: usize,
+        output: *mut OptionalOwnedUtf8,
+    ) -> u8 {
+        if host_context.is_null()
+            || namespace_is_null != 1
+            || !namespace.is_null()
+            || namespace_length != 0
+            || local_name.is_null()
+            || local_name_length == 0
+        {
+            return 0;
+        }
+        // SAFETY: This operation deliberately uses the same adversarial
+        // transfer modes as the optional attribute getter; native and output
+        // retain the original callback contract.
+        unsafe { adversarial_element_namespace_uri(native, output) }
+    }
+
+    unsafe extern "C" fn adversarial_element_has_attribute_ns(
+        native: *mut c_void,
+        host_context: *mut c_void,
+        _namespace_is_null: u8,
+        _namespace: *const u8,
+        _namespace_length: usize,
+        _local_name: *const u8,
+        _local_name_length: usize,
+        output: *mut u8,
+    ) -> u8 {
+        if native.is_null() || host_context.is_null() || output.is_null() {
+            return 0;
+        }
+        // SAFETY: The custom vtable is installed for exactly this host type.
+        let mode = unsafe { &*native.cast::<ElementHostProbe>() }.id();
+        if mode == "boolean-callback-failure" {
+            return 0;
+        }
+        // SAFETY: output is non-null caller-owned writable storage.
+        unsafe { *output = if mode == "invalid-boolean" { 2 } else { 1 } };
+        1
     }
 
     impl Drop for NativeSmoke {
@@ -5640,11 +5857,119 @@ mod tests {
                 .eval_bool_in_realm(realm, "getElementByIdBindingProof")
                 .unwrap()
         );
+
+        let attribute_namespace_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const element = document.getElementById('target');
+              const prototype = Object.getPrototypeOf(element);
+              const getDescriptor = Object.getOwnPropertyDescriptor(prototype, 'getAttributeNS');
+              const hasDescriptor = Object.getOwnPropertyDescriptor(prototype, 'hasAttributeNS');
+              const xlink = 'http://www.w3.org/1999/xlink';
+              let wrongBrandConversions = 0;
+              let getWrongBrand = false;
+              let hasWrongBrand = false;
+              try {
+                getDescriptor.value.call({},
+                  { toString() { wrongBrandConversions++; return null; } },
+                  { toString() { wrongBrandConversions++; return 'data-proof'; } });
+              } catch (error) { getWrongBrand = error instanceof TypeError; }
+              try {
+                hasDescriptor.value.call({},
+                  { toString() { wrongBrandConversions++; return null; } },
+                  { toString() { wrongBrandConversions++; return 'data-proof'; } });
+              } catch (error) { hasWrongBrand = error instanceof TypeError; }
+
+              let arityConversions = 0;
+              let missingSecond = false;
+              try {
+                element.getAttributeNS({
+                  toString() { arityConversions++; return ''; }
+                });
+              } catch (error) { missingSecond = error instanceof TypeError; }
+              let missingBoth = false;
+              try { element.hasAttributeNS(); }
+              catch (error) { missingBoth = error instanceof TypeError; }
+
+              const getOrder = [];
+              const orderedValue = element.getAttributeNS(
+                { toString() { getOrder.push('namespace'); return xlink; } },
+                { toString() { getOrder.push('localName'); return 'href'; } });
+              const hasOrder = [];
+              const orderedHas = element.hasAttributeNS(
+                { toString() { hasOrder.push('namespace'); return xlink; } },
+                { toString() { hasOrder.push('localName'); return 'href'; } });
+
+              const sentinel = new Error('namespace conversion sentinel');
+              let secondConverted = false;
+              let conversionErrorPreserved = false;
+              try {
+                element.getAttributeNS(
+                  { toString() { throw sentinel; } },
+                  { toString() { secondConverted = true; return 'href'; } });
+              } catch (error) { conversionErrorPreserved = error === sentinel; }
+              let namespaceSymbolRejected = false;
+              let localNameSymbolRejected = false;
+              try { element.getAttributeNS(Symbol('namespace'), 'href'); }
+              catch (error) { namespaceSymbolRejected = error instanceof TypeError; }
+              try { element.hasAttributeNS(null, Symbol('localName')); }
+              catch (error) { localNameSymbolRejected = error instanceof TypeError; }
+
+              globalThis.attributeNamespaceBindingProof =
+                getDescriptor && getDescriptor.value.name === 'getAttributeNS' &&
+                getDescriptor.value.length === 2 && getDescriptor.writable &&
+                getDescriptor.enumerable && getDescriptor.configurable &&
+                hasDescriptor && hasDescriptor.value.name === 'hasAttributeNS' &&
+                hasDescriptor.value.length === 2 && hasDescriptor.writable &&
+                hasDescriptor.enumerable && hasDescriptor.configurable &&
+                !Object.hasOwn(element, 'getAttributeNS') &&
+                !Object.hasOwn(element, 'hasAttributeNS') &&
+                getWrongBrand && hasWrongBrand && wrongBrandConversions === 0 &&
+                missingSecond && missingBoth && arityConversions === 0 &&
+                orderedValue === '#shape' && orderedHas === true &&
+                getOrder.join(',') === 'namespace,localName' &&
+                hasOrder.join(',') === 'namespace,localName' &&
+                conversionErrorPreserved && !secondConverted &&
+                namespaceSymbolRejected && localNameSymbolRejected &&
+                element.getAttributeNS(null, 'data-proof') === 'present' &&
+                element.getAttributeNS(undefined, 'data-proof') === 'present' &&
+                element.getAttributeNS('', 'data-proof') === 'present' &&
+                element.getAttributeNS(null, 'data-empty') === '' &&
+                element.getAttributeNS(null, 'missing') === null &&
+                element.getAttributeNS(null, 'DATA-PROOF') === null &&
+                element.getAttributeNS(xlink, 'href') === '#shape' &&
+                element.getAttributeNS(null, 'href') === null &&
+                element.getAttributeNS(null, 'data-proof', 'ignored') === 'present' &&
+                element.hasAttributeNS(null, 'data-proof') &&
+                element.hasAttributeNS(undefined, 'data-proof') &&
+                element.hasAttributeNS('', 'data-proof') &&
+                !element.hasAttributeNS(null, 'missing') &&
+                element.hasAttributeNS(xlink, 'href') &&
+                !element.hasAttributeNS(null, 'href');
+            })();"#,
+            "attribute-namespace-binding.js",
+            1,
+        ));
+        // SAFETY: The token stays live for the synchronous namespace lookup.
+        let attribute_namespace_outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                attribute_namespace_script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(attribute_namespace_outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "attributeNamespaceBindingProof")
+                .unwrap()
+        );
         assert_eq!(
             &*get_element_by_id_calls.borrow(),
             &[
                 "target", "target", "target", "target", "target", "target", "missing", "", "a\0b",
-                "\u{fffd}",
+                "\u{fffd}", "target",
             ]
         );
         assert!(
@@ -7118,6 +7443,8 @@ mod tests {
         let remove = element_host_remove::<ElementHostProbe>;
         let namespace_uri = element_host_get_namespace_uri::<ElementHostProbe>;
         let prefix = element_host_get_prefix::<ElementHostProbe>;
+        let get_attribute_ns = element_host_get_attribute_ns::<ElementHostProbe>;
+        let has_attribute_ns = element_host_has_attribute_ns::<ElementHostProbe>;
         let parent_element = element_host_get_parent_element::<ElementHostProbe>;
         let previous = element_host_get_previous_element_sibling::<ElementHostProbe>;
         let next = element_host_get_next_element_sibling::<ElementHostProbe>;
@@ -7219,6 +7546,237 @@ mod tests {
             assert_eq!(optional_string_output.value.length, 0);
             assert!(optional_string_output.value.owner.is_null());
             assert!(optional_string_output.value.drop_owner.is_none());
+
+            let xlink = b"http://www.w3.org/1999/xlink";
+            let href = b"href";
+            let data_proof = b"data-proof";
+            let data_empty = b"data-empty";
+            let missing = b"missing";
+            let mut attribute_boolean_output = u8::MAX;
+            assert_eq!(
+                get_attribute_ns(
+                    std::ptr::null_mut(),
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    &mut optional_string_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    std::ptr::null_mut(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    &mut optional_string_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    2,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    &mut optional_string_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    xlink.as_ptr(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    &mut optional_string_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    1,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    &mut optional_string_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    0,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    &mut optional_string_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut optional_string_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    std::ptr::null_mut(),
+                ),
+                0,
+            );
+
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    &mut optional_string_output,
+                ),
+                1,
+            );
+            assert_eq!(optional_string_output.is_null, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    optional_string_output.value.data,
+                    optional_string_output.value.length,
+                ),
+                b"present",
+            );
+            optional_string_output.value.drop_owner.unwrap()(optional_string_output.value.owner);
+
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    data_empty.as_ptr(),
+                    data_empty.len(),
+                    &mut optional_string_output,
+                ),
+                1,
+            );
+            assert_eq!(optional_string_output.is_null, 0);
+            assert_eq!(optional_string_output.value.length, 0);
+            optional_string_output.value.drop_owner.unwrap()(optional_string_output.value.owner);
+
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    0,
+                    xlink.as_ptr(),
+                    xlink.len(),
+                    href.as_ptr(),
+                    href.len(),
+                    &mut optional_string_output,
+                ),
+                1,
+            );
+            assert_eq!(optional_string_output.is_null, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    optional_string_output.value.data,
+                    optional_string_output.value.length,
+                ),
+                b"#shape",
+            );
+            optional_string_output.value.drop_owner.unwrap()(optional_string_output.value.owner);
+
+            assert_eq!(
+                get_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    missing.as_ptr(),
+                    missing.len(),
+                    &mut optional_string_output,
+                ),
+                1,
+            );
+            assert_eq!(optional_string_output.is_null, 1);
+
+            assert_eq!(
+                has_attribute_ns(
+                    native,
+                    host_context,
+                    0,
+                    xlink.as_ptr(),
+                    xlink.len(),
+                    href.as_ptr(),
+                    href.len(),
+                    &mut attribute_boolean_output,
+                ),
+                1,
+            );
+            assert_eq!(attribute_boolean_output, 1);
+            assert_eq!(
+                has_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    missing.as_ptr(),
+                    missing.len(),
+                    &mut attribute_boolean_output,
+                ),
+                1,
+            );
+            assert_eq!(attribute_boolean_output, 0);
+            assert_eq!(
+                has_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                    std::ptr::null_mut(),
+                ),
+                0,
+            );
 
             assert_eq!(
                 closest(
@@ -7481,6 +8039,8 @@ mod tests {
         .unwrap();
         let mut vtable = element_host_vtable::<ElementHostProbe>();
         vtable.get_namespace_uri = Some(adversarial_element_namespace_uri);
+        vtable.get_attribute_ns = Some(adversarial_element_get_attribute_ns);
+        vtable.has_attribute_ns = Some(adversarial_element_has_attribute_ns);
         let mut storage = [0; ERROR_CAPACITY];
         let mut error = error_buffer(&mut storage);
         // SAFETY: The complete vtable contains callbacks for the exact probe
@@ -7536,22 +8096,37 @@ mod tests {
                const rejectionByMode = {};\n\
                const rejected = malformedModes.map(mode => {\n\
                  target.id = mode;\n\
-                 try { target.namespaceURI; return rejectionByMode[mode] = false; }\n\
-                 catch (error) {\n\
-                   return rejectionByMode[mode] = error instanceof TypeError;\n\
-                 }\n\
+                 let namespaceRejected = false;\n\
+                 let attributeRejected = false;\n\
+                 try { target.namespaceURI; }\n\
+                 catch (error) { namespaceRejected = error instanceof TypeError; }\n\
+                 try { target.getAttributeNS(null, 'probe'); }\n\
+                 catch (error) { attributeRejected = error instanceof TypeError; }\n\
+                 return rejectionByMode[mode] = namespaceRejected && attributeRejected;\n\
                }).every(Boolean);\n\
                target.id = 'valid-empty';\n\
-               const emptyPreserved = target.namespaceURI === '';\n\
+               const emptyPreserved = target.namespaceURI === '' &&\n\
+                 target.getAttributeNS(null, 'probe') === '';\n\
                target.id = 'valid';\n\
-               const validValue = target.namespaceURI === 'urn:servo-v8:valid';\n\
+               const validValue = target.namespaceURI === 'urn:servo-v8:valid' &&\n\
+                 target.getAttributeNS(null, 'probe') === 'urn:servo-v8:valid';\n\
+               target.id = 'invalid-boolean';\n\
+               let invalidBooleanRejected = false;\n\
+               try { target.hasAttributeNS(null, 'probe'); }\n\
+               catch (error) { invalidBooleanRejected = error instanceof TypeError; }\n\
+               target.id = 'boolean-callback-failure';\n\
+               let booleanFailureRejected = false;\n\
+               try { target.hasAttributeNS(null, 'probe'); }\n\
+               catch (error) { booleanFailureRejected = error instanceof TypeError; }\n\
                const nullPrefix = target.prefix === null;\n\
                globalThis.optionalElementStringDetails = {\n\
                  exactSurface, rejected, emptyPreserved, validValue, nullPrefix,\n\
+                 invalidBooleanRejected, booleanFailureRejected,\n\
                  rejectionByMode\n\
                };\n\
                globalThis.optionalElementStringProof = exactSurface && rejected &&\n\
-                 emptyPreserved && validValue && nullPrefix;\n\
+                 emptyPreserved && validValue && nullPrefix &&\n\
+                 invalidBooleanRejected && booleanFailureRejected;\n\
              })();",
             "optional-element-string-adversarial.js",
             1,
@@ -7567,7 +8142,14 @@ mod tests {
         }
         .unwrap();
         assert_eq!(outcome, ScriptRunOutcome::Completed);
-        for name in ["exactSurface", "emptyPreserved", "validValue", "nullPrefix"] {
+        for name in [
+            "exactSurface",
+            "emptyPreserved",
+            "validValue",
+            "nullPrefix",
+            "invalidBooleanRejected",
+            "booleanFailureRejected",
+        ] {
             assert!(
                 runtime
                     .eval_bool_in_realm(realm, &format!("optionalElementStringDetails.{name}"),)
@@ -7593,12 +8175,12 @@ mod tests {
                 "malformed optional Element string was accepted: {mode}",
             );
         }
-        assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 5);
+        assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 10);
         assert_eq!(element_drops.get(), 0);
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(element_drops.get(), 1);
         assert_eq!(document_drops.get(), 1);
-        assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 5);
+        assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 10);
     }
 
     #[test]

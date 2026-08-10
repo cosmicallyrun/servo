@@ -73,7 +73,9 @@ ELEMENT_ID = "Element.id"
 ELEMENT_CLASS_NAME = "Element.className"
 ELEMENT_HAS_ATTRIBUTES = "Element.hasAttributes"
 ELEMENT_GET_ATTRIBUTE = "Element.getAttribute"
+ELEMENT_GET_ATTRIBUTE_NS = "Element.getAttributeNS"
 ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
+ELEMENT_HAS_ATTRIBUTE_NS = "Element.hasAttributeNS"
 ELEMENT_CHILDREN = "Element.children"
 ELEMENT_NAMESPACE_URI = "Element.namespaceURI"
 ELEMENT_PREFIX = "Element.prefix"
@@ -289,7 +291,9 @@ ELEMENT_HOST = (
     ELEMENT_CLASS_NAME,
     ELEMENT_HAS_ATTRIBUTES,
     ELEMENT_GET_ATTRIBUTE,
+    ELEMENT_GET_ATTRIBUTE_NS,
     ELEMENT_HAS_ATTRIBUTE,
+    ELEMENT_HAS_ATTRIBUTE_NS,
     ELEMENT_CHILDREN,
     ELEMENT_NAMESPACE_URI,
     ELEMENT_PREFIX,
@@ -1391,6 +1395,71 @@ def _select_element_host_member(
         return select_newobject_throws_domstring_to_interface_operation(
             parser_results, qualified_name, "NodeList"
         )
+    if member_name in {"getAttributeNS", "hasAttributeNS"}:
+        expected_attributes = {"Pure"} if member_name == "getAttributeNS" else set()
+        actual_attributes = set(member._extendedAttrDict)
+        if actual_attributes != expected_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+                f"got {sorted(actual_attributes)}"
+            )
+        signatures = member.signatures()
+        if len(signatures) != 1:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must have exactly one signature, "
+                f"found {len(signatures)}"
+            )
+        return_type, arguments = signatures[0]
+        if member_name == "getAttributeNS":
+            valid_return = return_type.nullable() and return_type.inner.isDOMString()
+            expected_return = "nullable `DOMString`"
+        else:
+            valid_return = return_type.nullable() is False and return_type.isBoolean()
+            expected_return = "non-nullable `boolean`"
+        if not valid_return:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must return {expected_return}, "
+                f"got `{return_type.prettyName()}`"
+            )
+        if len(arguments) != 2:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take exactly two arguments, "
+                f"found {len(arguments)}"
+            )
+        namespace, local_name = arguments
+        if (
+            namespace.identifier.name != "namespace"
+            or namespace.optional
+            or namespace.variadic
+            or not namespace.type.nullable()
+            or not namespace.type.inner.isDOMString()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` first argument `namespace` must be "
+                "required, non-variadic nullable `DOMString`"
+            )
+        if (
+            local_name.identifier.name != "localName"
+            or local_name.optional
+            or local_name.variadic
+            or local_name.type.nullable()
+            or not local_name.type.isDOMString()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` second argument `localName` must be "
+                "required, non-variadic non-nullable `DOMString`"
+            )
+        for argument in arguments:
+            argument_attributes = set(argument._extendedAttrDict) | set(
+                argument.type._extendedAttrDict
+            )
+            if argument_attributes:
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` arguments carry extended attributes "
+                    "that are not implemented: "
+                    + ", ".join(sorted(argument_attributes))
+                )
+        return member
     if member_name == "remove":
         expected_attributes = {"CEReactions", "Unscopable"}
         actual_attributes = set(member._extendedAttrDict)

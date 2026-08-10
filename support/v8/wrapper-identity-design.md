@@ -17,6 +17,8 @@ accessors; they introduce no cross-heap return value or wrapper-cache entry.
 ABI version 33 adds inherited `Node.parentElement` on Element wrappers; a
 non-null parent converges through the existing Element wrapper cache and a
 removed child returns null without creating a cache entry.
+ABI version 34 adds `Element.getAttributeNS` and `Element.hasAttributeNS`.
+Their scalar nullable-string/boolean results use no wrapper-cache entry.
 `Document.documentElement`, `Document.head`, `Document.getElementById()`, the
 Element/Node scalar slices, Element removal, and ParentNode traversal are built
 on it.
@@ -284,7 +286,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_element_remove_proof.html`, and
 `authoritative_element_sibling_proof.html`, and
 `authoritative_element_namespace_proof.html`, and
-`authoritative_parent_element_proof.html` cover runtime behaviour
+`authoritative_parent_element_proof.html`, and
+`authoritative_attribute_namespace_proof.html` cover runtime behaviour
 against real Servo DOM, and `interface_returns_preserve_wrapper_identity`
 covers the bridge:
 

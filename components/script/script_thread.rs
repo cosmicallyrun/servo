@@ -524,6 +524,54 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
     }
 
+    unsafe fn get_attribute_ns(
+        &self,
+        host_context: *mut c_void,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Result<Option<String>, ()> {
+        if host_context.is_null() {
+            return Err(());
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let value = self
+            .element
+            .root()
+            .GetAttributeNS(
+                cx,
+                namespace.map(DOMString::from),
+                DOMString::from(local_name),
+            )
+            .map(Into::into);
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            Err(())
+        } else {
+            Ok(value)
+        }
+    }
+
+    unsafe fn has_attribute_ns(
+        &self,
+        host_context: *mut c_void,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Option<bool> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let value = self.element.root().HasAttributeNS(
+            cx,
+            namespace.map(DOMString::from),
+            DOMString::from(local_name),
+        );
+        // SAFETY: cx is the live owner-thread SpiderMonkey context.
+        (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
+    }
+
     fn get_elements_by_class_name(&self, class_names: &str) -> servo_v8::HTMLCollectionHandle {
         let element = self.element.root();
         v8_class_collection_handle(element.upcast::<Node>(), class_names)
