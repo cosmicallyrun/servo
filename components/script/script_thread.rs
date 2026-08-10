@@ -537,6 +537,11 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         self.element.root().upcast::<Node>().NodeName().into()
     }
 
+    fn parent_element(&self) -> Option<servo_v8::InterfaceHandle> {
+        let parent = self.element.root().upcast::<Node>().GetParentElement()?;
+        Some(v8_element_interface_handle(&parent))
+    }
+
     fn namespace_uri(&self) -> Option<String> {
         self.element.root().GetNamespaceURI().map(Into::into)
     }

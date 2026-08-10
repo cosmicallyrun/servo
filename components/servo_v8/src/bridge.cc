@@ -2484,6 +2484,13 @@ void NodeHostGetNodeName(const v8::FunctionCallbackInfo<v8::Value>& info) {
                        "Node.nodeName host callback failed");
 }
 
+void NodeHostGetParentElement(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ElementHostGetInterface(info,
+                          &ServoV8ElementHostVTable::get_parent_element,
+                          "Node.parentElement host callback failed");
+}
+
 using ElementBooleanGetter = uint8_t (*)(void* native, uint8_t* output);
 using ElementBooleanGetterSlot =
     ElementBooleanGetter ServoV8ElementHostVTable::*;
@@ -2832,6 +2839,7 @@ bool InstallNodePrototype(ServoV8RealmState* realm,
       {"nodeName", &NodeHostGetNodeName, nullptr},
       {"isConnected", &NodeHostGetIsConnected, nullptr},
       {"textContent", &NodeHostGetTextContent, &NodeHostSetTextContent},
+      {"parentElement", &NodeHostGetParentElement, nullptr},
   };
   for (const auto& accessor : accessors) {
     v8::Local<v8::Function> getter;
@@ -4315,7 +4323,8 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_attribute || !vtable->has_attribute ||
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
-      !vtable->set_text_content || !vtable->has_child_nodes ||
+      !vtable->set_text_content || !vtable->get_parent_element ||
+      !vtable->has_child_nodes ||
       !vtable->get_children || !vtable->get_elements_by_class_name ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
       !vtable->get_child_element_count ||

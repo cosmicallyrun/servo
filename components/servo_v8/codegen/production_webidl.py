@@ -44,6 +44,7 @@ DOCUMENT_TITLE = "Document.title"
 NODE_NODE_TYPE = "Node.nodeType"
 NODE_NODE_NAME = "Node.nodeName"
 NODE_IS_CONNECTED = "Node.isConnected"
+NODE_PARENT_ELEMENT = "Node.parentElement"
 NODE_TEXT_CONTENT = "Node.textContent"
 NODE_HAS_CHILD_NODES = "Node.hasChildNodes"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
@@ -306,12 +307,14 @@ ELEMENT_HOST = (
     ELEMENT_REMOVE,
 )
 
-# Inherited scalar behavior installed on the Node prototype shared by Element
-# wrappers. These members introduce no new cross-heap edge or interface input.
+# Inherited behavior installed on the Node prototype shared by Element
+# wrappers. The scalar members introduce no new cross-heap edge or interface
+# input; parentElement reuses the existing nullable Element return path.
 NODE_HOST = (
     NODE_NODE_TYPE,
     NODE_NODE_NAME,
     NODE_IS_CONNECTED,
+    NODE_PARENT_ELEMENT,
     NODE_TEXT_CONTENT,
     NODE_HAS_CHILD_NODES,
 )
@@ -1499,6 +1502,7 @@ def _select_node_host_member(
         "nodeType": {"Constant"},
         "nodeName": {"Pure"},
         "isConnected": {"Pure"},
+        "parentElement": {"Pure"},
         "textContent": {"CEReactions", "Pure", "SetterThrows"},
     }
     if member_name in attribute_attributes:
@@ -1527,6 +1531,16 @@ def _select_node_host_member(
             if member.type.nullable() or not member.type.isBoolean():
                 raise WebIDLSelectionError(
                     f"`{qualified_name}` must use non-nullable `boolean`, "
+                    f"got `{member.type.prettyName()}`"
+                )
+        elif member_name == "parentElement":
+            if (
+                not member.type.nullable()
+                or not member.type.inner.isInterface()
+                or member.type.inner.name != "Element"
+            ):
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` must use nullable `Element`, "
                     f"got `{member.type.prettyName()}`"
                 )
         elif member_name == "textContent":

@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 32;
+const ABI_VERSION: u32 = 33;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -358,6 +358,7 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     fn is_connected(&self) -> bool;
     fn text_content(&self) -> Option<String>;
     unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool;
+    fn parent_element(&self) -> Option<InterfaceHandle>;
     fn has_child_nodes(&self) -> bool;
     fn children(&self) -> HTMLCollectionHandle;
     fn get_elements_by_class_name(&self, class_names: &str) -> HTMLCollectionHandle;
@@ -421,6 +422,7 @@ pub struct ElementHostVTable {
     pub get_text_content: Option<unsafe extern "C" fn(*mut c_void, *mut OptionalOwnedUtf8) -> u8>,
     pub set_text_content:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
+    pub get_parent_element: Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
     pub get_children: Option<unsafe extern "C" fn(*mut c_void, *mut RawHTMLCollectionValue) -> u8>,
     pub get_elements_by_class_name: Option<
@@ -1022,6 +1024,19 @@ unsafe extern "C" fn element_host_set_text_content<T: ElementHostBinding>(
     unsafe { (&*native.cast::<T>()).set_text_content(host_context, value) as u8 }
 }
 
+unsafe extern "C" fn element_host_get_parent_element<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut RawInterfaceValue,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let handle = unsafe { (&*native.cast::<T>()).parent_element() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_interface_value(output, handle) }
+}
+
 unsafe extern "C" fn element_host_has_child_nodes<T: ElementHostBinding>(
     native: *mut c_void,
     output: *mut u8,
@@ -1436,6 +1451,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         get_is_connected: Some(element_host_get_is_connected::<T>),
         get_text_content: Some(element_host_get_text_content::<T>),
         set_text_content: Some(element_host_set_text_content::<T>),
+        get_parent_element: Some(element_host_get_parent_element::<T>),
         has_child_nodes: Some(element_host_has_child_nodes::<T>),
         get_children: Some(element_host_get_children::<T>),
         get_elements_by_class_name: Some(element_host_get_elements_by_class_name::<T>),
@@ -2722,6 +2738,15 @@ mod tests {
     }
 
     /// A stand-in for one Servo Element.
+    #[derive(Clone)]
+    struct ParentElementProbe {
+        local_name: String,
+        tag_name: String,
+        identity: *const c_void,
+        state: Rc<ElementProbeState>,
+        owned_identity: Option<Rc<u8>>,
+    }
+
     struct ElementHostProbe {
         local_name: String,
         tag_name: String,
@@ -2732,6 +2757,7 @@ mod tests {
         _owned_identity: Option<Rc<u8>>,
         parent_children: Option<Rc<RefCell<Vec<ElementProbeChild>>>>,
         parent_state: Option<Rc<ElementProbeState>>,
+        parent_element: Option<ParentElementProbe>,
         drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -2745,6 +2771,7 @@ mod tests {
         owned_identity: Option<Rc<u8>>,
         parent_children: Option<Rc<RefCell<Vec<ElementProbeChild>>>>,
         parent_state: Option<Rc<ElementProbeState>>,
+        parent_element: Option<ParentElementProbe>,
         element_drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
     }
@@ -2764,6 +2791,7 @@ mod tests {
                         _owned_identity: self.owned_identity.clone(),
                         parent_children: self.parent_children.clone(),
                         parent_state: self.parent_state.clone(),
+                        parent_element: self.parent_element.clone(),
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -2803,6 +2831,7 @@ mod tests {
         items: Rc<RefCell<Vec<ElementProbeChild>>>,
         required_classes: Option<Vec<String>>,
         parent_state: Option<Rc<ElementProbeState>>,
+        parent_element: Option<ParentElementProbe>,
         element_drops: Rc<Cell<usize>>,
         drop_reentry: Option<ElementDropReentryProbe>,
         drops: Rc<Cell<usize>>,
@@ -2847,6 +2876,7 @@ mod tests {
                 owned_identity: Some(child.identity),
                 parent_children: Some(Rc::clone(&self.items)),
                 parent_state: self.parent_state.clone(),
+                parent_element: self.parent_element.clone(),
                 element_drops: Rc::clone(&self.element_drops),
                 drop_reentry: self.drop_reentry.clone(),
             }
@@ -3015,6 +3045,37 @@ mod tests {
             true
         }
 
+        fn parent_element(&self) -> Option<InterfaceHandle> {
+            let parent = self.parent_element.as_ref()?;
+            let parent_children = self.parent_children.as_ref()?;
+            if !parent_children
+                .borrow()
+                .iter()
+                .any(|child| Rc::as_ptr(&child.identity).cast::<c_void>() == self.identity)
+            {
+                return None;
+            }
+            // SAFETY: The descriptor carries the parent's stable cache key,
+            // rooted state, and optional Rc identity for this returned host.
+            Some(unsafe {
+                InterfaceHandle::new(
+                    parent.identity,
+                    ElementHostProbe {
+                        local_name: parent.local_name.clone(),
+                        tag_name: parent.tag_name.clone(),
+                        identity: parent.identity,
+                        state: Rc::clone(&parent.state),
+                        _owned_identity: parent.owned_identity.clone(),
+                        parent_children: None,
+                        parent_state: None,
+                        parent_element: None,
+                        drops: Rc::clone(&self.drops),
+                        drop_reentry: self.drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
         fn has_child_nodes(&self) -> bool {
             self.state.has_child_nodes.get()
         }
@@ -3029,6 +3090,7 @@ mod tests {
                         items: Rc::clone(&self.state.element_children),
                         required_classes: None,
                         parent_state: Some(Rc::clone(&self.state)),
+                        parent_element: Some(self.parent_descriptor()),
                         element_drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                         drops: Rc::clone(&self.state.html_collection_drops),
@@ -3051,6 +3113,7 @@ mod tests {
                             .collect(),
                     ),
                     parent_state: Some(Rc::clone(&self.state)),
+                    parent_element: Some(self.parent_descriptor()),
                     element_drops: Rc::clone(&self.drops),
                     drop_reentry: self.drop_reentry.clone(),
                     drops: Rc::clone(&self.state.html_collection_drops),
@@ -3182,8 +3245,9 @@ mod tests {
                     identity: Rc::as_ptr(&child.identity).cast(),
                     state: Rc::clone(&child.state),
                     owned_identity: Some(Rc::clone(&child.identity)),
-                    parent_children: None,
-                    parent_state: None,
+                    parent_children: Some(Rc::clone(&self.state.element_children)),
+                    parent_state: Some(Rc::clone(&self.state)),
+                    parent_element: Some(self.parent_descriptor()),
                     element_drops: Rc::clone(&self.drops),
                     drop_reentry: self.drop_reentry.clone(),
                 })
@@ -3197,6 +3261,16 @@ mod tests {
     }
 
     impl ElementHostProbe {
+        fn parent_descriptor(&self) -> ParentElementProbe {
+            ParentElementProbe {
+                local_name: self.local_name.clone(),
+                tag_name: self.tag_name.clone(),
+                identity: self.identity,
+                state: Rc::clone(&self.state),
+                owned_identity: self._owned_identity.clone(),
+            }
+        }
+
         fn selector_matches(&self, selectors: &str) -> Result<bool, ()> {
             if selectors == "[" || selectors.is_empty() {
                 return Err(());
@@ -3227,6 +3301,7 @@ mod tests {
                         _owned_identity: self._owned_identity.clone(),
                         parent_children: self.parent_children.clone(),
                         parent_state: self.parent_state.clone(),
+                        parent_element: self.parent_element.clone(),
                         drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -3249,6 +3324,7 @@ mod tests {
                         _owned_identity: Some(child.identity),
                         parent_children: Some(Rc::clone(&self.state.element_children)),
                         parent_state: Some(Rc::clone(&self.state)),
+                        parent_element: Some(self.parent_descriptor()),
                         drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -3277,6 +3353,7 @@ mod tests {
                         _owned_identity: Some(sibling.identity),
                         parent_children: Some(Rc::clone(parent_children)),
                         parent_state: self.parent_state.clone(),
+                        parent_element: self.parent_element.clone(),
                         drops: Rc::clone(&self.drops),
                         drop_reentry: self.drop_reentry.clone(),
                     },
@@ -3614,6 +3691,7 @@ mod tests {
                         _owned_identity: None,
                         parent_children: None,
                         parent_state: None,
+                        parent_element: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -3638,6 +3716,7 @@ mod tests {
                         _owned_identity: None,
                         parent_children: None,
                         parent_state: None,
+                        parent_element: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -3664,6 +3743,7 @@ mod tests {
                         items,
                         required_classes: None,
                         parent_state: None,
+                        parent_element: None,
                         element_drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                         drops: Rc::clone(&self.html_collection_drops),
@@ -3716,6 +3796,7 @@ mod tests {
                             .collect(),
                     ),
                     parent_state: None,
+                    parent_element: None,
                     element_drops: Rc::clone(&self.element_drops),
                     drop_reentry: self.element_drop_reentry.clone(),
                     drops: Rc::clone(&self.html_collection_drops),
@@ -3760,6 +3841,7 @@ mod tests {
                         _owned_identity: None,
                         parent_children: None,
                         parent_state: None,
+                        parent_element: None,
                         drops: Rc::clone(&self.element_drops),
                         drop_reentry: self.element_drop_reentry.clone(),
                     },
@@ -3807,6 +3889,7 @@ mod tests {
                     state: Rc::clone(state),
                     parent_children: None,
                     parent_state: None,
+                    parent_element: None,
                     owned_identity: None,
                     element_drops: Rc::clone(&self.element_drops),
                     drop_reentry: self.element_drop_reentry.clone(),
@@ -5924,6 +6007,9 @@ mod tests {
               const second = collection[1];
               const snapshot = target.querySelectorAll('*');
               const elementPrototype = Object.getPrototypeOf(first);
+              const nodePrototype = Object.getPrototypeOf(elementPrototype);
+              const parentDescriptor = Object.getOwnPropertyDescriptor(
+                nodePrototype, 'parentElement');
               const removeDescriptor = Object.getOwnPropertyDescriptor(
                 elementPrototype, 'remove');
               const previousDescriptor = Object.getOwnPropertyDescriptor(
@@ -5948,10 +6034,13 @@ mod tests {
               } catch (error) { wrongBrand = error instanceof TypeError; }
               let previousWrongBrand = false;
               let nextWrongBrand = false;
+              let parentWrongBrand = false;
               try { previousDescriptor.get.call({}); }
               catch (error) { previousWrongBrand = error instanceof TypeError; }
               try { nextDescriptor.get.call({}); }
               catch (error) { nextWrongBrand = error instanceof TypeError; }
+              try { parentDescriptor.get.call({}); }
+              catch (error) { parentWrongBrand = error instanceof TypeError; }
 
               const descriptorShape = removeDescriptor &&
                 removeDescriptor.value.name === 'remove' &&
@@ -5970,6 +6059,20 @@ mod tests {
                 nextWrongBrand &&
                 !Object.hasOwn(first, 'previousElementSibling') &&
                 !Object.hasOwn(first, 'nextElementSibling');
+              const parentDescriptorShape = parentDescriptor &&
+                parentDescriptor.get.name === 'get parentElement' &&
+                parentDescriptor.get.length === 0 &&
+                parentDescriptor.set === undefined &&
+                parentDescriptor.enumerable && parentDescriptor.configurable &&
+                parentWrongBrand &&
+                !Object.hasOwn(elementPrototype, 'parentElement') &&
+                !Object.hasOwn(first, 'parentElement');
+              target.parentMarker = 71;
+              const initialParents = first.parentElement === target &&
+                first.parentElement === first.parentElement &&
+                first.parentElement.parentMarker === 71 &&
+                second.parentElement === target &&
+                document.documentElement.parentElement === null;
               const initialSiblings =
                 first.previousElementSibling === null &&
                 first.nextElementSibling === second &&
@@ -5998,6 +6101,8 @@ mod tests {
                 first.nextElementSibling === null &&
                 second.previousElementSibling === null &&
                 second.nextElementSibling === null &&
+                first.parentElement === null &&
+                second.parentElement === target &&
                 !first.isConnected && second.isConnected;
               const freshSelectorMiss = target.querySelector('span') === null &&
                 target.querySelector('#first-child') === null &&
@@ -6015,7 +6120,8 @@ mod tests {
 
               globalThis.elementRemoveDetachedChild = first;
               globalThis.elementRemoveBindingProof =
-                descriptorShape && siblingDescriptorShape && initialSiblings &&
+                descriptorShape && siblingDescriptorShape && parentDescriptorShape &&
+                initialSiblings && initialParents &&
                 unscopablesShape && wrongBrand && !wrongBrandSurplusTouched && liveAfterRemove &&
                 freshSelectorMiss && staticSnapshotRetained &&
                 secondRemoveWasNoOp;
@@ -7012,6 +7118,7 @@ mod tests {
         let remove = element_host_remove::<ElementHostProbe>;
         let namespace_uri = element_host_get_namespace_uri::<ElementHostProbe>;
         let prefix = element_host_get_prefix::<ElementHostProbe>;
+        let parent_element = element_host_get_parent_element::<ElementHostProbe>;
         let previous = element_host_get_previous_element_sibling::<ElementHostProbe>;
         let next = element_host_get_next_element_sibling::<ElementHostProbe>;
         let query_all = element_host_query_selector_all::<ElementHostProbe>;
@@ -7061,6 +7168,13 @@ mod tests {
             assert_eq!(next(std::ptr::null_mut(), &mut sibling_output), 0);
             assert_eq!(next(native, std::ptr::null_mut()), 0);
             assert_eq!(next(native, &mut sibling_output), 1);
+            assert_eq!(sibling_output.is_null, 1);
+            assert!(sibling_output.key.is_null());
+            assert!(sibling_output.native.is_null());
+            sibling_output.is_null = 0;
+            assert_eq!(parent_element(std::ptr::null_mut(), &mut sibling_output), 0,);
+            assert_eq!(parent_element(native, std::ptr::null_mut()), 0);
+            assert_eq!(parent_element(native, &mut sibling_output), 1);
             assert_eq!(sibling_output.is_null, 1);
             assert!(sibling_output.key.is_null());
             assert!(sibling_output.native.is_null());

@@ -57,6 +57,7 @@ proofs=(
   "authoritative_element_remove_proof.html:(0, 255, 0):1:1"
   "authoritative_element_sibling_proof.html:(0, 255, 0):1:1"
   "authoritative_element_namespace_proof.html:(0, 255, 0):1:1"
+  "authoritative_parent_element_proof.html:(0, 255, 0):1:1"
   # bgColor is set by the SpiderMonkey error handler, not by V8.
   "authoritative_job_error_proof.html:(0, 255, 0):0:0"
 )

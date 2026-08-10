@@ -72,8 +72,8 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.characterSet`, `Document.charset`, `Document.inputEncoding`,
 `Document.contentType`, `Document.referrer`, `Document.lastModified`,
 `Document.visibilityState`, `Document.readyState`, `Document.title`,
-`Node.nodeType`, `Document.documentElement`, `Document.head`, and
-`Document.children`, `Document.firstElementChild`, `Document.lastElementChild`,
+`Node.nodeType`, `Node.parentElement`, `Document.documentElement`,
+`Document.head`, and `Document.children`, `Document.firstElementChild`,
 `Document.childElementCount`, `Document.getElementById`, and
 `Document.querySelector`, `Document.querySelectorAll`, and
 `Document.getElementsByClassName`, plus
@@ -199,6 +199,11 @@ ABI v32 adds `Element.namespaceURI` and `Element.prefix`. These read-only,
 brand-checked nullable-string accessors delegate to Servo's production Element
 getters, preserving the HTML and SVG namespace URI values and `null` for an
 unprefixed element. A non-null prefix is additionally pinned by Rust ABI tests.
+
+ABI v33 adds inherited `Node.parentElement` to Element wrappers. The read-only,
+brand-checked nullable Element accessor stays on the shared Node prototype and
+uses Servo's production `GetParentElement`; a non-null parent reuses the
+per-realm Element wrapper cache, while a retained removed child reads `null`.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -456,6 +461,7 @@ The proof suite uses that same counting argument:
 | `authoritative_element_remove_proof.html` | Element.remove uses Servo's ChildNode algorithm, updates live children while preserving static NodeList identity, and is unscopable |
 | `authoritative_element_sibling_proof.html` | Element-only sibling traversal skips text nodes, preserves wrapper identity, and updates after Element.remove |
 | `authoritative_element_namespace_proof.html` | HTML and inline SVG Element namespaceURI and null prefix accessors preserve descriptors, brands, and nullable-string values |
+| `authoritative_parent_element_proof.html` | inherited Node.parentElement stays on Node.prototype, preserves parent identity, and becomes null after Element.remove |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the

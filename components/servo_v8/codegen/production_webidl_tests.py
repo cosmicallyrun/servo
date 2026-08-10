@@ -380,6 +380,12 @@ class ProductionNodeTests(unittest.TestCase):
         self.assertTrue(members[production_webidl.NODE_NODE_TYPE].readonly)
         self.assertTrue(members[production_webidl.NODE_NODE_NAME].readonly)
         self.assertTrue(members[production_webidl.NODE_IS_CONNECTED].readonly)
+        parent_element = members[production_webidl.NODE_PARENT_ELEMENT]
+        self.assertTrue(parent_element.readonly)
+        self.assertTrue(parent_element.type.nullable())
+        self.assertTrue(parent_element.type.inner.isInterface())
+        self.assertEqual(parent_element.type.inner.name, "Element")
+        self.assertEqual(set(parent_element._extendedAttrDict), {"Pure"})
         text_content = members[production_webidl.NODE_TEXT_CONTENT]
         self.assertFalse(text_content.readonly)
         self.assertTrue(text_content.type.nullable())
@@ -388,6 +394,20 @@ class ProductionNodeTests(unittest.TestCase):
         ].signatures()[0]
         self.assertTrue(return_type.isBoolean())
         self.assertEqual(arguments, [])
+
+    def test_pins_real_node_parent_element_as_inherited_element_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_node_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        parent_element = members[production_webidl.NODE_PARENT_ELEMENT]
+        self.assertEqual(list(members), list(production_webidl.NODE_HOST))
+        self.assertTrue(parent_element.readonly)
+        self.assertTrue(parent_element.type.nullable())
+        self.assertEqual(parent_element.type.inner.name, "Element")
+        self.assertEqual(set(parent_element._extendedAttrDict), {"Pure"})
 
 
 class SyntheticSelectionTests(unittest.TestCase):
@@ -1767,7 +1787,10 @@ class SyntheticSelectionTests(unittest.TestCase):
         expected: str,
     ) -> None:
         parser_results = self.parse(
-            {"Node.webidl": f"interface Node {{ {declaration} }};"}
+            {
+                "Element.webidl": "interface Element {};",
+                "Node.webidl": f"interface Node {{ {declaration} }};",
+            }
         )
         with self.assertRaisesRegex(
             production_webidl.WebIDLSelectionError,
@@ -1793,6 +1816,66 @@ class SyntheticSelectionTests(unittest.TestCase):
         )
         self.assertFalse(member.readonly)
         self.assertTrue(member.type.nullable())
+
+    def test_selects_exact_node_parent_element(self) -> None:
+        parser_results = self.parse(
+            {
+                "Node.webidl": """
+                    interface Element {};
+                    interface Node {
+                      [Pure] readonly attribute Element? parentElement;
+                    };
+                """,
+            }
+        )
+        member = production_webidl._select_node_host_member(
+            parser_results,
+            production_webidl.NODE_PARENT_ELEMENT,
+        )
+        self.assertTrue(member.readonly)
+        self.assertEqual(set(member._extendedAttrDict), {"Pure"})
+        self.assertTrue(member.type.nullable())
+        self.assertEqual(member.type.inner.name, "Element")
+
+    def test_rejects_node_parent_element_shape_drift(self) -> None:
+        cases = (
+            (
+                "readonly attribute Element? parentElement;",
+                "`Node.parentElement` must carry exactly ['Pure'], got []",
+            ),
+            (
+                "[Pure, Throws] readonly attribute Element? parentElement;",
+                "`Node.parentElement` must carry exactly ['Pure'], "
+                "got ['Pure', 'Throws']",
+            ),
+            (
+                "[Pure] attribute Element? parentElement;",
+                "`Node.parentElement` must be readonly",
+            ),
+            (
+                "[Pure] readonly attribute Element parentElement;",
+                "`Node.parentElement` must use nullable `Element`, got `Element`",
+            ),
+            (
+                "[Pure] readonly attribute Node? parentElement;",
+                "`Node.parentElement` must use nullable `Element`, got `Node?`",
+            ),
+            (
+                "[Pure] readonly attribute DOMString? parentElement;",
+                "`Node.parentElement` must use nullable `Element`, got `DOMString?`",
+            ),
+            (
+                "[Pure] static readonly attribute Element? parentElement;",
+                "`Node.parentElement` must be an instance attribute",
+            ),
+        )
+        for declaration, expected in cases:
+            with self.subTest(declaration=declaration):
+                self.assert_node_rejected(
+                    declaration,
+                    "parentElement",
+                    expected,
+                )
 
     def test_rejects_node_text_content_without_setter_throws(self) -> None:
         self.assert_node_rejected(
