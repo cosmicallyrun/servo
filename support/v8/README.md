@@ -76,9 +76,10 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.head`, and `Document.children`, `Document.firstElementChild`,
 `Document.childElementCount`, `Document.getElementById`, and
 `Document.querySelector`, `Document.querySelectorAll`, and
-`Document.getElementsByClassName`, plus
+`Document.getElementsByClassName`, `Document.getElementsByTagName`, plus
 `Element.children`, `Element.querySelectorAll`,
-`Element.getElementsByClassName`, `Element.remove`,
+`Element.getElementsByClassName`, `Element.getElementsByTagName`,
+`Element.remove`,
 `Element.previousElementSibling`, `Element.nextElementSibling`, `Element.closest`,
 `Element.matches`, `Element.webkitMatchesSelector`, `Element.namespaceURI`,
 `Element.prefix`, `Element.getAttributeNS`, `Element.hasAttributeNS`, and
@@ -219,6 +220,14 @@ the ABI atomically, so returned arrays are snapshots rather than a live view.
 Servo's current parsed-XLink behavior emits local `href` from this operation;
 `getAttributeNS` separately preserves the XLink namespace identity. Retaining
 the source prefix is a pre-existing Servo parser issue outside this V8 slice.
+
+ABI v36 adds `Document.getElementsByTagName` and
+`Element.getElementsByTagName`. Each call returns a fresh live
+`HTMLCollection` rooted at its receiver and reuses the existing indexed,
+named-property, teardown, and Element-wrapper machinery. The production host
+matches `*`, ASCII-folds HTML element names only when the root is in an HTML
+document, and otherwise preserves case and qualified-prefix matching exactly
+as Servo's native collection filter does.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -366,12 +375,14 @@ string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
 `document.head`, the ParentNode `children`/first/last/count getters, and
 `document.getElementById()`, `document.querySelector()`,
-`document.querySelectorAll()`, and `document.getElementsByClassName()`.
+`document.querySelectorAll()`, `document.getElementsByClassName()`, and
+`document.getElementsByTagName()`.
 Elements returned through that
 surface share a per-realm prototype implementing `localName`, `tagName`, `id`,
 `className`, `hasAttributes()`, `getAttribute()`, `hasAttribute()`, `children`,
 `firstElementChild`, `lastElementChild`, `childElementCount`, `querySelector()`,
-`querySelectorAll()`, `getElementsByClassName()`, `closest()`, `matches()`, and
+`querySelectorAll()`, `getElementsByClassName()`, `getElementsByTagName()`,
+`closest()`, `matches()`, and
 `webkitMatchesSelector()`. That
 prototype inherits from a shared Node prototype implementing `nodeType`,
 `nodeName`, `isConnected`, `textContent`, and `hasChildNodes()`.
@@ -473,6 +484,7 @@ The proof suite uses that same counting argument:
 | `authoritative_query_selector_all_proof.html` | static rooted NodeLists survive real tree mutation and expose indexed/iterable WebIDL behavior |
 | `authoritative_children_collection_proof.html` | live SameObject HTMLCollections track tree/name mutation with indexed and named legacy properties |
 | `authoritative_get_elements_by_class_name_proof.html` | Document/Element class queries produce independently rooted live HTMLCollections with correct scope, conversion, identity, and mutation behavior |
+| `authoritative_get_elements_by_tag_name_proof.html` | Document/Element qualified-name queries produce fresh live HTMLCollections with HTML case folding, SVG case sensitivity, scope, identity, and mutation behavior |
 | `authoritative_element_remove_proof.html` | Element.remove uses Servo's ChildNode algorithm, updates live children while preserving static NodeList identity, and is unscopable |
 | `authoritative_element_sibling_proof.html` | Element-only sibling traversal skips text nodes, preserves wrapper identity, and updates after Element.remove |
 | `authoritative_element_namespace_proof.html` | HTML and inline SVG Element namespaceURI and null prefix accessors preserve descriptors, brands, and nullable-string values |

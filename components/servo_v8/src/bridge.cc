@@ -2661,6 +2661,60 @@ void ElementHostGetElementsByClassName(
   info.GetReturnValue().Set(wrapper);
 }
 
+void ElementHostGetElementsByTagName(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // WebIDL brand-checks the receiver before checking or converting arguments.
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->html_collection_host_installed ||
+      !realm->runtime->element_host_installed ||
+      realm->html_collection_template.IsEmpty() ||
+      realm->element_template.IsEmpty() ||
+      !realm->runtime->element_host_vtable.get_elements_by_tag_name) {
+    ThrowTypeError(isolate,
+                   "HTMLCollection host is not installed in this realm");
+    return;
+  }
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, "Element.getElementsByTagName requires 1 argument");
+    return;
+  }
+  v8::Local<v8::String> qualified_name_string;
+  if (!info[0]
+           ->ToString(isolate->GetCurrentContext())
+           .ToLocal(&qualified_name_string)) {
+    return;
+  }
+  v8::String::Utf8Value qualified_name(isolate, qualified_name_string);
+  if (!*qualified_name && qualified_name.length() != 0) return;
+
+  ServoV8HTMLCollectionValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.get_elements_by_tag_name(
+                    native,
+                    reinterpret_cast<const uint8_t*>(*qualified_name),
+                    qualified_name.length(), &value) != 0;
+  }
+  if (!succeeded || !value.key || !value.native) {
+    DropUnownedHTMLCollectionHost(realm->runtime, value.native);
+    ThrowTypeError(isolate,
+                   "Element.getElementsByTagName host callback failed");
+    return;
+  }
+  v8::Local<v8::Object> wrapper = WrapperForHTMLCollectionValue(
+      realm, isolate->GetCurrentContext(), value);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(
+        isolate, "Element.getElementsByTagName wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(wrapper);
+}
+
 void ElementHostGetLastElementChild(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   ElementHostGetInterface(
@@ -3206,6 +3260,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"getAttributeNS", &ElementHostGetAttributeNS, 2,
        v8::SideEffectType::kHasNoSideEffect},
       {"hasAttributeNS", &ElementHostHasAttributeNS, 2,
+       v8::SideEffectType::kHasSideEffect},
+      {"getElementsByTagName", &ElementHostGetElementsByTagName, 1,
        v8::SideEffectType::kHasSideEffect},
       {"getElementsByClassName", &ElementHostGetElementsByClassName, 1,
        v8::SideEffectType::kHasSideEffect},
@@ -4561,7 +4617,8 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->get_parent_element ||
       !vtable->has_child_nodes ||
-      !vtable->get_children || !vtable->get_elements_by_class_name ||
+      !vtable->get_children || !vtable->get_elements_by_tag_name ||
+      !vtable->get_elements_by_class_name ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
       !vtable->get_child_element_count ||
       !vtable->get_previous_element_sibling ||

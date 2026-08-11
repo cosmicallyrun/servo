@@ -1300,7 +1300,7 @@ def _domstring_to_nonnullable_interface_rust_trait_members(member: Member) -> Bl
         _domstring_to_nonnullable_interface_argument(member)
     )
     return [
-        "    /// Returns a live collection host for this exact class-name query.",
+        "    /// Returns a live collection host for this exact string query.",
         f"    fn {name}(&self, {argument}: &str) -> HTMLCollectionHandle;",
     ]
 

@@ -50,6 +50,9 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "const void* key;",
             "void* native;",
             "uint8_t (*get_children)(void* native, ServoV8HTMLCollectionValue* output);",
+            "uint8_t (*get_elements_by_tag_name)(void* native,",
+            "const uint8_t* qualified_name,",
+            "size_t qualified_name_length,",
             "uint8_t (*get_elements_by_class_name)(void* native,",
             "const uint8_t* class_names,",
             "size_t class_names_length,",
@@ -88,6 +91,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "std::str::from_utf8(bytes)",
             "fn head(&self) -> Option<InterfaceHandle>;",
             "fn children(&self) -> HTMLCollectionHandle;",
+            "fn get_elements_by_tag_name(&self, qualified_name: &str) -> HTMLCollectionHandle;",
             "fn get_elements_by_class_name(&self, class_names: &str) -> HTMLCollectionHandle;",
             "pub struct RawHTMLCollectionValue {",
             "output: *mut RawHTMLCollectionValue,",
@@ -106,6 +110,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "set_bg_color: Some(document_host_set_bg_color::<T>)",
             "set_title: Some(document_host_set_title::<T>)",
             "get_element_by_id: Some(document_host_get_element_by_id::<T>)",
+            "get_elements_by_tag_name: Some(document_host_get_elements_by_tag_name::<T>)",
             "get_elements_by_class_name: Some(document_host_get_elements_by_class_name::<T>)",
             "query_selector: Some(document_host_query_selector::<T>)",
             "query_selector_all: Some(document_host_query_selector_all::<T>)",
@@ -131,6 +136,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "DocumentHostGetDocumentElement(",
             "DocumentHostGetHead(",
             "DocumentHostGetChildren(",
+            "DocumentHostCallGetElementsByTagName(",
             "DocumentHostCallGetElementsByClassName(",
             "ServoV8HTMLCollectionValue value{};",
             "!realm->runtime->html_collection_host_installed",
@@ -150,6 +156,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "state->vtable.get_ready_state(state->native, &value)",
             "value.is_null > 1",
             "Document.getElementById requires one argument",
+            "Document.getElementsByTagName requires one argument",
             "Document.getElementsByClassName requires one argument",
             "DropUnownedNodeListHost(state->runtime, outcome.native);",
             "ReturnSelectorNodeListOutcome(realm, context, outcome, \"Document.querySelectorAll\"",
@@ -172,10 +179,14 @@ class DocumentHostGenerationTests(unittest.TestCase):
         class_query_install = output.split(
             "v8::Function::New(context, DocumentHostCallGetElementsByClassName,", 1
         )[1].split(".ToLocal", 1)[0]
+        tag_query_install = output.split(
+            "v8::Function::New(context, DocumentHostCallGetElementsByTagName,", 1
+        )[1].split(".ToLocal", 1)[0]
 
         self.assertIn("v8::SideEffectType::kHasNoSideEffect", query_selector_install)
         self.assertIn("v8::SideEffectType::kHasSideEffect", query_selector_all_install)
         self.assertIn("v8::SideEffectType::kHasSideEffect", class_query_install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", tag_query_install)
 
     def test_generates_context_free_class_collection_callback(self) -> None:
         rust = self.outputs[generate_document_host.RUST_NAME]
@@ -196,6 +207,30 @@ class DocumentHostGenerationTests(unittest.TestCase):
             rust_trait,
         )
         self.assertNotIn("unsafe fn get_elements_by_class_name", rust_trait)
+        self.assertNotIn("host_context", rust_thunk)
+        self.assertNotIn("active_host_context", cpp_callback)
+        self.assertIn("WrapperForHTMLCollectionValue", cpp_callback)
+        self.assertIn("DropUnownedHTMLCollectionHost", cpp_callback)
+
+    def test_generates_context_free_tag_collection_callback(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        rust_trait = rust.split(
+            "pub unsafe trait DocumentHostBinding: Sized + 'static {", 1
+        )[1].split("\n}", 1)[0]
+        rust_thunk = rust.split(
+            'unsafe extern "C" fn document_host_get_elements_by_tag_name', 1
+        )[1].split("\n}", 1)[0]
+        cpp_callback = cpp.split(
+            "void DocumentHostCallGetElementsByTagName(", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn(
+            "fn get_elements_by_tag_name(&self, qualified_name: &str) "
+            "-> HTMLCollectionHandle;",
+            rust_trait,
+        )
+        self.assertNotIn("unsafe fn get_elements_by_tag_name", rust_trait)
         self.assertNotIn("host_context", rust_thunk)
         self.assertNotIn("active_host_context", cpp_callback)
         self.assertIn("WrapperForHTMLCollectionValue", cpp_callback)

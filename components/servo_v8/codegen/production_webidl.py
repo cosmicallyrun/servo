@@ -48,6 +48,7 @@ NODE_PARENT_ELEMENT = "Node.parentElement"
 NODE_TEXT_CONTENT = "Node.textContent"
 NODE_HAS_CHILD_NODES = "Node.hasChildNodes"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
+DOCUMENT_GET_ELEMENTS_BY_TAG_NAME = "Document.getElementsByTagName"
 DOCUMENT_GET_ELEMENTS_BY_CLASS_NAME = "Document.getElementsByClassName"
 DOCUMENT_HEAD = "Document.head"
 DOCUMENT_CHILDREN = "Document.children"
@@ -89,6 +90,7 @@ ELEMENT_QUERY_SELECTOR = "Element.querySelector"
 ELEMENT_CLOSEST = "Element.closest"
 ELEMENT_MATCHES = "Element.matches"
 ELEMENT_WEBKIT_MATCHES_SELECTOR = "Element.webkitMatchesSelector"
+ELEMENT_GET_ELEMENTS_BY_TAG_NAME = "Element.getElementsByTagName"
 ELEMENT_GET_ELEMENTS_BY_CLASS_NAME = "Element.getElementsByClassName"
 ELEMENT_QUERY_SELECTOR_ALL = "Element.querySelectorAll"
 ELEMENT_REMOVE = "Element.remove"
@@ -165,6 +167,7 @@ class DocumentHostMember(NamedTuple):
     shape: str
     expected_interface: str | None = None
     expected_enum_values: tuple[str, ...] | None = None
+    expected_argument_name: str | None = None
 
 
 # The supported Document slice is data: selection and generation both walk it,
@@ -209,9 +212,16 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     # SpiderMonkey context or exception channel. The operation itself carries
     # no extended attributes in production WebIDL.
     DocumentHostMember(
+        DOCUMENT_GET_ELEMENTS_BY_TAG_NAME,
+        DOMSTRING_TO_NONNULLABLE_INTERFACE,
+        "HTMLCollection",
+        expected_argument_name="qualifiedName",
+    ),
+    DocumentHostMember(
         DOCUMENT_GET_ELEMENTS_BY_CLASS_NAME,
         DOMSTRING_TO_NONNULLABLE_INTERFACE,
         "HTMLCollection",
+        expected_argument_name="classNames",
     ),
     # A second identity exercises multiple wrapper-cache entries in one realm.
     # HTMLHeadElement is exposed through the current inherited Element facade.
@@ -308,6 +318,7 @@ ELEMENT_HOST = (
     ELEMENT_CLOSEST,
     ELEMENT_MATCHES,
     ELEMENT_WEBKIT_MATCHES_SELECTOR,
+    ELEMENT_GET_ELEMENTS_BY_TAG_NAME,
     ELEMENT_GET_ELEMENTS_BY_CLASS_NAME,
     ELEMENT_QUERY_SELECTOR_ALL,
     ELEMENT_REMOVE,
@@ -1386,12 +1397,15 @@ def _select_element_host_member(
         return select_pure_throws_domstring_to_boolean_operation(
             parser_results, qualified_name
         )
-    if member_name == "getElementsByClassName":
+    if member_name in {"getElementsByTagName", "getElementsByClassName"}:
+        expected_argument_name = (
+            "localName" if member_name == "getElementsByTagName" else "classNames"
+        )
         return select_domstring_to_nonnullable_interface_operation(
             parser_results,
             qualified_name,
             "HTMLCollection",
-            "classNames",
+            expected_argument_name,
         )
     if member_name == "querySelectorAll":
         return select_newobject_throws_domstring_to_interface_operation(
@@ -1932,11 +1946,15 @@ def _select_document_host_member(
                     f"`{member.qualified_name}` collection shape must return "
                     "`HTMLCollection`"
                 )
+            if member.expected_argument_name is None:
+                raise WebIDLSelectionError(
+                    f"`{member.qualified_name}` collection shape must pin its argument name"
+                )
             return select_domstring_to_nonnullable_interface_operation(
                 parser_results,
                 member.qualified_name,
                 member.expected_interface,
-                "classNames",
+                member.expected_argument_name,
             )
         if member.shape == NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE:
             return select_newobject_throws_domstring_to_interface_operation(
