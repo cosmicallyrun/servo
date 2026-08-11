@@ -290,6 +290,13 @@ class ProductionElementTests(unittest.TestCase):
         self.assertFalse(has_ns_arguments[1].type.nullable())
         self.assertTrue(has_ns_arguments[1].type.isDOMString())
         self.assertEqual(set(has_attribute_ns._extendedAttrDict), set())
+        get_attribute_names = members[production_webidl.ELEMENT_GET_ATTRIBUTE_NAMES]
+        names_return, names_arguments = get_attribute_names.signatures()[0]
+        self.assertFalse(names_return.nullable())
+        self.assertTrue(names_return.isSequence())
+        self.assertTrue(names_return.inner.isDOMString())
+        self.assertEqual(names_arguments, [])
+        self.assertEqual(set(get_attribute_names._extendedAttrDict), {"Pure"})
         for qualified_name in (
             production_webidl.ELEMENT_FIRST_ELEMENT_CHILD,
             production_webidl.ELEMENT_LAST_ELEMENT_CHILD,
@@ -1672,6 +1679,78 @@ class SyntheticSelectionTests(unittest.TestCase):
                     self.assertTrue(return_type.isBoolean())
                     self.assertFalse(return_type.nullable())
                     self.assertEqual(set(member._extendedAttrDict), set())
+
+    def test_selects_exact_element_attribute_names_operation(self) -> None:
+        parser_results = self.parse(
+            {
+                "Element.webidl": """
+                    interface Element {
+                      [Pure] sequence<DOMString> getAttributeNames();
+                    };
+                """
+            }
+        )
+        member = production_webidl._select_element_host_member(
+            parser_results,
+            production_webidl.ELEMENT_GET_ATTRIBUTE_NAMES,
+        )
+        return_type, arguments = member.signatures()[0]
+        self.assertTrue(return_type.isSequence())
+        self.assertTrue(return_type.inner.isDOMString())
+        self.assertFalse(return_type.nullable())
+        self.assertEqual(arguments, [])
+        self.assertEqual(set(member._extendedAttrDict), {"Pure"})
+
+    def test_rejects_element_attribute_names_shape_drift(self) -> None:
+        cases = (
+            (
+                "sequence<DOMString> getAttributeNames();",
+                "`Element.getAttributeNames` must carry exactly ['Pure'], got []",
+            ),
+            (
+                "[Pure, Throws] sequence<DOMString> getAttributeNames();",
+                "`Element.getAttributeNames` must carry exactly ['Pure'], "
+                "got ['Pure', 'Throws']",
+            ),
+            (
+                "[Pure] DOMString getAttributeNames();",
+                "`Element.getAttributeNames` must return non-nullable "
+                "`sequence<DOMString>`, got `DOMString`",
+            ),
+            (
+                "[Pure] sequence<USVString> getAttributeNames();",
+                "`Element.getAttributeNames` must return non-nullable "
+                "`sequence<DOMString>`, got `sequence<USVString>`",
+            ),
+            (
+                "[Pure] sequence<Element> getAttributeNames();",
+                "`Element.getAttributeNames` must return non-nullable "
+                "`sequence<DOMString>`, got `sequence<Element>`",
+            ),
+            (
+                "[Pure] sequence<DOMString> getAttributeNames(DOMString name);",
+                "`Element.getAttributeNames` must take no arguments, found 1",
+            ),
+            (
+                "[Pure] static sequence<DOMString> getAttributeNames();",
+                "`Element.getAttributeNames` must be an ordinary instance operation",
+            ),
+            (
+                """
+                  [Pure] sequence<DOMString> getAttributeNames();
+                  [Pure] sequence<DOMString> getAttributeNames(boolean extra);
+                """,
+                "`Element.getAttributeNames` must have exactly one signature, "
+                "found 2",
+            ),
+        )
+        for declaration, expected in cases:
+            with self.subTest(declaration=declaration):
+                self.assert_element_rejected(
+                    declaration,
+                    "getAttributeNames",
+                    expected,
+                )
 
     def test_rejects_namespace_attribute_operation_drift(self) -> None:
         cases = (

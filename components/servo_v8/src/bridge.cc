@@ -1187,6 +1187,69 @@ void ReturnSelectorNodeListOutcome(
 #include "servo_v8_generated.inc"
 #include "servo_v8_document_host_generated.inc"
 
+class ElementHostOwnedUtf8SequenceScope {
+ public:
+  ElementHostOwnedUtf8SequenceScope(ServoV8Runtime* runtime,
+                                    ServoV8OwnedUtf8Sequence* sequence)
+      : runtime_(runtime), sequence_(sequence) {}
+  ~ElementHostOwnedUtf8SequenceScope() {
+    if (sequence_->owner && sequence_->drop_owner) {
+      RustCallbackScope callback_scope(runtime_);
+      sequence_->drop_owner(sequence_->owner);
+    }
+  }
+
+ private:
+  ServoV8Runtime* runtime_;
+  ServoV8OwnedUtf8Sequence* sequence_;
+};
+
+bool IsValidUtf8(const uint8_t* data, size_t length) {
+  if (length == 0) return true;
+  if (!data) return false;
+  size_t index = 0;
+  while (index < length) {
+    const uint8_t first = data[index++];
+    if (first <= 0x7f) continue;
+    auto continuation = [&](size_t offset) {
+      return offset < length && (data[offset] & 0xc0) == 0x80;
+    };
+    if (first >= 0xc2 && first <= 0xdf) {
+      if (!continuation(index)) return false;
+      index += 1;
+      continue;
+    }
+    if (first >= 0xe0 && first <= 0xef) {
+      if (length - index < 2 || !continuation(index) ||
+          !continuation(index + 1)) {
+        return false;
+      }
+      const uint8_t second = data[index];
+      if ((first == 0xe0 && second < 0xa0) ||
+          (first == 0xed && second > 0x9f)) {
+        return false;
+      }
+      index += 2;
+      continue;
+    }
+    if (first >= 0xf0 && first <= 0xf4) {
+      if (length - index < 3 || !continuation(index) ||
+          !continuation(index + 1) || !continuation(index + 2)) {
+        return false;
+      }
+      const uint8_t second = data[index];
+      if ((first == 0xf0 && second < 0x90) ||
+          (first == 0xf4 && second > 0x8f)) {
+        return false;
+      }
+      index += 3;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 // Finds or creates the wrapper for one DOM object, preserving identity.
 //
 // A hit drops the surplus host the caller speculatively allocated, so
@@ -1999,6 +2062,68 @@ void ElementHostHasAttributes(
     }
   }
   info.GetReturnValue().Set(result != 0);
+}
+
+void ElementHostGetAttributeNames(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  ServoV8OwnedUtf8Sequence result{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.get_attribute_names(
+        native, &result);
+  }
+  // Acquire the transferred owner even on callback failure so a partially
+  // written hostile result cannot leak.
+  ElementHostOwnedUtf8SequenceScope result_scope(realm->runtime, &result);
+  if (!succeeded) {
+    ThrowTypeError(isolate, "Element.getAttributeNames host callback failed");
+    return;
+  }
+  const bool malformed_empty =
+      result.length == 0 &&
+      (result.values || result.owner || result.drop_owner);
+  const bool malformed_non_empty =
+      result.length != 0 &&
+      (!result.values || !result.owner || !result.drop_owner);
+  if (malformed_empty || malformed_non_empty ||
+      result.length >
+          static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(isolate, "invalid Element.getAttributeNames result");
+    return;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Array> array =
+      v8::Array::New(isolate, static_cast<int>(result.length));
+  for (size_t index = 0; index < result.length; ++index) {
+    const ServoV8Utf8View& view = result.values[index];
+    if (view.length >
+            static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        !IsValidUtf8(view.data, view.length)) {
+      ThrowTypeError(isolate, "invalid Element.getAttributeNames UTF-8 item");
+      return;
+    }
+    v8::Local<v8::String> value;
+    if (view.length == 0) {
+      value = v8::String::Empty(isolate);
+    } else if (!v8::String::NewFromUtf8(
+                    isolate, reinterpret_cast<const char*>(view.data),
+                    v8::NewStringType::kNormal,
+                    static_cast<int>(view.length))
+                    .ToLocal(&value)) {
+      return;
+    }
+    if (!array
+             ->Set(context, static_cast<uint32_t>(index), value)
+             .FromMaybe(false)) {
+      return;
+    }
+  }
+  info.GetReturnValue().Set(array);
 }
 
 bool ElementHostOperationName(
@@ -3071,6 +3196,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
   };
   const ElementOperation operations[] = {
       {"hasAttributes", &ElementHostHasAttributes, 0,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"getAttributeNames", &ElementHostGetAttributeNames, 0,
        v8::SideEffectType::kHasNoSideEffect},
       {"getAttribute", &ElementHostGetAttribute, 1,
        v8::SideEffectType::kHasNoSideEffect},
@@ -4427,7 +4554,8 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_namespace_uri || !vtable->get_prefix ||
       !vtable->get_id || !vtable->set_id || !vtable->get_class_name ||
       !vtable->set_class_name || !vtable->has_attributes ||
-      !vtable->get_attribute || !vtable->has_attribute ||
+      !vtable->get_attribute_names || !vtable->get_attribute ||
+      !vtable->has_attribute ||
       !vtable->get_attribute_ns || !vtable->has_attribute_ns ||
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||

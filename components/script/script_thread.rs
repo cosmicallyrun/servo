@@ -490,6 +490,15 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         self.element.root().HasAttributes()
     }
 
+    fn get_attribute_names(&self) -> Vec<String> {
+        self.element
+            .root()
+            .GetAttributeNames()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
     unsafe fn get_attribute(
         &self,
         host_context: *mut c_void,

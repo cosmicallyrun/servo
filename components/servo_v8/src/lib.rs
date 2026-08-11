@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 34;
+const ABI_VERSION: u32 = 35;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -347,6 +347,7 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     fn class_name(&self) -> String;
     unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool;
     fn has_attributes(&self) -> bool;
+    fn get_attribute_names(&self) -> Vec<String>;
     unsafe fn get_attribute(
         &self,
         host_context: *mut c_void,
@@ -405,6 +406,22 @@ pub struct OptionalOwnedUtf8 {
     pub value: OwnedUtf8,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Utf8View {
+    pub data: *const u8,
+    pub length: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct OwnedUtf8Sequence {
+    pub values: *const Utf8View,
+    pub length: usize,
+    pub owner: *mut c_void,
+    pub drop_owner: Option<DropCallback>,
+}
+
 #[repr(C)]
 pub struct ElementHostVTable {
     pub get_local_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
@@ -417,6 +434,8 @@ pub struct ElementHostVTable {
     pub set_class_name:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
     pub has_attributes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_attribute_names:
+        Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8Sequence) -> u8>,
     pub get_attribute: Option<
         unsafe extern "C" fn(
             *mut c_void,
@@ -964,6 +983,76 @@ unsafe extern "C" fn element_host_has_attributes<T: ElementHostBinding>(
     // SAFETY: Both pointers satisfy the vtable contract.
     unsafe { *output = (&*native.cast::<T>()).has_attributes() as u8 };
     1
+}
+
+struct OwnedUtf8SequenceOwner {
+    _values: Vec<Vec<u8>>,
+    views: Vec<Utf8View>,
+}
+
+unsafe extern "C" fn element_host_owned_utf8_sequence_drop(owner: *mut c_void) {
+    if owner.is_null() {
+        return;
+    }
+    // SAFETY: Every non-empty sequence transfer creates exactly one boxed
+    // owner and C++ calls this callback at most once after the synchronous use.
+    drop(unsafe { Box::from_raw(owner.cast::<OwnedUtf8SequenceOwner>()) });
+}
+
+unsafe fn element_host_write_owned_utf8_sequence(
+    output: *mut OwnedUtf8Sequence,
+    values: Vec<String>,
+) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    if values.is_empty() {
+        // SAFETY: output is non-null caller-owned writable storage.
+        unsafe {
+            *output = OwnedUtf8Sequence {
+                values: std::ptr::null(),
+                length: 0,
+                owner: std::ptr::null_mut(),
+                drop_owner: None,
+            }
+        };
+        return 1;
+    }
+    let values: Vec<Vec<u8>> = values.into_iter().map(String::into_bytes).collect();
+    let views = values
+        .iter()
+        .map(|value| Utf8View {
+            data: value.as_ptr(),
+            length: value.len(),
+        })
+        .collect();
+    let owner = Box::new(OwnedUtf8SequenceOwner {
+        _values: values,
+        views,
+    });
+    let result = OwnedUtf8Sequence {
+        values: owner.views.as_ptr(),
+        length: owner.views.len(),
+        owner: Box::into_raw(owner).cast(),
+        drop_owner: Some(element_host_owned_utf8_sequence_drop),
+    };
+    // SAFETY: output is non-null caller-owned writable storage. Every pointer
+    // in result borrows from the transferred owner until its drop callback.
+    unsafe { *output = result };
+    1
+}
+
+unsafe extern "C" fn element_host_get_attribute_names<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut OwnedUtf8Sequence,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let values = unsafe { (&*native.cast::<T>()).get_attribute_names() };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_owned_utf8_sequence(output, values) }
 }
 
 unsafe extern "C" fn element_host_get_attribute<T: ElementHostBinding>(
@@ -1563,6 +1652,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         get_class_name: Some(element_host_get_class_name::<T>),
         set_class_name: Some(element_host_set_class_name::<T>),
         has_attributes: Some(element_host_has_attributes::<T>),
+        get_attribute_names: Some(element_host_get_attribute_names::<T>),
         get_attribute: Some(element_host_get_attribute::<T>),
         has_attribute: Some(element_host_has_attribute::<T>),
         get_attribute_ns: Some(element_host_get_attribute_ns::<T>),
@@ -2669,6 +2759,7 @@ mod tests {
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     static OPTIONAL_STRING_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static UTF8_SEQUENCE_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
         static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
@@ -3144,6 +3235,15 @@ mod tests {
 
         fn has_attributes(&self) -> bool {
             !self.state.attributes.borrow().is_empty()
+        }
+
+        fn get_attribute_names(&self) -> Vec<String> {
+            self.state
+                .attributes
+                .borrow()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect()
         }
 
         unsafe fn get_attribute(
@@ -4385,6 +4485,140 @@ mod tests {
         // SAFETY: output is non-null caller-owned writable storage.
         unsafe { *output = if mode == "invalid-boolean" { 2 } else { 1 } };
         1
+    }
+
+    struct AdversarialUtf8SequenceOwner {
+        _values: Vec<Vec<u8>>,
+        views: Vec<Utf8View>,
+    }
+
+    unsafe extern "C" fn adversarial_utf8_sequence_owner_drop(owner: *mut c_void) {
+        if owner.is_null() {
+            return;
+        }
+        // SAFETY: Each adversarial result transfers exactly one owner and the
+        // C++ scope must return it exactly once on success or rejection.
+        drop(unsafe { Box::from_raw(owner.cast::<AdversarialUtf8SequenceOwner>()) });
+        UTF8_SEQUENCE_OWNER_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn adversarial_owned_utf8_sequence(values: Vec<Vec<u8>>) -> OwnedUtf8Sequence {
+        assert!(!values.is_empty());
+        let views = values
+            .iter()
+            .map(|value| Utf8View {
+                data: value.as_ptr(),
+                length: value.len(),
+            })
+            .collect();
+        let owner = Box::new(AdversarialUtf8SequenceOwner {
+            _values: values,
+            views,
+        });
+        let result = OwnedUtf8Sequence {
+            values: owner.views.as_ptr(),
+            length: owner.views.len(),
+            owner: Box::into_raw(owner).cast(),
+            drop_owner: Some(adversarial_utf8_sequence_owner_drop),
+        };
+        result
+    }
+
+    unsafe extern "C" fn adversarial_element_get_attribute_names(
+        native: *mut c_void,
+        output: *mut OwnedUtf8Sequence,
+    ) -> u8 {
+        if native.is_null() || output.is_null() {
+            return 0;
+        }
+        // SAFETY: The custom vtable is installed for exactly this host type.
+        let mode = unsafe { &*native.cast::<ElementHostProbe>() }.id();
+        let mut result = OwnedUtf8Sequence {
+            values: std::ptr::null(),
+            length: 0,
+            owner: std::ptr::null_mut(),
+            drop_owner: None,
+        };
+        let mut succeeded = true;
+        match mode.as_str() {
+            "callback-failure-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![b"failure".to_vec()]);
+                succeeded = false;
+            },
+            "empty-with-owner" => {
+                result = adversarial_owned_utf8_sequence(vec![b"hidden".to_vec()]);
+                result.values = std::ptr::null();
+                result.length = 0;
+            },
+            "empty-with-values" => {
+                result.values = std::ptr::NonNull::<Utf8View>::dangling().as_ptr();
+            },
+            "missing-values-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![b"missing".to_vec()]);
+                result.values = std::ptr::null();
+            },
+            "missing-owner" => {
+                result.values = std::ptr::NonNull::<Utf8View>::dangling().as_ptr();
+                result.length = 1;
+            },
+            "owner-without-drop" => {
+                result.values = std::ptr::NonNull::<Utf8View>::dangling().as_ptr();
+                result.length = 1;
+                result.owner = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+            },
+            "drop-without-owner" => {
+                result.values = std::ptr::NonNull::<Utf8View>::dangling().as_ptr();
+                result.length = 1;
+                result.drop_owner = Some(adversarial_utf8_sequence_owner_drop);
+            },
+            "invalid-utf8-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![vec![0xff]]);
+            },
+            "overlong-utf8-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![vec![0xc0, 0x80]]);
+            },
+            "surrogate-utf8-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![vec![0xed, 0xa0, 0x80]]);
+            },
+            "truncated-utf8-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![vec![0xe2, 0x82]]);
+            },
+            "out-of-range-utf8-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![vec![0xf4, 0x90, 0x80, 0x80]]);
+            },
+            "null-data-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![b"x".to_vec()]);
+                // SAFETY: result.owner is the exact still-live owner created above.
+                let owner = unsafe { &mut *result.owner.cast::<AdversarialUtf8SequenceOwner>() };
+                owner.views[0].data = std::ptr::null();
+            },
+            "oversized-item-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![b"x".to_vec()]);
+                // SAFETY: result.owner is the exact still-live owner created above.
+                let owner = unsafe { &mut *result.owner.cast::<AdversarialUtf8SequenceOwner>() };
+                owner.views[0].length = usize::MAX;
+            },
+            "oversized-sequence-owned" => {
+                result = adversarial_owned_utf8_sequence(vec![b"x".to_vec()]);
+                result.length = usize::MAX;
+            },
+            "valid-values" => {
+                result = adversarial_owned_utf8_sequence(vec![
+                    Vec::new(),
+                    "naïve".as_bytes().to_vec(),
+                    "€".as_bytes().to_vec(),
+                    "😀".as_bytes().to_vec(),
+                ]);
+                // A zero-length view may canonically carry a null data pointer.
+                // SAFETY: result.owner is the exact still-live owner above.
+                let owner = unsafe { &mut *result.owner.cast::<AdversarialUtf8SequenceOwner>() };
+                owner.views[0].data = std::ptr::null();
+            },
+            _ => {},
+        }
+        // SAFETY: output is non-null caller-owned writable storage.
+        unsafe { *output = result };
+        succeeded as u8
     }
 
     impl Drop for NativeSmoke {
@@ -5965,11 +6199,54 @@ mod tests {
                 .eval_bool_in_realm(realm, "attributeNamespaceBindingProof")
                 .unwrap()
         );
+        let attribute_names_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const element = document.getElementById('target');
+              const descriptor = Object.getOwnPropertyDescriptor(
+                Object.getPrototypeOf(element), 'getAttributeNames');
+              let wrongBrandRejected = false;
+              try { descriptor.value.call({}); }
+              catch (error) { wrongBrandRejected = error instanceof TypeError; }
+              const first = element.getAttributeNames();
+              const second = element.getAttributeNames();
+              first[0] = 'local-only';
+              first.pop();
+              const third = element.getAttributeNames();
+              globalThis.attributeNamesBindingProof =
+                descriptor && descriptor.value.name === 'getAttributeNames' &&
+                descriptor.value.length === 0 && descriptor.writable &&
+                descriptor.enumerable && descriptor.configurable &&
+                !Object.hasOwn(element, 'getAttributeNames') && wrongBrandRejected &&
+                Array.isArray(first) && Object.getPrototypeOf(first) === Array.prototype &&
+                first !== second && second !== third && first !== third &&
+                first.join(',') === 'local-only,class,data-proof' &&
+                second.join(',') === 'id,class,data-proof,data-empty' &&
+                third.join(',') === 'id,class,data-proof,data-empty';
+            })();"#,
+            "attribute-names-binding.js",
+            1,
+        ));
+        // SAFETY: The context token remains live for this synchronous run.
+        let attribute_names_outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                attribute_names_script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(attribute_names_outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "attributeNamesBindingProof")
+                .unwrap()
+        );
         assert_eq!(
             &*get_element_by_id_calls.borrow(),
             &[
                 "target", "target", "target", "target", "target", "target", "missing", "", "a\0b",
-                "\u{fffd}", "target",
+                "\u{fffd}", "target", "target",
             ]
         );
         assert!(
@@ -7441,6 +7718,7 @@ mod tests {
         let matches = element_host_matches::<ElementHostProbe>;
         let webkit_matches = element_host_webkit_matches_selector::<ElementHostProbe>;
         let remove = element_host_remove::<ElementHostProbe>;
+        let get_attribute_names = element_host_get_attribute_names::<ElementHostProbe>;
         let namespace_uri = element_host_get_namespace_uri::<ElementHostProbe>;
         let prefix = element_host_get_prefix::<ElementHostProbe>;
         let get_attribute_ns = element_host_get_attribute_ns::<ElementHostProbe>;
@@ -7478,12 +7756,69 @@ mod tests {
                 drop_owner: None,
             },
         };
+        let mut attribute_names_output = OwnedUtf8Sequence {
+            values: std::ptr::null(),
+            length: 0,
+            owner: std::ptr::null_mut(),
+            drop_owner: None,
+        };
 
         // SAFETY: Each invalid pointer combination is intentional and every
         // valid byte range and output remains live for the call.
         unsafe {
             assert_eq!(remove(std::ptr::null_mut(), host_context), 0);
             assert_eq!(remove(native, std::ptr::null_mut()), 0);
+            assert_eq!(
+                get_attribute_names(std::ptr::null_mut(), &mut attribute_names_output),
+                0,
+            );
+            assert_eq!(get_attribute_names(native, std::ptr::null_mut()), 0);
+            assert_eq!(get_attribute_names(native, &mut attribute_names_output), 1);
+            assert_eq!(attribute_names_output.length, 4);
+            assert!(!attribute_names_output.values.is_null());
+            assert!(!attribute_names_output.owner.is_null());
+            let attribute_name_views = std::slice::from_raw_parts(
+                attribute_names_output.values,
+                attribute_names_output.length,
+            );
+            let attribute_names: Vec<&str> = attribute_name_views
+                .iter()
+                .map(|view| {
+                    std::str::from_utf8(std::slice::from_raw_parts(view.data, view.length)).unwrap()
+                })
+                .collect();
+            assert_eq!(attribute_names, ["id", "class", "data-proof", "data-empty"]);
+            attribute_names_output.drop_owner.unwrap()(attribute_names_output.owner);
+
+            assert_eq!(
+                element_host_write_owned_utf8_sequence(&mut attribute_names_output, Vec::new(),),
+                1,
+            );
+            assert_eq!(attribute_names_output.length, 0);
+            assert!(attribute_names_output.values.is_null());
+            assert!(attribute_names_output.owner.is_null());
+            assert!(attribute_names_output.drop_owner.is_none());
+
+            assert_eq!(
+                element_host_write_owned_utf8_sequence(
+                    &mut attribute_names_output,
+                    vec![String::new(), "naïve".to_owned()],
+                ),
+                1,
+            );
+            let attribute_name_views = std::slice::from_raw_parts(
+                attribute_names_output.values,
+                attribute_names_output.length,
+            );
+            assert_eq!(attribute_name_views[0].length, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    attribute_name_views[1].data,
+                    attribute_name_views[1].length,
+                ),
+                "naïve".as_bytes(),
+            );
+            attribute_names_output.drop_owner.unwrap()(attribute_names_output.owner);
             assert_eq!(remove(native, host_context), 1);
             assert_eq!(previous(std::ptr::null_mut(), &mut sibling_output), 0);
             assert_eq!(previous(native, std::ptr::null_mut()), 0);
@@ -8032,6 +8367,7 @@ mod tests {
     #[test]
     fn optional_element_strings_reject_malformed_values_and_drop_owners() {
         OPTIONAL_STRING_OWNER_DROPS.store(0, Ordering::SeqCst);
+        UTF8_SEQUENCE_OWNER_DROPS.store(0, Ordering::SeqCst);
         let mut runtime = Runtime::new(Options {
             expose_gc: 1,
             ..Options::default()
@@ -8041,6 +8377,7 @@ mod tests {
         vtable.get_namespace_uri = Some(adversarial_element_namespace_uri);
         vtable.get_attribute_ns = Some(adversarial_element_get_attribute_ns);
         vtable.has_attribute_ns = Some(adversarial_element_has_attribute_ns);
+        vtable.get_attribute_names = Some(adversarial_element_get_attribute_names);
         let mut storage = [0; ERROR_CAPACITY];
         let mut error = error_buffer(&mut storage);
         // SAFETY: The complete vtable contains callbacks for the exact probe
@@ -8118,15 +8455,48 @@ mod tests {
                let booleanFailureRejected = false;\n\
                try { target.hasAttributeNS(null, 'probe'); }\n\
                catch (error) { booleanFailureRejected = error instanceof TypeError; }\n\
+               const sequenceMalformedModes = [\n\
+                 'callback-failure-owned', 'empty-with-owner', 'empty-with-values',\n\
+                 'missing-values-owned', 'missing-owner', 'owner-without-drop',\n\
+                 'drop-without-owner', 'invalid-utf8-owned', 'overlong-utf8-owned',\n\
+                 'surrogate-utf8-owned', 'truncated-utf8-owned',\n\
+                 'out-of-range-utf8-owned', 'null-data-owned',\n\
+                 'oversized-item-owned', 'oversized-sequence-owned'\n\
+               ];\n\
+               const sequenceRejectionByMode = {};\n\
+               const sequenceRejected = sequenceMalformedModes.map(mode => {\n\
+                 target.id = mode;\n\
+                 try {\n\
+                   target.getAttributeNames();\n\
+                   return sequenceRejectionByMode[mode] = false;\n\
+                 } catch (error) {\n\
+                   return sequenceRejectionByMode[mode] = error instanceof TypeError;\n\
+                 }\n\
+               }).every(Boolean);\n\
+               target.id = 'empty';\n\
+               const emptySequenceFirst = target.getAttributeNames();\n\
+               const emptySequenceSecond = target.getAttributeNames();\n\
+               const validEmptySequence = Array.isArray(emptySequenceFirst) &&\n\
+                 emptySequenceFirst.length === 0 && emptySequenceSecond.length === 0 &&\n\
+                 emptySequenceFirst !== emptySequenceSecond;\n\
+               target.id = 'valid-values';\n\
+               const validSequence = target.getAttributeNames();\n\
+               const validSequenceValues = Array.isArray(validSequence) &&\n\
+                 validSequence.length === 4 && validSequence[0] === '' &&\n\
+                 validSequence[1] === 'naïve' && validSequence[2] === '€' &&\n\
+                 validSequence[3] === '😀';\n\
                const nullPrefix = target.prefix === null;\n\
                globalThis.optionalElementStringDetails = {\n\
                  exactSurface, rejected, emptyPreserved, validValue, nullPrefix,\n\
                  invalidBooleanRejected, booleanFailureRejected,\n\
+                 sequenceRejected, validEmptySequence, validSequenceValues,\n\
+                 sequenceRejectionByMode,\n\
                  rejectionByMode\n\
                };\n\
                globalThis.optionalElementStringProof = exactSurface && rejected &&\n\
                  emptyPreserved && validValue && nullPrefix &&\n\
-                 invalidBooleanRejected && booleanFailureRejected;\n\
+                 invalidBooleanRejected && booleanFailureRejected &&\n\
+                 sequenceRejected && validEmptySequence && validSequenceValues;\n\
              })();",
             "optional-element-string-adversarial.js",
             1,
@@ -8149,6 +8519,9 @@ mod tests {
             "nullPrefix",
             "invalidBooleanRejected",
             "booleanFailureRejected",
+            "sequenceRejected",
+            "validEmptySequence",
+            "validSequenceValues",
         ] {
             assert!(
                 runtime
@@ -8175,12 +8548,41 @@ mod tests {
                 "malformed optional Element string was accepted: {mode}",
             );
         }
+        for mode in [
+            "callback-failure-owned",
+            "empty-with-owner",
+            "empty-with-values",
+            "missing-values-owned",
+            "missing-owner",
+            "owner-without-drop",
+            "drop-without-owner",
+            "invalid-utf8-owned",
+            "overlong-utf8-owned",
+            "surrogate-utf8-owned",
+            "truncated-utf8-owned",
+            "out-of-range-utf8-owned",
+            "null-data-owned",
+            "oversized-item-owned",
+            "oversized-sequence-owned",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(
+                        realm,
+                        &format!("optionalElementStringDetails.sequenceRejectionByMode['{mode}']"),
+                    )
+                    .unwrap(),
+                "malformed UTF-8 sequence was accepted: {mode}",
+            );
+        }
         assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 10);
+        assert_eq!(UTF8_SEQUENCE_OWNER_DROPS.load(Ordering::SeqCst), 12);
         assert_eq!(element_drops.get(), 0);
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(element_drops.get(), 1);
         assert_eq!(document_drops.get(), 1);
         assert_eq!(OPTIONAL_STRING_OWNER_DROPS.load(Ordering::SeqCst), 10);
+        assert_eq!(UTF8_SEQUENCE_OWNER_DROPS.load(Ordering::SeqCst), 12);
     }
 
     #[test]

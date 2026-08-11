@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 34u
+#define SERVO_V8_ABI_VERSION 35u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -93,6 +93,20 @@ typedef struct ServoV8OptionalOwnedUtf8 {
   ServoV8OwnedUtf8 value;
 } ServoV8OptionalOwnedUtf8;
 
+/* One atomic snapshot of a WebIDL sequence<DOMString>. Every view borrows its
+ * bytes from the single owner for the lifetime of the synchronous callback. */
+typedef struct ServoV8Utf8View {
+  const uint8_t* data;
+  size_t length;
+} ServoV8Utf8View;
+
+typedef struct ServoV8OwnedUtf8Sequence {
+  const ServoV8Utf8View* values;
+  size_t length;
+  void* owner;
+  ServoV8DropCallback drop_owner;
+} ServoV8OwnedUtf8Sequence;
+
 typedef struct ServoV8ElementHostVTable {
   uint8_t (*get_local_name)(void* native, ServoV8OwnedUtf8* output);
   uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
@@ -110,6 +124,8 @@ typedef struct ServoV8ElementHostVTable {
                             const uint8_t* value,
                             size_t value_length);
   uint8_t (*has_attributes)(void* native, uint8_t* output);
+  uint8_t (*get_attribute_names)(void* native,
+                                 ServoV8OwnedUtf8Sequence* output);
   uint8_t (*get_attribute)(void* native,
                            void* host_context,
                            const uint8_t* name,

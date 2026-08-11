@@ -72,6 +72,7 @@ ELEMENT_TAG_NAME = "Element.tagName"
 ELEMENT_ID = "Element.id"
 ELEMENT_CLASS_NAME = "Element.className"
 ELEMENT_HAS_ATTRIBUTES = "Element.hasAttributes"
+ELEMENT_GET_ATTRIBUTE_NAMES = "Element.getAttributeNames"
 ELEMENT_GET_ATTRIBUTE = "Element.getAttribute"
 ELEMENT_GET_ATTRIBUTE_NS = "Element.getAttributeNS"
 ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
@@ -290,6 +291,7 @@ ELEMENT_HOST = (
     ELEMENT_ID,
     ELEMENT_CLASS_NAME,
     ELEMENT_HAS_ATTRIBUTES,
+    ELEMENT_GET_ATTRIBUTE_NAMES,
     ELEMENT_GET_ATTRIBUTE,
     ELEMENT_GET_ATTRIBUTE_NS,
     ELEMENT_HAS_ATTRIBUTE,
@@ -1395,6 +1397,35 @@ def _select_element_host_member(
         return select_newobject_throws_domstring_to_interface_operation(
             parser_results, qualified_name, "NodeList"
         )
+    if member_name == "getAttributeNames":
+        expected_attributes = {"Pure"}
+        actual_attributes = set(member._extendedAttrDict)
+        if actual_attributes != expected_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+                f"got {sorted(actual_attributes)}"
+            )
+        signatures = member.signatures()
+        if len(signatures) != 1:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must have exactly one signature, "
+                f"found {len(signatures)}"
+            )
+        return_type, arguments = signatures[0]
+        if (
+            return_type.nullable()
+            or not return_type.isSequence()
+            or not return_type.inner.isDOMString()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must return non-nullable `sequence<DOMString>`, "
+                f"got `{return_type.prettyName()}`"
+            )
+        if arguments:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take no arguments, found {len(arguments)}"
+            )
+        return member
     if member_name in {"getAttributeNS", "hasAttributeNS"}:
         expected_attributes = {"Pure"} if member_name == "getAttributeNS" else set()
         actual_attributes = set(member._extendedAttrDict)

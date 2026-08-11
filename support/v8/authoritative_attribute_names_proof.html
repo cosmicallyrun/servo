@@ -1,0 +1,122 @@
+<!doctype html>
+<!--
+Runtime proof for Element.getAttributeNames(). The V8-authoritative script
+pins the Element.prototype operation, copies current production attribute-list
+order from HTML and SVG fixtures, and proves every returned sequence is a new
+ordinary mutable snapshot. A following SpiderMonkey script independently reads
+the same parsed names.
+
+Servo currently emits the local `href` rather than qualified `xlink:href` for
+this parsed XLink fixture; getAttributeNS separately preserves its XLink
+namespace identity. The proof pins that production parity rather than changing
+Servo parser semantics in this V8 bridge slice.
+
+Run via support/v8/run_proofs.sh once ABI v35 is installed.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative getAttributeNames proof</title>
+    <style>
+      #target,
+      #svg,
+      i { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <div id="target" class="first" data-alpha="one" data-beta="two"></div>
+    <i></i>
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+      <use id="use" xlink:href="#shape"></use>
+    </svg>
+    <script data-servo-v8="authoritative">
+      const target = document.getElementById("target");
+      const use = document.getElementById("use");
+      const empty = document.querySelector("i");
+      const elementPrototype = Object.getPrototypeOf(target);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "getAttributeNames",
+      );
+
+      let wrongBrandRejected = false;
+      try {
+        descriptor.value.call({});
+      } catch (error) {
+        wrongBrandRejected = error instanceof TypeError;
+      }
+      if (
+        !descriptor ||
+        typeof descriptor.value !== "function" ||
+        descriptor.value.name !== "getAttributeNames" ||
+        descriptor.value.length !== 0 ||
+        !descriptor.writable ||
+        !descriptor.enumerable ||
+        !descriptor.configurable ||
+        Object.hasOwn(target, "getAttributeNames") ||
+        !wrongBrandRejected
+      ) {
+        throw new Error("getAttributeNames prototype surface is wrong");
+      }
+
+      const first = target.getAttributeNames();
+      const second = target.getAttributeNames();
+      const svgNames = use.getAttributeNames();
+      if (
+        !Array.isArray(first) ||
+        Object.getPrototypeOf(first) !== Array.prototype ||
+        !Object.isExtensible(first) ||
+        first === second ||
+        first.join(",") !== "id,class,data-alpha,data-beta" ||
+        second.join(",") !== "id,class,data-alpha,data-beta" ||
+        svgNames.join(",") !== "id,href"
+      ) {
+        throw new Error("getAttributeNames did not copy parsed attribute order");
+      }
+
+      first.pop();
+      first[0] = "local-only";
+      const third = target.getAttributeNames();
+      if (
+        first.join(",") !== "local-only,class,data-alpha" ||
+        second.join(",") !== "id,class,data-alpha,data-beta" ||
+        third === first ||
+        third === second ||
+        third.join(",") !== "id,class,data-alpha,data-beta"
+      ) {
+        throw new Error("getAttributeNames did not return independent snapshots");
+      }
+
+      const emptyFirst = empty.getAttributeNames();
+      const emptySecond = empty.getAttributeNames();
+      emptyFirst.push("local-only");
+      if (
+        !Array.isArray(emptyFirst) ||
+        emptyFirst === emptySecond ||
+        emptyFirst.join(",") !== "local-only" ||
+        emptySecond.length !== 0 ||
+        empty.getAttributeNames().length !== 0
+      ) {
+        throw new Error("empty getAttributeNames result was not a fresh array");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently checks the parsed attribute names.
+      const target = document.getElementById("target");
+      const use = document.getElementById("use");
+      const empty = document.querySelector("i");
+      if (
+        !target ||
+        !use ||
+        !empty ||
+        target.getAttributeNames().join(",") !== "id,class,data-alpha,data-beta" ||
+        use.getAttributeNames().join(",") !== "id,href" ||
+        empty.getAttributeNames().length !== 0
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

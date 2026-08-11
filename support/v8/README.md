@@ -80,9 +80,9 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Element.children`, `Element.querySelectorAll`,
 `Element.getElementsByClassName`, `Element.remove`,
 `Element.previousElementSibling`, `Element.nextElementSibling`, `Element.closest`,
-`Element.matches`, `Element.webkitMatchesSelector`, `Element.namespaceURI`, and
-`Element.prefix`, `Element.getAttributeNS`, and `Element.hasAttributeNS`,
-declarations in Servo's real production WebIDL
+`Element.matches`, `Element.webkitMatchesSelector`, `Element.namespaceURI`,
+`Element.prefix`, `Element.getAttributeNS`, `Element.hasAttributeNS`, and
+`Element.getAttributeNames` declarations in Servo's real production WebIDL
 corpus. Which members are exposed is a data manifest of `(qualified name,
 shape, exact returned interface)` records, with the interface field absent for
 non-interface values. One selector and one emitter are registered per shape,
@@ -211,6 +211,14 @@ attribute getters with an ephemeral SpiderMonkey context. They preserve WebIDL
 nullable namespace conversion, DOMString conversion order, nullable string
 results, and the distinction between an unnamespaced HTML/SVG attribute and an
 XLink namespaced attribute.
+
+ABI v35 adds `Element.getAttributeNames`. The zero-argument, brand-checked
+operation copies Servo's current attribute-list names in list order into a
+fresh ordinary JavaScript Array. A single owned UTF-8 sequence crosses
+the ABI atomically, so returned arrays are snapshots rather than a live view.
+Servo's current parsed-XLink behavior emits local `href` from this operation;
+`getAttributeNS` separately preserves the XLink namespace identity. Retaining
+the source prefix is a pre-existing Servo parser issue outside this V8 slice.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -470,6 +478,7 @@ The proof suite uses that same counting argument:
 | `authoritative_element_namespace_proof.html` | HTML and inline SVG Element namespaceURI and null prefix accessors preserve descriptors, brands, and nullable-string values |
 | `authoritative_parent_element_proof.html` | inherited Node.parentElement stays on Node.prototype, preserves parent identity, and becomes null after Element.remove |
 | `authoritative_attribute_namespace_proof.html` | HTML/SVG namespace-aware attribute reads preserve receiver brands, ordered conversion, nullable values, and XLink distinction |
+| `authoritative_attribute_names_proof.html` | getAttributeNames copies ordered HTML/SVG names into fresh mutable snapshots, including current parsed-XLink local-name parity |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
