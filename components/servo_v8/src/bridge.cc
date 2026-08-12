@@ -1034,15 +1034,15 @@ bool InstallDomException(ServoV8RealmState* realm,
   return true;
 }
 
-void ThrowSyntaxErrorDomException(ServoV8RealmState* realm,
-                                  v8::Local<v8::Context> context) {
+void ThrowDomException(ServoV8RealmState* realm,
+                       v8::Local<v8::Context> context,
+                       v8::Local<v8::String> message,
+                       v8::Local<v8::String> name) {
   v8::Isolate* isolate = realm->runtime->isolate;
   if (realm->dom_exception_prototype.IsEmpty()) {
     ThrowTypeError(isolate, "DOMException is not installed in this realm");
     return;
   }
-  v8::Local<v8::String> message =
-      V8String(isolate, "The string did not match the expected pattern.");
   v8::Local<v8::Object> exception;
   if (!v8::Exception::Error(message)->ToObject(context).ToLocal(&exception) ||
       !exception->Delete(context, V8String(isolate, "message")).FromMaybe(false) ||
@@ -1051,12 +1051,19 @@ void ThrowSyntaxErrorDomException(ServoV8RealmState* realm,
            ->SetPrototype(context,
                           realm->dom_exception_prototype.Get(isolate))
            .FromMaybe(false) ||
-      !InitializeDomException(
-          isolate, context, exception, message,
-          V8String(isolate, "SyntaxError"))) {
+      !InitializeDomException(isolate, context, exception, message, name)) {
     return;
   }
   isolate->ThrowException(exception);
+}
+
+void ThrowSyntaxErrorDomException(ServoV8RealmState* realm,
+                                  v8::Local<v8::Context> context) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  ThrowDomException(
+      realm, context,
+      V8String(isolate, "The string did not match the expected pattern."),
+      V8String(isolate, "SyntaxError"));
 }
 
 v8::Local<v8::Object> WrapperForInterfaceValue(
@@ -1931,6 +1938,32 @@ bool ElementHostCallbackState(
   }
   *realm_output = realm;
   *native_output = native;
+  return true;
+}
+
+bool UnwrapElementHostArgument(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    int index,
+    ServoV8RealmState* expected_realm,
+    void** native_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Value> value = info[index];
+  if (!value->IsObject()) {
+    ThrowTypeError(isolate, "Node argument is not an exposed Node");
+    return false;
+  }
+  v8::Local<v8::Object> object = value.As<v8::Object>();
+  auto* realm = static_cast<ServoV8RealmState*>(
+      object->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(isolate,
+                                                                 object);
+  if (!realm || realm != expected_realm || realm->tearing_down ||
+      !cell || cell->kind() != ServoV8HostKind::kElement || !cell->native()) {
+    ThrowTypeError(isolate, "Node argument is not an Element-backed Node in this realm");
+    return false;
+  }
+  *native_output = cell->native();
   return true;
 }
 
@@ -2838,6 +2871,227 @@ void NodeHostHasChildNodes(
                         "Node.hasChildNodes host callback failed");
 }
 
+bool IsCanonicalEmptyOwnedUtf8(const ServoV8OwnedUtf8& value) {
+  return !value.data && value.length == 0 && !value.owner &&
+         !value.drop_owner;
+}
+
+void ReturnNodeMutationOutcome(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    ServoV8NodeMutationOutcome* outcome,
+    bool callback_succeeded,
+    const char* member_name,
+    v8::ReturnValue<v8::Value> return_value) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  // Own both transfers even on callback failure or malformed output.
+  DocumentHostOwnedUtf8Scope message_scope(realm->runtime,
+                                            &outcome->exception_message);
+  auto fail = [&](const char* message) {
+    DropUnownedElementHost(realm->runtime, outcome->value.native,
+                           realm->runtime->element_host_vtable.drop);
+    outcome->value.native = nullptr;
+    ThrowTypeError(isolate, message);
+  };
+  if (!callback_succeeded) {
+    fail(member_name);
+    return;
+  }
+
+  const ServoV8InterfaceValue& value = outcome->value;
+  const bool valid_returned_value =
+      value.is_null == 0 && value.key && value.native;
+  const bool canonical_null_value =
+      value.is_null == 1 && !value.key && !value.native;
+  const bool is_exception =
+      outcome->status == SERVO_V8_NODE_MUTATION_DOM_EXCEPTION;
+  const bool valid_exception_kind =
+      outcome->exception_kind ==
+          SERVO_V8_NODE_MUTATION_EXCEPTION_HIERARCHY_REQUEST ||
+      outcome->exception_kind == SERVO_V8_NODE_MUTATION_EXCEPTION_NOT_FOUND;
+  const bool valid_exception_message =
+      outcome->exception_message.data && outcome->exception_message.owner &&
+      outcome->exception_message.drop_owner &&
+      outcome->exception_message.length <=
+          static_cast<size_t>(std::numeric_limits<int>::max()) &&
+      IsValidUtf8(outcome->exception_message.data,
+                  outcome->exception_message.length);
+  const bool canonical_non_exception =
+      outcome->exception_kind == SERVO_V8_NODE_MUTATION_EXCEPTION_NONE &&
+      IsCanonicalEmptyOwnedUtf8(outcome->exception_message);
+  const bool valid_shape =
+      (outcome->status == SERVO_V8_NODE_MUTATION_RETURNED &&
+       valid_returned_value && canonical_non_exception) ||
+      (is_exception && canonical_null_value && valid_exception_kind &&
+       valid_exception_message) ||
+      (outcome->status == SERVO_V8_NODE_MUTATION_HOST_FAILURE &&
+       canonical_null_value && canonical_non_exception);
+  if (!valid_shape) {
+    fail("invalid Node mutation outcome");
+    return;
+  }
+
+  if (outcome->status == SERVO_V8_NODE_MUTATION_HOST_FAILURE) {
+    ThrowTypeError(isolate, member_name);
+    return;
+  }
+  if (is_exception) {
+    v8::Local<v8::String> message;
+    if (outcome->exception_message.length == 0) {
+      message = v8::String::Empty(isolate);
+    } else if (!v8::String::NewFromUtf8(
+                    isolate,
+                    reinterpret_cast<const char*>(outcome->exception_message.data),
+                    v8::NewStringType::kNormal,
+                    static_cast<int>(outcome->exception_message.length))
+                    .ToLocal(&message)) {
+      return;
+    }
+    const char* name =
+        outcome->exception_kind ==
+                SERVO_V8_NODE_MUTATION_EXCEPTION_HIERARCHY_REQUEST
+            ? "HierarchyRequestError"
+            : "NotFoundError";
+    ThrowDomException(realm, context, message, V8String(isolate, name));
+    return;
+  }
+
+  v8::Local<v8::Object> wrapper =
+      WrapperForInterfaceValue(realm, isolate, context, value);
+  outcome->value.native = nullptr;
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(isolate, "Node mutation result wrapper could not be created");
+    return;
+  }
+  return_value.Set(wrapper);
+}
+
+bool NodeMutationCallbackState(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    int required_arguments,
+    const char* member_name,
+    ServoV8RealmState** realm_output,
+    void** native_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  // WebIDL checks the receiver brand before inspecting arguments.
+  if (!ElementHostCallbackState(info, realm_output, native_output)) return false;
+  if (info.Length() < required_arguments) {
+    ThrowTypeError(isolate, member_name);
+    return false;
+  }
+  if (!(*realm_output)->document_host.active_host_context) {
+    ThrowTypeError(isolate, "Node mutation requires a live host context");
+    return false;
+  }
+  return true;
+}
+
+void NodeHostInsertBefore(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!NodeMutationCallbackState(info, 2, "Node.insertBefore requires 2 arguments",
+                                 &realm, &native)) {
+    return;
+  }
+  void* node_native = nullptr;
+  if (!UnwrapElementHostArgument(info, 0, realm, &node_native)) return;
+  uint8_t child_is_null = info[1]->IsNull() ? 1 : 0;
+  void* child_native = nullptr;
+  if (!child_is_null &&
+      !UnwrapElementHostArgument(info, 1, realm, &child_native)) {
+    return;
+  }
+  ServoV8NodeMutationOutcome outcome{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.insert_before(
+        native, realm->document_host.active_host_context, node_native,
+        child_is_null, child_native, &outcome);
+  }
+  ReturnNodeMutationOutcome(realm, info.GetIsolate()->GetCurrentContext(),
+                            &outcome, succeeded,
+                            "Node.insertBefore host callback failed",
+                            info.GetReturnValue());
+}
+
+void NodeHostAppendChild(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!NodeMutationCallbackState(info, 1, "Node.appendChild requires 1 argument",
+                                 &realm, &native)) {
+    return;
+  }
+  void* node_native = nullptr;
+  if (!UnwrapElementHostArgument(info, 0, realm, &node_native)) return;
+  ServoV8NodeMutationOutcome outcome{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.append_child(
+        native, realm->document_host.active_host_context, node_native,
+        &outcome);
+  }
+  ReturnNodeMutationOutcome(realm, info.GetIsolate()->GetCurrentContext(),
+                            &outcome, succeeded,
+                            "Node.appendChild host callback failed",
+                            info.GetReturnValue());
+}
+
+void NodeHostReplaceChild(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!NodeMutationCallbackState(info, 2, "Node.replaceChild requires 2 arguments",
+                                 &realm, &native)) {
+    return;
+  }
+  void* node_native = nullptr;
+  void* child_native = nullptr;
+  if (!UnwrapElementHostArgument(info, 0, realm, &node_native) ||
+      !UnwrapElementHostArgument(info, 1, realm, &child_native)) {
+    return;
+  }
+  ServoV8NodeMutationOutcome outcome{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.replace_child(
+        native, realm->document_host.active_host_context, node_native,
+        child_native, &outcome);
+  }
+  ReturnNodeMutationOutcome(realm, info.GetIsolate()->GetCurrentContext(),
+                            &outcome, succeeded,
+                            "Node.replaceChild host callback failed",
+                            info.GetReturnValue());
+}
+
+void NodeHostRemoveChild(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!NodeMutationCallbackState(info, 1, "Node.removeChild requires 1 argument",
+                                 &realm, &native)) {
+    return;
+  }
+  void* child_native = nullptr;
+  if (!UnwrapElementHostArgument(info, 0, realm, &child_native)) return;
+  ServoV8NodeMutationOutcome outcome{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.remove_child(
+        native, realm->document_host.active_host_context, child_native,
+        &outcome);
+  }
+  ReturnNodeMutationOutcome(realm, info.GetIsolate()->GetCurrentContext(),
+                            &outcome, succeeded,
+                            "Node.removeChild host callback failed",
+                            info.GetReturnValue());
+}
+
 using ElementOptionalStringGetter =
     uint8_t (*)(void* native, ServoV8OptionalOwnedUtf8* output);
 using ElementOptionalStringGetterSlot =
@@ -3147,17 +3401,40 @@ bool InstallNodePrototype(ServoV8RealmState* realm,
                                    setter, v8::None);
   }
 
-  v8::Local<v8::String> name = V8String(isolate, "hasChildNodes");
-  v8::Local<v8::Function> function;
-  if (!v8::Function::New(context, NodeHostHasChildNodes, {}, 0,
-                         v8::ConstructorBehavior::kThrow,
-                         v8::SideEffectType::kHasNoSideEffect)
-           .ToLocal(&function)) {
-    return false;
+  struct NodeOperation {
+    const char* name;
+    v8::FunctionCallback callback;
+    int length;
+    v8::SideEffectType side_effect;
+  };
+  const NodeOperation operations[] = {
+      {"hasChildNodes", &NodeHostHasChildNodes, 0,
+       v8::SideEffectType::kHasNoSideEffect},
+      {"insertBefore", &NodeHostInsertBefore, 2,
+       v8::SideEffectType::kHasSideEffect},
+      {"appendChild", &NodeHostAppendChild, 1,
+       v8::SideEffectType::kHasSideEffect},
+      {"replaceChild", &NodeHostReplaceChild, 2,
+       v8::SideEffectType::kHasSideEffect},
+      {"removeChild", &NodeHostRemoveChild, 1,
+       v8::SideEffectType::kHasSideEffect},
+  };
+  for (const auto& operation : operations) {
+    v8::Local<v8::Function> function;
+    if (!v8::Function::New(context, operation.callback, {}, operation.length,
+                           v8::ConstructorBehavior::kThrow,
+                           operation.side_effect)
+             .ToLocal(&function)) {
+      return false;
+    }
+    v8::Local<v8::String> name = V8String(isolate, operation.name);
+    function->SetName(name);
+    if (!prototype->DefineOwnProperty(context, name, function, v8::None)
+             .FromMaybe(false)) {
+      return false;
+    }
   }
-  function->SetName(name);
-  return prototype->DefineOwnProperty(context, name, function, v8::None)
-      .FromMaybe(false);
+  return true;
 }
 
 bool AddUnscopable(v8::Isolate* isolate,
@@ -4616,7 +4893,9 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->get_parent_element ||
-      !vtable->has_child_nodes ||
+      !vtable->has_child_nodes || !vtable->insert_before ||
+      !vtable->append_child || !vtable->replace_child ||
+      !vtable->remove_child ||
       !vtable->get_children || !vtable->get_elements_by_tag_name ||
       !vtable->get_elements_by_class_name ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||

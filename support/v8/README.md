@@ -229,6 +229,22 @@ matches `*`, ASCII-folds HTML element names only when the root is in an HTML
 document, and otherwise preserves case and qualified-prefix matching exactly
 as Servo's native collection filter does.
 
+ABI v37 adds the narrow, Element-backed `Node.insertBefore`,
+`Node.appendChild`, `Node.replaceChild`, and `Node.removeChild` slice. The V8
+host roots receiver and argument Elements through their existing
+`Trusted<Element>` owners and invokes Servo's production `NodeMethods`; it
+does not duplicate pointer, adoption, mutation-observer, range, layout, slot,
+or custom-element work. Results retain the existing per-realm Element wrapper
+identity. `HierarchyRequestError` and `NotFoundError` cross the ABI as typed
+POD outcomes and are constructed as V8-owned realm-local DOMExceptions, rather
+than creating a SpiderMonkey exception while V8 has borrowed the sidecar.
+Unexpected SpiderMonkey exceptions are cleared and reported as an internal V8
+host failure. Reactions remain on Servo's outer or backup element queue until
+the V8 callback returns. `authoritative_node_mutation_proof.html` exercises
+all four operations, their descriptors/brands/returns/error variants, live
+and static collection behavior, a SpiderMonkey follow-up observation, and
+leaves one visible rendered `Hello` for the browser screenshot milestone.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script
@@ -491,6 +507,7 @@ The proof suite uses that same counting argument:
 | `authoritative_parent_element_proof.html` | inherited Node.parentElement stays on Node.prototype, preserves parent identity, and becomes null after Element.remove |
 | `authoritative_attribute_namespace_proof.html` | HTML/SVG namespace-aware attribute reads preserve receiver brands, ordered conversion, nullable values, and XLink distinction |
 | `authoritative_attribute_names_proof.html` | getAttributeNames copies ordered HTML/SVG names into fresh mutable snapshots, including current parsed-XLink local-name parity |
+| `authoritative_node_mutation_proof.html` | all four Element-backed Node mutations call Servo's production algorithms, preserve wrapper identity and live/static views, map DOMExceptions into V8, and leave a visible rendered Hello |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -514,7 +531,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 29 and remains experimental. The original
+The current exported C ABI is version 37 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

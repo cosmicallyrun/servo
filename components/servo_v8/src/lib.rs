@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 36;
+const ABI_VERSION: u32 = 37;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -172,10 +172,13 @@ impl InterfaceHandle {
     ///
     /// # Safety
     ///
-    /// `dom_object` must be the address of the DOM object `host` roots, and
-    /// that root must keep it alive for as long as the host lives. Passing an
-    /// address the host does not root would let the cache outlive its object.
-    pub unsafe fn new<T: ElementHostBinding>(dom_object: *const c_void, host: T) -> Self {
+    /// `T` must be the exact type installed through
+    /// [`Runtime::install_element_host`]. `dom_object` must be the address of
+    /// the DOM object `host` roots, and that root must keep it alive for as
+    /// long as the host lives. Passing a different type or an address the host
+    /// does not root would make the type-erased vtable cast invalid or let the
+    /// cache outlive its object.
+    pub unsafe fn new<T: NodeHostBinding>(dom_object: *const c_void, host: T) -> Self {
         Self {
             key: dom_object,
             native: Box::into_raw(Box::new(host)).cast::<c_void>(),
@@ -228,6 +231,26 @@ impl NodeListHandle {
 pub enum SelectorNodeListResult {
     Match(NodeListHandle),
     SyntaxError,
+    HostFailure,
+}
+
+/// A DOMException kind produced by one of Node's structural mutation methods.
+///
+/// The exception stays typed data until the V8 bridge creates a realm-local
+/// `DOMException`; a SpiderMonkey exception object never crosses this ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeMutationException {
+    HierarchyRequest,
+    NotFound,
+}
+
+/// The complete native result space for an Element-backed Node mutation.
+pub enum NodeMutationResult {
+    Returned(InterfaceHandle),
+    DomException {
+        kind: NodeMutationException,
+        message: String,
+    },
     HostFailure,
 }
 
@@ -401,6 +424,55 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     ) -> SelectorNodeListResult;
 }
 
+/// Node's structural mutation surface for the runtime's installed Element
+/// host type.
+///
+/// This initial Node ABI deliberately accepts only Element-backed wrappers,
+/// which are the only Node wrappers currently exposed by the experimental V8
+/// realm. Inputs are borrowed synchronously: implementations must not retain
+/// them. Implementations must call Servo's production Node algorithms, keep
+/// custom-element reactions deferred until the V8 callback unwinds, and turn
+/// DOM failures into [`NodeMutationResult`] without leaving a SpiderMonkey
+/// exception pending.
+///
+/// # Safety
+///
+/// The receiver and every input are live hosts of the same concrete type
+/// installed through [`Runtime::install_element_host`]. `host_context` is the
+/// owner-thread context and is valid only for the duration of the call. No
+/// method may unwind, enter V8, or pump an event loop.
+pub unsafe trait NodeHostBinding: ElementHostBinding {
+    unsafe fn insert_before(
+        &self,
+        host_context: *mut c_void,
+        node: &Self,
+        child: Option<&Self>,
+    ) -> NodeMutationResult;
+    unsafe fn append_child(&self, host_context: *mut c_void, node: &Self) -> NodeMutationResult;
+    unsafe fn replace_child(
+        &self,
+        host_context: *mut c_void,
+        node: &Self,
+        child: &Self,
+    ) -> NodeMutationResult;
+    unsafe fn remove_child(&self, host_context: *mut c_void, child: &Self) -> NodeMutationResult;
+}
+
+const NODE_MUTATION_RETURNED: u32 = 0;
+const NODE_MUTATION_DOM_EXCEPTION: u32 = 1;
+const NODE_MUTATION_HOST_FAILURE: u32 = 2;
+const NODE_MUTATION_EXCEPTION_NONE: u32 = 0;
+const NODE_MUTATION_EXCEPTION_HIERARCHY_REQUEST: u32 = 1;
+const NODE_MUTATION_EXCEPTION_NOT_FOUND: u32 = 2;
+
+#[repr(C)]
+pub struct RawNodeMutationOutcome {
+    pub status: u32,
+    pub exception_kind: u32,
+    pub exception_message: OwnedUtf8,
+    pub value: RawInterfaceValue,
+}
+
 #[repr(C)]
 pub struct OptionalOwnedUtf8 {
     pub is_null: u8,
@@ -480,6 +552,41 @@ pub struct ElementHostVTable {
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
     pub get_parent_element: Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub insert_before: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            u8,
+            *mut c_void,
+            *mut RawNodeMutationOutcome,
+        ) -> u8,
+    >,
+    pub append_child: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut RawNodeMutationOutcome,
+        ) -> u8,
+    >,
+    pub replace_child: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut RawNodeMutationOutcome,
+        ) -> u8,
+    >,
+    pub remove_child: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut RawNodeMutationOutcome,
+        ) -> u8,
+    >,
     pub get_children: Option<unsafe extern "C" fn(*mut c_void, *mut RawHTMLCollectionValue) -> u8>,
     pub get_elements_by_tag_name: Option<
         unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut RawHTMLCollectionValue) -> u8,
@@ -941,6 +1048,65 @@ fn raw_selector_node_list_outcome(result: SelectorNodeListResult) -> RawSelector
     }
 }
 
+fn raw_null_interface_value() -> RawInterfaceValue {
+    RawInterfaceValue {
+        is_null: 1,
+        key: std::ptr::null(),
+        native: std::ptr::null_mut(),
+    }
+}
+
+fn raw_empty_owned_utf8() -> OwnedUtf8 {
+    OwnedUtf8 {
+        data: std::ptr::null(),
+        length: 0,
+        owner: std::ptr::null_mut(),
+        drop_owner: None,
+    }
+}
+
+fn raw_owned_utf8(value: String) -> OwnedUtf8 {
+    let owner = Box::new(value.into_bytes());
+    OwnedUtf8 {
+        data: owner.as_ptr(),
+        length: owner.len(),
+        owner: Box::into_raw(owner).cast(),
+        drop_owner: Some(document_host_owned_utf8_drop),
+    }
+}
+
+fn raw_node_mutation_outcome(result: NodeMutationResult) -> RawNodeMutationOutcome {
+    match result {
+        NodeMutationResult::Returned(handle) => RawNodeMutationOutcome {
+            status: NODE_MUTATION_RETURNED,
+            exception_kind: NODE_MUTATION_EXCEPTION_NONE,
+            exception_message: raw_empty_owned_utf8(),
+            value: RawInterfaceValue {
+                is_null: 0,
+                key: handle.key,
+                native: handle.native,
+            },
+        },
+        NodeMutationResult::DomException { kind, message } => RawNodeMutationOutcome {
+            status: NODE_MUTATION_DOM_EXCEPTION,
+            exception_kind: match kind {
+                NodeMutationException::HierarchyRequest => {
+                    NODE_MUTATION_EXCEPTION_HIERARCHY_REQUEST
+                },
+                NodeMutationException::NotFound => NODE_MUTATION_EXCEPTION_NOT_FOUND,
+            },
+            exception_message: raw_owned_utf8(message),
+            value: raw_null_interface_value(),
+        },
+        NodeMutationResult::HostFailure => RawNodeMutationOutcome {
+            status: NODE_MUTATION_HOST_FAILURE,
+            exception_kind: NODE_MUTATION_EXCEPTION_NONE,
+            exception_message: raw_empty_owned_utf8(),
+            value: raw_null_interface_value(),
+        },
+    }
+}
+
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -1259,6 +1425,109 @@ unsafe extern "C" fn element_host_has_child_nodes<T: ElementHostBinding>(
     // SAFETY: Both pointers satisfy the vtable contract.
     unsafe { *output = (&*native.cast::<T>()).has_child_nodes() as u8 };
     1
+}
+
+unsafe fn element_host_write_node_mutation_outcome(
+    output: *mut RawNodeMutationOutcome,
+    result: NodeMutationResult,
+) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    // SAFETY: output is non-null caller-owned writable storage. The complete
+    // ownership-bearing result is transferred atomically.
+    unsafe { *output = raw_node_mutation_outcome(result) };
+    1
+}
+
+unsafe extern "C" fn element_host_insert_before<T: NodeHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    node_native: *mut c_void,
+    child_is_null: u8,
+    child_native: *mut c_void,
+    output: *mut RawNodeMutationOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || node_native.is_null()
+        || output.is_null()
+        || child_is_null > 1
+        || (child_is_null == 0 && child_native.is_null())
+        || (child_is_null == 1 && !child_native.is_null())
+    {
+        return 0;
+    }
+    // SAFETY: C++ brand-checks every host and lends the same installed T only
+    // for this callback. A null child is represented canonically.
+    let result = unsafe {
+        (&*native.cast::<T>()).insert_before(
+            host_context,
+            &*node_native.cast::<T>(),
+            (child_is_null == 0).then(|| &*child_native.cast::<T>()),
+        )
+    };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_node_mutation_outcome(output, result) }
+}
+
+unsafe extern "C" fn element_host_append_child<T: NodeHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    node_native: *mut c_void,
+    output: *mut RawNodeMutationOutcome,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || node_native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: C++ lends two live hosts of the same installed T.
+    let result =
+        unsafe { (&*native.cast::<T>()).append_child(host_context, &*node_native.cast::<T>()) };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_node_mutation_outcome(output, result) }
+}
+
+unsafe extern "C" fn element_host_replace_child<T: NodeHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    node_native: *mut c_void,
+    child_native: *mut c_void,
+    output: *mut RawNodeMutationOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || node_native.is_null()
+        || child_native.is_null()
+        || output.is_null()
+    {
+        return 0;
+    }
+    // SAFETY: C++ lends three live hosts of the same installed T.
+    let result = unsafe {
+        (&*native.cast::<T>()).replace_child(
+            host_context,
+            &*node_native.cast::<T>(),
+            &*child_native.cast::<T>(),
+        )
+    };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_node_mutation_outcome(output, result) }
+}
+
+unsafe extern "C" fn element_host_remove_child<T: NodeHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    child_native: *mut c_void,
+    output: *mut RawNodeMutationOutcome,
+) -> u8 {
+    if native.is_null() || host_context.is_null() || child_native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: C++ lends two live hosts of the same installed T.
+    let result =
+        unsafe { (&*native.cast::<T>()).remove_child(host_context, &*child_native.cast::<T>()) };
+    // SAFETY: output is caller-owned writable storage.
+    unsafe { element_host_write_node_mutation_outcome(output, result) }
 }
 
 unsafe extern "C" fn element_host_get_children<T: ElementHostBinding>(
@@ -1675,7 +1944,7 @@ fn html_collection_host_vtable<T: HTMLCollectionHostBinding>() -> HTMLCollection
     }
 }
 
-fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
+fn element_host_vtable<T: NodeHostBinding>() -> ElementHostVTable {
     ElementHostVTable {
         get_local_name: Some(element_host_get_local_name::<T>),
         get_tag_name: Some(element_host_get_tag_name::<T>),
@@ -1698,6 +1967,10 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         set_text_content: Some(element_host_set_text_content::<T>),
         get_parent_element: Some(element_host_get_parent_element::<T>),
         has_child_nodes: Some(element_host_has_child_nodes::<T>),
+        insert_before: Some(element_host_insert_before::<T>),
+        append_child: Some(element_host_append_child::<T>),
+        replace_child: Some(element_host_replace_child::<T>),
+        remove_child: Some(element_host_remove_child::<T>),
         get_children: Some(element_host_get_children::<T>),
         get_elements_by_tag_name: Some(element_host_get_elements_by_tag_name::<T>),
         get_elements_by_class_name: Some(element_host_get_elements_by_class_name::<T>),
@@ -2345,7 +2618,7 @@ impl Runtime {
     ///
     /// The vtable is type-level; the hosts it describes are per DOM object and
     /// are handed over one at a time by an interface-typed getter.
-    pub fn install_element_host<T: ElementHostBinding>(&mut self) -> Result<(), Error> {
+    pub fn install_element_host<T: NodeHostBinding>(&mut self) -> Result<(), Error> {
         let vtable = element_host_vtable::<T>();
         let mut storage = [0; ERROR_CAPACITY];
         let mut error = error_buffer(&mut storage);
@@ -3587,7 +3860,173 @@ mod tests {
         }
     }
 
+    // SAFETY: The probe's child vectors and every child identity are
+    // owner-thread `Rc` values. Mutation borrows them only for one callback,
+    // does not retain an input host or host context, and returns the original
+    // input's rooted identity through the existing wrapper cache.
+    unsafe impl NodeHostBinding for ElementHostProbe {
+        unsafe fn insert_before(
+            &self,
+            host_context: *mut c_void,
+            node: &Self,
+            child: Option<&Self>,
+        ) -> NodeMutationResult {
+            assert!(!host_context.is_null());
+            if self.identity == node.identity {
+                return Self::hierarchy_request();
+            }
+            if child.is_some_and(|child| !self.contains_mutation_child(child)) {
+                return Self::not_found();
+            }
+            if child.is_some_and(|child| child.identity == node.identity) {
+                return NodeMutationResult::Returned(node.interface_handle());
+            }
+            let Some(node_child) = node.take_mutation_child() else {
+                return NodeMutationResult::HostFailure;
+            };
+            if node.state.remove_fails.get() || self.state.remove_fails.get() {
+                return NodeMutationResult::HostFailure;
+            }
+            node.detach_from_mutation_parent();
+            let mut children = self.state.element_children.borrow_mut();
+            if let Some(child) = child {
+                let Some(index) = children
+                    .iter()
+                    .position(|candidate| Self::same_child(candidate, child))
+                else {
+                    return Self::not_found();
+                };
+                children.insert(index, node_child);
+            } else {
+                children.push(node_child);
+            }
+            self.state.has_child_nodes.set(!children.is_empty());
+            node.state.is_connected.set(self.state.is_connected.get());
+            NodeMutationResult::Returned(node.interface_handle())
+        }
+
+        unsafe fn append_child(
+            &self,
+            host_context: *mut c_void,
+            node: &Self,
+        ) -> NodeMutationResult {
+            // SAFETY: appendChild is insertBefore with a null reference child.
+            unsafe { self.insert_before(host_context, node, None) }
+        }
+
+        unsafe fn replace_child(
+            &self,
+            host_context: *mut c_void,
+            node: &Self,
+            child: &Self,
+        ) -> NodeMutationResult {
+            assert!(!host_context.is_null());
+            if self.identity == node.identity {
+                return Self::hierarchy_request();
+            }
+            if !self.contains_mutation_child(child) {
+                return Self::not_found();
+            }
+            if child.identity == node.identity {
+                return NodeMutationResult::Returned(node.interface_handle());
+            }
+            let Some(node_child) = node.take_mutation_child() else {
+                return NodeMutationResult::HostFailure;
+            };
+            if node.state.remove_fails.get() || self.state.remove_fails.get() {
+                return NodeMutationResult::HostFailure;
+            }
+            node.detach_from_mutation_parent();
+            let mut children = self.state.element_children.borrow_mut();
+            let Some(index) = children
+                .iter()
+                .position(|candidate| Self::same_child(candidate, child))
+            else {
+                return Self::not_found();
+            };
+            let replaced = std::mem::replace(&mut children[index], node_child);
+            replaced.state.is_connected.set(false);
+            self.state.has_child_nodes.set(!children.is_empty());
+            node.state.is_connected.set(self.state.is_connected.get());
+            NodeMutationResult::Returned(child.interface_handle())
+        }
+
+        unsafe fn remove_child(
+            &self,
+            host_context: *mut c_void,
+            child: &Self,
+        ) -> NodeMutationResult {
+            assert!(!host_context.is_null());
+            if self.state.remove_fails.get() || child.state.remove_fails.get() {
+                return NodeMutationResult::HostFailure;
+            }
+            let mut children = self.state.element_children.borrow_mut();
+            let Some(index) = children
+                .iter()
+                .position(|candidate| Self::same_child(candidate, child))
+            else {
+                return Self::not_found();
+            };
+            let removed = children.remove(index);
+            removed.state.is_connected.set(false);
+            self.state.has_child_nodes.set(!children.is_empty());
+            NodeMutationResult::Returned(child.interface_handle())
+        }
+    }
+
     impl ElementHostProbe {
+        fn hierarchy_request() -> NodeMutationResult {
+            NodeMutationResult::DomException {
+                kind: NodeMutationException::HierarchyRequest,
+                message: "The operation would yield an incorrect node tree.".to_owned(),
+            }
+        }
+
+        fn not_found() -> NodeMutationResult {
+            NodeMutationResult::DomException {
+                kind: NodeMutationException::NotFound,
+                message: "The child can not be found in the parent.".to_owned(),
+            }
+        }
+
+        fn same_child(candidate: &ElementProbeChild, host: &Self) -> bool {
+            Rc::as_ptr(&candidate.identity).cast::<c_void>() == host.identity
+        }
+
+        fn contains_mutation_child(&self, child: &Self) -> bool {
+            self.state
+                .element_children
+                .borrow()
+                .iter()
+                .any(|candidate| Self::same_child(candidate, child))
+        }
+
+        fn take_mutation_child(&self) -> Option<ElementProbeChild> {
+            Some(ElementProbeChild {
+                identity: self._owned_identity.clone()?,
+                local_name: self.local_name.clone(),
+                tag_name: self.tag_name.clone(),
+                state: Rc::clone(&self.state),
+            })
+        }
+
+        fn detach_from_mutation_parent(&self) {
+            let Some(parent_children) = &self.parent_children else {
+                return;
+            };
+            let mut children = parent_children.borrow_mut();
+            if let Some(index) = children
+                .iter()
+                .position(|candidate| Self::same_child(candidate, self))
+            {
+                let child = children.remove(index);
+                child.state.is_connected.set(false);
+                if let Some(parent_state) = &self.parent_state {
+                    parent_state.has_child_nodes.set(!children.is_empty());
+                }
+            }
+        }
+
         fn parent_descriptor(&self) -> ParentElementProbe {
             ParentElementProbe {
                 local_name: self.local_name.clone(),
@@ -6888,6 +7327,163 @@ mod tests {
             runtime
                 .eval_bool_in_realm(realm, "elementRemoveHostFailureProof")
                 .unwrap()
+        );
+        runtime.destroy_realm(realm).unwrap();
+    }
+
+    #[test]
+    fn node_mutations_preserve_identity_and_report_typed_dom_failures() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime
+            .install_element_host::<ElementHostProbe>()
+            .expect("Node-capable Element host installs once");
+        runtime
+            .install_html_collection_host::<HTMLCollectionHostProbe>()
+            .expect("HTMLCollection host installs once");
+        let realm = runtime.create_realm().unwrap();
+        let host = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        let first_child_state =
+            Rc::clone(&host.id_element_state.element_children.borrow()[0].state);
+        let element_drops = Rc::clone(&host.element_drops);
+        runtime.install_document_host(realm, host).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"
+            (() => {
+              const target = document.getElementById('target');
+              const first = target.children[0];
+              const second = target.children[1];
+              const nodePrototype = Object.getPrototypeOf(Object.getPrototypeOf(target));
+              const operations = [
+                ['insertBefore', 2], ['appendChild', 1],
+                ['replaceChild', 2], ['removeChild', 1],
+              ];
+              const descriptorShape = operations.every(([name, length]) => {
+                const descriptor = Object.getOwnPropertyDescriptor(nodePrototype, name);
+                return descriptor && descriptor.value.name === name &&
+                  descriptor.value.length === length && descriptor.writable &&
+                  descriptor.enumerable && descriptor.configurable;
+              });
+
+              let wrongBrandTouchedArgument = false;
+              let wrongBrand = false;
+              try {
+                nodePrototype.appendChild.call({}, new Proxy({}, {
+                  get() { wrongBrandTouchedArgument = true; return undefined; }
+                }));
+              } catch (error) { wrongBrand = error instanceof TypeError; }
+
+              let missing = false;
+              let undefinedArgument = false;
+              let wrongArgument = false;
+              try { target.appendChild(); }
+              catch (error) { missing = error instanceof TypeError; }
+              try { target.insertBefore(first, undefined); }
+              catch (error) { undefinedArgument = error instanceof TypeError; }
+              try { target.replaceChild({}, first); }
+              catch (error) { wrongArgument = error instanceof TypeError; }
+
+              const insertedAtNull = target.insertBefore(second, null) === second &&
+                target.children[0] === first && target.children[1] === second;
+              const appended = target.appendChild(first) === first &&
+                target.children[0] === second && target.children[1] === first;
+              const replaced = target.replaceChild(second, first) === first &&
+                target.children.length === 1 && target.children[0] === second &&
+                !first.isConnected && second.isConnected;
+              const removed = target.removeChild(second) === second &&
+                target.children.length === 0 && !second.isConnected;
+
+              let hierarchy = false;
+              try { second.appendChild(second); }
+              catch (error) {
+                hierarchy = error instanceof DOMException && error.name === 'HierarchyRequestError' &&
+                  error.code === 3;
+              }
+              let notFound = false;
+              try { target.removeChild(second); }
+              catch (error) {
+                notFound = error instanceof DOMException && error.name === 'NotFoundError' &&
+                  error.code === 8;
+              }
+
+              globalThis.mutationTarget = target;
+              globalThis.mutationFirst = first;
+              globalThis.nodeMutationBridgeProof = descriptorShape && wrongBrand &&
+                !wrongBrandTouchedArgument && missing && undefinedArgument && wrongArgument &&
+                insertedAtNull && appended && replaced && removed && hierarchy && notFound;
+            })();
+            "#,
+            "node-mutation-binding.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: The opaque token remains live for this synchronous host entry.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "nodeMutationBridgeProof")
+                .unwrap()
+        );
+        assert!(
+            element_drops.get() >= 4,
+            "each returned wrapper cache hit must release its speculative host"
+        );
+
+        first_child_state.remove_fails.set(true);
+        let failure_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            "(() => {\n\
+               let hostFailure = false;\n\
+               try { mutationTarget.appendChild(mutationFirst); }\n\
+               catch (error) { hostFailure = error instanceof TypeError; }\n\
+               globalThis.nodeMutationHostFailureProof = hostFailure;\n\
+             })();",
+            "node-mutation-host-failure.js",
+            1,
+        ));
+        // SAFETY: The opaque token remains live for this synchronous host entry.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    failure_script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "nodeMutationHostFailureProof")
+                .unwrap()
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { mutationTarget.appendChild(mutationFirst); } \
+                     catch (error) { return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap(),
+            "mutation without the ephemeral host context must be rejected"
         );
         runtime.destroy_realm(realm).unwrap();
     }

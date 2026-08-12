@@ -47,6 +47,10 @@ NODE_IS_CONNECTED = "Node.isConnected"
 NODE_PARENT_ELEMENT = "Node.parentElement"
 NODE_TEXT_CONTENT = "Node.textContent"
 NODE_HAS_CHILD_NODES = "Node.hasChildNodes"
+NODE_INSERT_BEFORE = "Node.insertBefore"
+NODE_APPEND_CHILD = "Node.appendChild"
+NODE_REPLACE_CHILD = "Node.replaceChild"
+NODE_REMOVE_CHILD = "Node.removeChild"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_GET_ELEMENTS_BY_TAG_NAME = "Document.getElementsByTagName"
 DOCUMENT_GET_ELEMENTS_BY_CLASS_NAME = "Document.getElementsByClassName"
@@ -334,6 +338,13 @@ NODE_HOST = (
     NODE_PARENT_ELEMENT,
     NODE_TEXT_CONTENT,
     NODE_HAS_CHILD_NODES,
+    # These are gates only.  The generated Node host does not yet emit
+    # mutation callbacks, but every build must reject a production signature
+    # drift before an emitter is added.
+    NODE_INSERT_BEFORE,
+    NODE_APPEND_CHILD,
+    NODE_REPLACE_CHILD,
+    NODE_REMOVE_CHILD,
 )
 
 
@@ -1585,6 +1596,82 @@ def _select_element_host_member(
     return member
 
 
+def _select_node_mutation_operation(
+    member: WebIDL.IDLMethod,
+    qualified_name: str,
+    expected_arguments: Sequence[tuple[str, bool]],
+) -> WebIDL.IDLMethod:
+    """Select one exact `[CEReactions, Throws]` Node mutation operation.
+
+    ``expected_arguments`` names each required ``Node`` argument and whether
+    it is nullable.  Keeping this gate independent from the future emitter
+    makes the current generated surface fail closed on every ABI-relevant
+    production WebIDL change.
+    """
+
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must be an ordinary instance operation"
+        )
+    actual_attributes = set(member._extendedAttrDict)
+    expected_attributes = {"CEReactions", "Throws"}
+    if actual_attributes != expected_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+            f"got {sorted(actual_attributes)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if (
+        return_type.nullable()
+        or not return_type.isInterface()
+        or return_type.name != "Node"
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `Node`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if len(arguments) != len(expected_arguments):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly {len(expected_arguments)} argument(s), "
+            f"found {len(arguments)}"
+        )
+    for argument, (expected_name, expected_nullable) in zip(
+        arguments, expected_arguments, strict=True
+    ):
+        if (
+            argument.identifier.name != expected_name
+            or argument.optional
+            or argument.variadic
+            or argument.defaultValue is not None
+            or argument.type.nullable() != expected_nullable
+        ):
+            nullable = "nullable " if expected_nullable else "non-nullable "
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take required {nullable}`Node {expected_name}`"
+            )
+        node_type = argument.type.inner if expected_nullable else argument.type
+        if not node_type.isInterface() or node_type.name != "Node":
+            nullable = "?" if expected_nullable else ""
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` argument `{expected_name}` must use "
+                f"`Node{nullable}`, got `{argument.type.prettyName()}`"
+            )
+        argument_attributes = set(argument._extendedAttrDict) | set(
+            argument.type._extendedAttrDict
+        )
+        if argument_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` argument `{expected_name}` carries extended attributes "
+                "that are not implemented: " + ", ".join(sorted(argument_attributes))
+            )
+    return member
+
+
 def _select_node_host_member(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
     qualified_name: str,
@@ -1611,6 +1698,19 @@ def _select_node_host_member(
             f"expected exactly one member `{qualified_name}`, found {len(members)}"
         )
     member = members[0]
+
+    mutation_arguments = {
+        "insertBefore": (("node", False), ("child", True)),
+        "appendChild": (("node", False),),
+        "replaceChild": (("node", False), ("child", False)),
+        "removeChild": (("child", False),),
+    }
+    if member_name in mutation_arguments:
+        if not member.isMethod():
+            raise WebIDLSelectionError(f"`{qualified_name}` must be an operation")
+        return _select_node_mutation_operation(
+            member, qualified_name, mutation_arguments[member_name]
+        )
 
     attribute_attributes = {
         "nodeType": {"Constant"},

@@ -443,6 +443,34 @@ class ProductionNodeTests(unittest.TestCase):
         ].signatures()[0]
         self.assertTrue(return_type.isBoolean())
         self.assertEqual(arguments, [])
+        expected_mutations = (
+            (production_webidl.NODE_INSERT_BEFORE, (("node", False), ("child", True))),
+            (production_webidl.NODE_APPEND_CHILD, (("node", False),)),
+            (production_webidl.NODE_REPLACE_CHILD, (("node", False), ("child", False))),
+            (production_webidl.NODE_REMOVE_CHILD, (("child", False),)),
+        )
+        for qualified_name, expected_arguments in expected_mutations:
+            with self.subTest(member=qualified_name):
+                method = members[qualified_name]
+                return_type, arguments = method.signatures()[0]
+                self.assertFalse(return_type.nullable())
+                self.assertTrue(return_type.isInterface())
+                self.assertEqual(return_type.name, "Node")
+                self.assertEqual(set(method._extendedAttrDict), {"CEReactions", "Throws"})
+                self.assertEqual(len(arguments), len(expected_arguments))
+                for argument, (expected_name, expected_nullable) in zip(
+                    arguments, expected_arguments, strict=True
+                ):
+                    self.assertEqual(argument.identifier.name, expected_name)
+                    self.assertFalse(argument.optional)
+                    self.assertFalse(argument.variadic)
+                    self.assertIsNone(argument.defaultValue)
+                    self.assertEqual(argument.type.nullable(), expected_nullable)
+                    node_type = argument.type.inner if expected_nullable else argument.type
+                    self.assertTrue(node_type.isInterface())
+                    self.assertEqual(node_type.name, "Node")
+                    self.assertFalse(argument._extendedAttrDict)
+                    self.assertFalse(argument.type._extendedAttrDict)
 
     def test_pins_real_node_parent_element_as_inherited_element_value(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2232,6 +2260,90 @@ class SyntheticSelectionTests(unittest.TestCase):
             "hasChildNodes",
             "`Node.hasChildNodes` must take no arguments, found 1",
         )
+
+    def test_selects_exact_node_mutation_operations(self) -> None:
+        parser_results = self.parse(
+            {
+                "Node.webidl": """interface Node {
+                    [CEReactions, Throws] Node insertBefore(Node node, Node? child);
+                    [CEReactions, Throws] Node appendChild(Node node);
+                    [CEReactions, Throws] Node replaceChild(Node node, Node child);
+                    [CEReactions, Throws] Node removeChild(Node child);
+                };""",
+            }
+        )
+        expected = (
+            ("insertBefore", (("node", False), ("child", True))),
+            ("appendChild", (("node", False),)),
+            ("replaceChild", (("node", False), ("child", False))),
+            ("removeChild", (("child", False),)),
+        )
+        for member_name, arguments in expected:
+            with self.subTest(member=member_name):
+                member = production_webidl._select_node_host_member(
+                    parser_results, f"Node.{member_name}"
+                )
+                self.assertEqual(set(member._extendedAttrDict), {"CEReactions", "Throws"})
+                self.assertEqual(member.signatures()[0][0].name, "Node")
+                self.assertEqual(
+                    tuple(
+                        (argument.identifier.name, argument.type.nullable())
+                        for argument in member.signatures()[0][1]
+                    ),
+                    arguments,
+                )
+
+    def test_rejects_node_mutation_operation_shape_drift(self) -> None:
+        cases = (
+            (
+                "[CEReactions] Node appendChild(Node node);",
+                "appendChild",
+                "`Node.appendChild` must carry exactly ['CEReactions', 'Throws'], got ['CEReactions']",
+            ),
+            (
+                "[CEReactions, Throws] Node appendChild(Node? node);",
+                "appendChild",
+                "`Node.appendChild` must take required non-nullable `Node node`",
+            ),
+            (
+                "[CEReactions, Throws] Node insertBefore(Node node, Node child);",
+                "insertBefore",
+                "`Node.insertBefore` must take required nullable `Node child`",
+            ),
+            (
+                "[CEReactions, Throws] Node replaceChild(Node node, optional Node? child = null);",
+                "replaceChild",
+                "`Node.replaceChild` must take required non-nullable `Node child`",
+            ),
+            (
+                "[CEReactions, Throws] Node removeChild(Node child, Node extra);",
+                "removeChild",
+                "`Node.removeChild` must take exactly 1 argument(s), found 2",
+            ),
+            (
+                "[CEReactions, Throws] Element appendChild(Node node);",
+                "appendChild",
+                "`Node.appendChild` must return non-nullable `Node`, got `Element`",
+            ),
+            (
+                "[CEReactions, Throws] static Node removeChild(Node child);",
+                "removeChild",
+                "`Node.removeChild` must be an ordinary instance operation",
+            ),
+            (
+                "[CEReactions, Throws] Node appendChild([Clamp] Node node);",
+                "appendChild",
+                "`Node.appendChild` argument `node` carries extended attributes that are not implemented: Clamp",
+            ),
+            (
+                "[CEReactions, Throws] Node appendChild(Node node); [CEReactions, Throws] Node appendChild(Node node, Node child);",
+                "appendChild",
+                "`Node.appendChild` must have exactly one signature, found 2",
+            ),
+        )
+        for declaration, member, expected in cases:
+            with self.subTest(declaration=declaration):
+                self.assert_node_rejected(declaration, member, expected)
 
 
 if __name__ == "__main__":

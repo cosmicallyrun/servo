@@ -1,0 +1,140 @@
+<!doctype html>
+<!--
+Browser proof for ABI v37's Element-backed Node structural mutation slice.
+
+The marked V8 script moves pre-existing Elements exclusively through Servo's
+production appendChild, insertBefore, replaceChild, and removeChild methods.
+It pins Node.prototype descriptors and receiver brands, verifies returned
+wrapper identity, retained live children and static querySelectorAll behavior,
+and observes both production DOMException kinds. A following SpiderMonkey
+script sees the final production tree. The visible result is intentionally a
+single rendered “Hello” so this page also serves as the screenshot milestone.
+
+Build with `v8-classic-script-authoritative`, then open this file in
+servoshell and capture its rendered output. `run_proofs.sh` intentionally does
+not include it because its visible text makes the screenshot non-uniform.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Node mutation proof</title>
+    <style>
+      body { background: lime; color: #101010; font: 48px/1.2 sans-serif; }
+      #fixture, #source, #removed { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <main id="fixture">
+      <section id="target">
+        <span id="old">old</span><span id="anchor">anchor</span>
+      </section>
+      <section id="source">
+        <span id="hello">Hello</span><span id="inserted">inserted</span>
+        <span id="replacement">replacement</span>
+      </section>
+    </main>
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const target = document.querySelector("#target");
+      const source = document.querySelector("#source");
+      const hello = document.querySelector("#hello");
+      const inserted = document.querySelector("#inserted");
+      const replacement = document.querySelector("#replacement");
+      const old = document.querySelector("#old");
+      const anchor = document.querySelector("#anchor");
+      const visibleTarget = document.querySelector("#visible-target");
+      const nodePrototype = Object.getPrototypeOf(Object.getPrototypeOf(target));
+
+      const descriptors = Object.fromEntries(
+        ["insertBefore", "appendChild", "replaceChild", "removeChild"].map(
+          name => [name, Object.getOwnPropertyDescriptor(nodePrototype, name)],
+        ),
+      );
+      const lengths = {
+        insertBefore: 2,
+        appendChild: 1,
+        replaceChild: 2,
+        removeChild: 1,
+      };
+      for (const [name, descriptor] of Object.entries(descriptors)) {
+        if (
+          Object.hasOwn(target, name) || !descriptor ||
+          typeof descriptor.value !== "function" ||
+          descriptor.value.name !== name || descriptor.value.length !== lengths[name] ||
+          !descriptor.writable || !descriptor.enumerable || !descriptor.configurable
+        ) {
+          throw new Error("bad Node.prototype." + name + " descriptor");
+        }
+        let wrongBrand = false;
+        try { descriptor.value.call({}); } catch (error) {
+          wrongBrand = error instanceof TypeError;
+        }
+        if (!wrongBrand) throw new Error(name + " did not reject a wrong receiver");
+      }
+
+      const live = target.children;
+      const snapshot = target.querySelectorAll("span");
+      if (live.length !== 2 || snapshot.length !== 2 || snapshot[0] !== old) {
+        throw new Error("initial fixture did not use the production tree");
+      }
+
+      // Each result must be the exact existing V8 wrapper handed into Servo.
+      if (target.appendChild(hello) !== hello || hello.parentElement !== target) {
+        throw new Error("appendChild did not return or move the existing Element");
+      }
+      if (target.insertBefore(inserted, hello) !== inserted ||
+          target.insertBefore(anchor, null) !== anchor) {
+        throw new Error("insertBefore did not return its Node or accept null");
+      }
+      if (target.replaceChild(replacement, old) !== old || old.parentElement !== null) {
+        throw new Error("replaceChild did not return the removed Node");
+      }
+      if (target.removeChild(anchor) !== anchor || anchor.parentElement !== null) {
+        throw new Error("removeChild did not return the removed Node");
+      }
+
+      let hierarchy = false;
+      try { hello.appendChild(target); } catch (error) {
+        hierarchy = error instanceof DOMException &&
+          error.name === "HierarchyRequestError" && error.code === 3;
+      }
+      let notFound = false;
+      try { target.removeChild(old); } catch (error) {
+        notFound = error instanceof DOMException &&
+          error.name === "NotFoundError" && error.code === 8;
+      }
+      if (!hierarchy || !notFound) {
+        throw new Error("Node mutation DOMException mapping is wrong");
+      }
+
+      if (
+        live !== target.children || live.length !== 3 ||
+        live[0] !== replacement || live[1] !== inserted || live[2] !== hello ||
+        snapshot.length !== 2 || snapshot[0] !== old || snapshot[1] !== anchor ||
+        target.querySelectorAll("span")[2] !== hello ||
+        document.querySelector("#hello") !== hello || source.children.length !== 0
+      ) {
+        throw new Error("Node mutations did not preserve live and static DOM views");
+      }
+
+      // Leave the user-visible browser proof in the real Servo tree.
+      replacement.remove();
+      inserted.remove();
+      hello.id = "rendered-hello";
+      visibleTarget.appendChild(hello);
+      document.bgColor = "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently observes the final, V8-mutated Servo DOM.
+      const hello = document.getElementById("rendered-hello");
+      if (
+        !hello || hello.textContent !== "Hello" ||
+        hello.parentElement.id !== "visible-target" ||
+        document.getElementById("old") !== null || document.getElementById("anchor") !== null ||
+        document.querySelector("#target").childElementCount !== 0
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

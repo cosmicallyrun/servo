@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 36u
+#define SERVO_V8_ABI_VERSION 37u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -107,6 +107,21 @@ typedef struct ServoV8OwnedUtf8Sequence {
   ServoV8DropCallback drop_owner;
 } ServoV8OwnedUtf8Sequence;
 
+#define SERVO_V8_NODE_MUTATION_RETURNED 0u
+#define SERVO_V8_NODE_MUTATION_DOM_EXCEPTION 1u
+#define SERVO_V8_NODE_MUTATION_HOST_FAILURE 2u
+
+#define SERVO_V8_NODE_MUTATION_EXCEPTION_NONE 0u
+#define SERVO_V8_NODE_MUTATION_EXCEPTION_HIERARCHY_REQUEST 1u
+#define SERVO_V8_NODE_MUTATION_EXCEPTION_NOT_FOUND 2u
+
+typedef struct ServoV8NodeMutationOutcome {
+  uint32_t status;
+  uint32_t exception_kind;
+  ServoV8OwnedUtf8 exception_message;
+  ServoV8InterfaceValue value;
+} ServoV8NodeMutationOutcome;
+
 typedef struct ServoV8ElementHostVTable {
   uint8_t (*get_local_name)(void* native, ServoV8OwnedUtf8* output);
   uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
@@ -165,6 +180,25 @@ typedef struct ServoV8ElementHostVTable {
   uint8_t (*get_parent_element)(void* native,
                                 ServoV8InterfaceValue* output);
   uint8_t (*has_child_nodes)(void* native, uint8_t* output);
+  uint8_t (*insert_before)(void* native,
+                           void* host_context,
+                           void* node_native,
+                           uint8_t child_is_null,
+                           void* child_native,
+                           ServoV8NodeMutationOutcome* output);
+  uint8_t (*append_child)(void* native,
+                          void* host_context,
+                          void* node_native,
+                          ServoV8NodeMutationOutcome* output);
+  uint8_t (*replace_child)(void* native,
+                           void* host_context,
+                           void* node_native,
+                           void* child_native,
+                           ServoV8NodeMutationOutcome* output);
+  uint8_t (*remove_child)(void* native,
+                          void* host_context,
+                          void* child_native,
+                          ServoV8NodeMutationOutcome* output);
   uint8_t (*get_children)(void* native,
                           ServoV8HTMLCollectionValue* output);
   uint8_t (*get_elements_by_tag_name)(

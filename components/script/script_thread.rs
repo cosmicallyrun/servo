@@ -484,6 +484,45 @@ fn v8_element_interface_handle(element: &Element) -> servo_v8::InterfaceHandle {
     }
 }
 
+/// Converts the production Node algorithm result into the V8-only POD outcome.
+///
+/// Structural mutations are declared `[Throws]`, but their Servo errors must
+/// never be materialized as SpiderMonkey DOMException objects while V8 owns the
+/// script frame. The C++ bridge creates the equivalent realm-local V8
+/// DOMException from this result after the Rust callback returns.
+#[cfg(feature = "v8-shadow")]
+fn v8_node_mutation_result(
+    cx: &mut JSContext,
+    result: Result<DomRoot<Node>, Error>,
+    returned: &Element,
+) -> servo_v8::NodeMutationResult {
+    // A production mutation currently has no SpiderMonkey-throwing branch,
+    // but preserve the host boundary if one is added. Do this before creating
+    // an owned InterfaceHandle so the failed result cannot leak its fresh host.
+    if unsafe { JS_IsExceptionPending(cx) } {
+        unsafe { JS_ClearPendingException(cx) };
+        return servo_v8::NodeMutationResult::HostFailure;
+    }
+
+    match result {
+        Ok(_) => servo_v8::NodeMutationResult::Returned(v8_element_interface_handle(returned)),
+        Err(Error::HierarchyRequest(message)) => servo_v8::NodeMutationResult::DomException {
+            kind: servo_v8::NodeMutationException::HierarchyRequest,
+            message: message.unwrap_or_else(|| {
+                "The operation would yield an incorrect node tree.".to_owned()
+            }),
+        },
+        Err(Error::NotFound(message)) => servo_v8::NodeMutationResult::DomException {
+            kind: servo_v8::NodeMutationException::NotFound,
+            message: message.unwrap_or_else(|| "The object can not be found here.".to_owned()),
+        },
+        // The selected Node methods presently expose only the two variants
+        // above. Keep future Servo error expansion fail-safe until its V8 ABI
+        // exception kind is intentionally added.
+        Err(_) => servo_v8::NodeMutationResult::HostFailure,
+    }
+}
+
 #[cfg(feature = "v8-shadow")]
 #[expect(unsafe_code)]
 // SAFETY: This host stays on its element's originating script thread, roots
@@ -882,6 +921,93 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
             Err(Error::Syntax(_)) => servo_v8::SelectorNodeListResult::SyntaxError,
             Err(_) => servo_v8::SelectorNodeListResult::HostFailure,
         }
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: The bridge brand-checks the receiver and every argument as a live
+// V8ElementHost and lends them only for this callback. Each Trusted<Element>
+// is rooted before invoking Servo's production Node algorithm. No borrowed
+// host or JSContext escapes, and CE reactions stay on Servo's outer or backup
+// queue until V8 has unwound.
+unsafe impl servo_v8::NodeHostBinding for V8ElementHost {
+    unsafe fn insert_before(
+        &self,
+        host_context: *mut c_void,
+        node: &Self,
+        child: Option<&Self>,
+    ) -> servo_v8::NodeMutationResult {
+        if host_context.is_null() {
+            return servo_v8::NodeMutationResult::HostFailure;
+        }
+        // SAFETY: The authoritative V8 entry lends this context synchronously.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let parent = self.element.root();
+        let node = node.element.root();
+        let child = child.map(|child| child.element.root());
+        let result = parent.upcast::<Node>().InsertBefore(
+            cx,
+            node.upcast::<Node>(),
+            child.as_deref().map(|child| child.upcast()),
+        );
+        v8_node_mutation_result(cx, result, &node)
+    }
+
+    unsafe fn append_child(
+        &self,
+        host_context: *mut c_void,
+        node: &Self,
+    ) -> servo_v8::NodeMutationResult {
+        if host_context.is_null() {
+            return servo_v8::NodeMutationResult::HostFailure;
+        }
+        // SAFETY: The authoritative V8 entry lends this context synchronously.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let parent = self.element.root();
+        let node = node.element.root();
+        let result = parent.upcast::<Node>().AppendChild(cx, node.upcast::<Node>());
+        v8_node_mutation_result(cx, result, &node)
+    }
+
+    unsafe fn replace_child(
+        &self,
+        host_context: *mut c_void,
+        node: &Self,
+        child: &Self,
+    ) -> servo_v8::NodeMutationResult {
+        if host_context.is_null() {
+            return servo_v8::NodeMutationResult::HostFailure;
+        }
+        // SAFETY: The authoritative V8 entry lends this context synchronously.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let parent = self.element.root();
+        let node = node.element.root();
+        let child = child.element.root();
+        let result = parent.upcast::<Node>().ReplaceChild(
+            cx,
+            node.upcast::<Node>(),
+            child.upcast::<Node>(),
+        );
+        v8_node_mutation_result(cx, result, &child)
+    }
+
+    unsafe fn remove_child(
+        &self,
+        host_context: *mut c_void,
+        child: &Self,
+    ) -> servo_v8::NodeMutationResult {
+        if host_context.is_null() {
+            return servo_v8::NodeMutationResult::HostFailure;
+        }
+        // SAFETY: The authoritative V8 entry lends this context synchronously.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let parent = self.element.root();
+        let child = child.element.root();
+        let result = parent
+            .upcast::<Node>()
+            .RemoveChild(cx, child.upcast::<Node>());
+        v8_node_mutation_result(cx, result, &child)
     }
 }
 

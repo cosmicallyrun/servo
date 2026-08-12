@@ -213,13 +213,31 @@ installing the new wrapper. Items still enter the ordinary Element cache, so
 collection access, selectors, and `getElementById` converge on one wrapper for
 each underlying Element.
 
-## What this does not do
+## Borrowed Node mutation inputs
 
-The current scalar setters can mutate attributes and text, but nothing here
-accepts another DOM object or a JavaScript function. Node creation/reparenting
-and event listeners are separate problems: a V8 function held by a Servo event
-target reverses the edge direction this design depends on and must be reasoned
-about again from scratch.
+ABI v37 adds structural mutation without adding a Servo-to-V8 edge. The
+Element wrapper cells already own `Trusted<Element>` roots; after C++ validates
+an argument as an Element-backed Node from the receiver's realm, it lends the
+installed native host to Rust for exactly one synchronous callback. Rust roots
+the receiver and every argument locally, calls Servo's production Node
+algorithm, and never retains or drops the borrowed input. The JavaScript locals
+and cppgc cells keep those native hosts alive until the callback returns.
+
+The returned Node receives a freshly owned Element host and passes through the
+ordinary wrapper cache. A cache hit drops that speculative host and returns the
+existing JavaScript object, so `parent.appendChild(child) === child` without a
+new cross-heap reference. `HierarchyRequestError` and `NotFoundError` cross as
+typed POD plus one owned UTF-8 message; C++ releases the message on every
+success, failure, and malformed-result path and constructs the exception in
+the calling V8 realm.
+
+This first mutation slice intentionally accepts only Element-backed Nodes,
+because they are the only Node wrappers the experimental realm exposes.
+Document, DocumentFragment, Text, and Comment wrappers require a dynamic Node
+host kind and a unified identity cache. Node creation and event listeners are
+also separate problems: a V8 function held by a Servo event target reverses
+the edge direction this design depends on and must be reasoned about again
+from scratch.
 
 ## The constraint this design depends on
 
@@ -296,7 +314,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_element_namespace_proof.html`, and
 `authoritative_parent_element_proof.html`, and
 `authoritative_attribute_namespace_proof.html`, and
-`authoritative_attribute_names_proof.html` cover runtime behaviour
+`authoritative_attribute_names_proof.html`, and
+`authoritative_node_mutation_proof.html` cover runtime behaviour
 against real Servo DOM, and `interface_returns_preserve_wrapper_identity`
 covers the bridge:
 
