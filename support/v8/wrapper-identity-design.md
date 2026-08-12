@@ -228,6 +228,11 @@ and case-sensitive. Keeping this predicate in the production
 `HTMLCollection` module prevents the V8 facade from drifting on SVG, MathML,
 custom namespaces, or HTML case behavior.
 
+ABI v41's `Element.removeAttributeNS` reuses the existing Element host and
+wrapper identity. Its synchronous mutation callback neither creates a wrapper
+nor changes either cache; Servo owns the attribute and custom-element reaction
+lifetime after the callback returns.
+
 ## Borrowed Node mutation inputs
 
 ABI v37 adds structural mutation without adding a Servo-to-V8 edge. The

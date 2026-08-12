@@ -4,7 +4,7 @@ Runtime proof that V8-originated CEReactions run only after V8 unwinds.
 
 A customized built-in <body> observes bgcolor, an autonomous custom element
 observes id, class, and one attribute changed by `toggleAttribute` then
-`removeAttribute`, and its custom child observes disconnection caused by
+`removeAttributeNS`, and its custom child observes disconnection caused by
 `Element.remove()`. The V8-authoritative script mutates all of them through the
 host bridge. Servo leaves the resulting reactions on its rooted backup queue and
 invokes the callbacks at the existing microtask checkpoint, after the V8
@@ -80,7 +80,7 @@ and no "answered from the host's own native source" warning.
       target.id = "changed-id";
       target.className = "after";
       target.toggleAttribute("data-v8-toggle", true);
-      target.removeAttribute("data-v8-toggle");
+      target.removeAttributeNS(null, "data-v8-toggle");
       target.remove();
     </script>
     <script>

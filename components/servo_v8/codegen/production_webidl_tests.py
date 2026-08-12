@@ -380,6 +380,21 @@ class ProductionElementTests(unittest.TestCase):
         self.assertEqual([argument.identifier.name for argument in remove_arguments], ["name"])
         self.assertTrue(remove_arguments[0].type.isDOMString())
         self.assertFalse(remove_arguments[0].optional)
+        remove_attribute_ns = members[production_webidl.ELEMENT_REMOVE_ATTRIBUTE_NS]
+        remove_ns_return, remove_ns_arguments = remove_attribute_ns.signatures()[0]
+        self.assertEqual(remove_ns_return.prettyName(), "undefined")
+        self.assertFalse(remove_ns_return.nullable())
+        self.assertEqual(set(remove_attribute_ns._extendedAttrDict), {"CEReactions"})
+        self.assertEqual(
+            [argument.identifier.name for argument in remove_ns_arguments],
+            ["namespace", "localName"],
+        )
+        self.assertTrue(remove_ns_arguments[0].type.nullable())
+        self.assertTrue(remove_ns_arguments[0].type.inner.isDOMString())
+        self.assertFalse(remove_ns_arguments[0].optional)
+        self.assertFalse(remove_ns_arguments[1].type.nullable())
+        self.assertTrue(remove_ns_arguments[1].type.isDOMString())
+        self.assertFalse(remove_ns_arguments[1].optional)
         for qualified_name in (
             production_webidl.ELEMENT_FIRST_ELEMENT_CHILD,
             production_webidl.ELEMENT_LAST_ELEMENT_CHILD,
@@ -2193,6 +2208,9 @@ class SyntheticSelectionTests(unittest.TestCase):
                       boolean hasAttributeNS(
                         DOMString? namespace, DOMString localName
                       );
+                      [CEReactions] undefined removeAttributeNS(
+                        DOMString? namespace, DOMString localName
+                      );
                     };
                 """,
             }
@@ -2200,6 +2218,7 @@ class SyntheticSelectionTests(unittest.TestCase):
         for qualified_name in (
             production_webidl.ELEMENT_GET_ATTRIBUTE_NS,
             production_webidl.ELEMENT_HAS_ATTRIBUTE_NS,
+            production_webidl.ELEMENT_REMOVE_ATTRIBUTE_NS,
         ):
             with self.subTest(member=qualified_name):
                 member = production_webidl._select_element_host_member(
@@ -2218,6 +2237,10 @@ class SyntheticSelectionTests(unittest.TestCase):
                     self.assertTrue(return_type.nullable())
                     self.assertTrue(return_type.inner.isDOMString())
                     self.assertEqual(set(member._extendedAttrDict), {"Pure"})
+                elif qualified_name == production_webidl.ELEMENT_REMOVE_ATTRIBUTE_NS:
+                    self.assertFalse(return_type.nullable())
+                    self.assertEqual(return_type.prettyName(), "undefined")
+                    self.assertEqual(set(member._extendedAttrDict), {"CEReactions"})
                 else:
                     self.assertTrue(return_type.isBoolean())
                     self.assertFalse(return_type.nullable())
@@ -2356,6 +2379,51 @@ class SyntheticSelectionTests(unittest.TestCase):
                 "hasAttributeNS",
                 "`Element.hasAttributeNS` first argument `namespace` must be "
                 "required, non-variadic nullable `DOMString`",
+            ),
+            (
+                "undefined removeAttributeNS(DOMString? namespace, DOMString localName);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` must carry exactly ['CEReactions'], got []",
+            ),
+            (
+                "[CEReactions, Throws] undefined removeAttributeNS(DOMString? namespace, DOMString localName);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` must carry exactly ['CEReactions'], "
+                "got ['CEReactions', 'Throws']",
+            ),
+            (
+                "[CEReactions] boolean removeAttributeNS(DOMString? namespace, DOMString localName);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` must return non-nullable `undefined`, "
+                "got `boolean`",
+            ),
+            (
+                "[CEReactions] undefined removeAttributeNS(DOMString namespace, DOMString localName);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` first argument `namespace` must be "
+                "required, non-variadic nullable `DOMString`",
+            ),
+            (
+                "[CEReactions] undefined removeAttributeNS(DOMString? namespace, optional DOMString localName);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` second argument `localName` must be "
+                "required, non-variadic non-nullable `DOMString`",
+            ),
+            (
+                "[CEReactions] undefined removeAttributeNS(DOMString? namespace);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` must take exactly two arguments, found 1",
+            ),
+            (
+                "[CEReactions] undefined removeAttributeNS(DOMString? namespace, DOMString localName, DOMString extra);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` must take exactly two arguments, found 3",
+            ),
+            (
+                "[CEReactions] undefined removeAttributeNS(DOMString? namespace, USVString localName);",
+                "removeAttributeNS",
+                "`Element.removeAttributeNS` second argument `localName` must be "
+                "required, non-variadic non-nullable `DOMString`",
             ),
         )
         for declaration, member, expected in cases:

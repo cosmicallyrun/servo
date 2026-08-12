@@ -773,6 +773,34 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         true
     }
 
+    unsafe fn remove_attribute_ns(
+        &self,
+        host_context: *mut c_void,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends this context for one
+        // synchronous production Element operation.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // As with removeAttribute, leave CEReactions on Servo's outer or
+        // backup queue rather than invoking a SpiderMonkey callback under V8.
+        self.element.root().RemoveAttributeNS(
+            cx,
+            namespace.map(DOMString::from),
+            DOMString::from(local_name),
+        );
+        // RemoveAttributeNS has no declared error result. Still protect the V8
+        // caller from any unexpected pending SpiderMonkey exception.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return false;
+        }
+        true
+    }
+
     fn get_elements_by_class_name(&self, class_names: &str) -> servo_v8::HTMLCollectionHandle {
         let element = self.element.root();
         v8_class_collection_handle(element.upcast::<Node>(), class_names)

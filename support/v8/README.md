@@ -307,6 +307,16 @@ branding, arity and conversions, namespace normalization, both wildcards,
 case and prefix behavior, Document/Element scope, wrapper identity, and live
 insertion/removal observed by both engines.
 
+ABI v41 adds `Element.removeAttributeNS`. `Element.removeAttributeNS` removes
+attributes by namespace URI and local name on the real Servo Element. It is
+exposed as a `[CEReactions]` ordinary method on `Element.prototype` returning
+`undefined`. Receivers are checked for brand before argument count and
+conversions. Nullable `namespace` conversion occurs first, followed by
+`localName` DOMString conversion, preserving `ToString` exceptions in WebIDL
+order. It uses Servo's `ElementMethods::RemoveAttributeNS` with an ephemeral
+host context and leaves `CEReactions` on Servo's queue without manually
+pushing/popping reaction queues.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script

@@ -2499,6 +2499,39 @@ void ElementHostRemoveAttribute(
   }
 }
 
+void ElementHostRemoveAttributeNS(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  bool namespace_is_null = false;
+  v8::Local<v8::String> namespace_string;
+  v8::Local<v8::String> local_name_string;
+  if (!ElementHostNamespaceOperationArguments(
+          info, "Element.removeAttributeNS requires 2 arguments", &realm, &native,
+          &namespace_is_null, &namespace_string, &local_name_string)) {
+    return;
+  }
+  v8::String::Utf8Value namespace_utf8(isolate, namespace_string);
+  v8::String::Utf8Value local_name_utf8(isolate, local_name_string);
+  if ((!*namespace_utf8 && namespace_utf8.length() != 0) ||
+      (!*local_name_utf8 && local_name_utf8.length() != 0)) {
+    return;
+  }
+  RustCallbackScope callback_scope(realm->runtime);
+  if (!realm->runtime->element_host_vtable.remove_attribute_ns(
+          native, realm->document_host.active_host_context,
+          namespace_is_null ? 1 : 0,
+          namespace_is_null
+              ? nullptr
+              : reinterpret_cast<const uint8_t*>(*namespace_utf8),
+          namespace_is_null ? 0 : static_cast<size_t>(namespace_utf8.length()),
+          reinterpret_cast<const uint8_t*>(*local_name_utf8),
+          static_cast<size_t>(local_name_utf8.length()))) {
+    ThrowTypeError(isolate, "Element.removeAttributeNS host callback failed");
+  }
+}
+
 using ElementSelectorElementOperation = uint8_t (*)(
     void* native,
     void* host_context,
@@ -3724,6 +3757,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"toggleAttribute", &ElementHostToggleAttribute, 1,
        v8::SideEffectType::kHasSideEffect},
       {"removeAttribute", &ElementHostRemoveAttribute, 1,
+       v8::SideEffectType::kHasSideEffect},
+      {"removeAttributeNS", &ElementHostRemoveAttributeNS, 2,
        v8::SideEffectType::kHasSideEffect},
       {"getElementsByTagName", &ElementHostGetElementsByTagName, 1,
        v8::SideEffectType::kHasSideEffect},
@@ -5080,6 +5115,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->has_attribute ||
       !vtable->get_attribute_ns || !vtable->has_attribute_ns ||
       !vtable->toggle_attribute || !vtable->remove_attribute ||
+      !vtable->remove_attribute_ns ||
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->get_parent_element ||

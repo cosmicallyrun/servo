@@ -1,12 +1,13 @@
 <!doctype html>
 <!--
-Runtime proof for Element.getAttributeNS and Element.hasAttributeNS. The
+Runtime proof for Element.getAttributeNS, Element.hasAttributeNS, and
+Element.removeAttributeNS. The
 V8-authoritative script checks WebIDL operation descriptors, receiver brands,
 ordered conversion of both required arguments, and real HTML/SVG attribute
 namespace distinction. The SpiderMonkey follow-up independently reads the
 same parsed DOM.
 
-Run via support/v8/run_proofs.sh once ABI v34 is installed.
+Run via support/v8/run_proofs.sh once ABI v41 is installed.
 -->
 <html>
   <head>
@@ -35,10 +36,15 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
         elementPrototype,
         "hasAttributeNS",
       );
+      const removeDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "removeAttributeNS",
+      );
       const xlink = "http://www.w3.org/1999/xlink";
 
       let getWrongBrand = false;
       let hasWrongBrand = false;
+      let removeWrongBrand = false;
       let wrongBrandConversion = 0;
       try {
         getDescriptor.value.call(
@@ -58,8 +64,17 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
       } catch (error) {
         hasWrongBrand = error instanceof TypeError;
       }
+      try {
+        removeDescriptor.value.call(
+          {},
+          { toString() { wrongBrandConversion++; return xlink; } },
+          { toString() { wrongBrandConversion++; return "href"; } },
+        );
+      } catch (error) {
+        removeWrongBrand = error instanceof TypeError;
+      }
       if (
-        ![getDescriptor, hasDescriptor].every(
+        ![getDescriptor, hasDescriptor, removeDescriptor].every(
           (descriptor) =>
             descriptor &&
             typeof descriptor.value === "function" &&
@@ -70,10 +85,13 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
         ) ||
         getDescriptor.value.name !== "getAttributeNS" ||
         hasDescriptor.value.name !== "hasAttributeNS" ||
+        removeDescriptor.value.name !== "removeAttributeNS" ||
         Object.hasOwn(html, "getAttributeNS") ||
         Object.hasOwn(html, "hasAttributeNS") ||
+        Object.hasOwn(html, "removeAttributeNS") ||
         !getWrongBrand ||
         !hasWrongBrand ||
+        !removeWrongBrand ||
         wrongBrandConversion !== 0
       ) {
         throw new Error("namespaced attribute operation surface is wrong");
@@ -123,6 +141,7 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
       let arityConversions = 0;
       let getMissingSecond = false;
       let hasMissingBoth = false;
+      let removeMissingSecond = false;
       try {
         html.getAttributeNS({
           toString() {
@@ -137,6 +156,16 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
         html.hasAttributeNS();
       } catch (error) {
         hasMissingBoth = error instanceof TypeError;
+      }
+      try {
+        html.removeAttributeNS({
+          toString() {
+            arityConversions++;
+            return "";
+          },
+        });
+      } catch (error) {
+        removeMissingSecond = error instanceof TypeError;
       }
 
       const conversionError = new Error("namespace conversion sentinel");
@@ -165,6 +194,7 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
       if (
         !getMissingSecond ||
         !hasMissingBoth ||
+        !removeMissingSecond ||
         arityConversions !== 0 ||
         !conversionErrorPreserved ||
         secondConverted ||
@@ -204,6 +234,39 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
         throw new Error("namespaced attribute reads are not namespace-sensitive");
       }
 
+      const removeConversionOrder = [];
+      const removeResult = removeDescriptor.value.call(
+        use,
+        {
+          toString() {
+            removeConversionOrder.push("namespace");
+            return xlink;
+          },
+        },
+        {
+          toString() {
+            removeConversionOrder.push("localName");
+            return "href";
+          },
+        },
+      );
+      if (
+        removeResult !== undefined ||
+        removeConversionOrder.join(",") !== "namespace,localName" ||
+        use.hasAttributeNS(xlink, "href") ||
+        use.getAttributeNS(xlink, "href") !== null
+      ) {
+        throw new Error("removeAttributeNS failed to remove namespaced attribute");
+      }
+
+      if (
+        html.removeAttributeNS(null, "plain") !== undefined ||
+        html.hasAttributeNS(null, "plain") ||
+        html.removeAttributeNS(null, "missing") !== undefined
+      ) {
+        throw new Error("removeAttributeNS failed to mutate HTML attribute list");
+      }
+
       document.bgColor = document.bgColor === "lime" ? "red" : "lime";
     </script>
     <script>
@@ -214,12 +277,8 @@ Run via support/v8/run_proofs.sh once ABI v34 is installed.
       if (
         !html ||
         !use ||
-        html.getAttributeNS(null, "plain") !== "plain-value" ||
-        html.getAttributeNS(null, "missing") !== null ||
-        use.getAttributeNS(xlink, "href") !== "#shape" ||
-        !use.hasAttributeNS(xlink, "href") ||
-        use.getAttributeNS(null, "href") !== null ||
-        use.hasAttributeNS(null, "href")
+        html.hasAttributeNS(null, "plain") ||
+        use.hasAttributeNS(xlink, "href")
       ) {
         document.body.setAttribute("bgcolor", "red");
       }

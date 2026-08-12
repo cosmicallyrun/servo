@@ -87,6 +87,7 @@ ELEMENT_HAS_ATTRIBUTE_NS = "Element.hasAttributeNS"
 ELEMENT_TOGGLE_ATTRIBUTE = "Element.toggleAttribute"
 ELEMENT_SET_ATTRIBUTE = "Element.setAttribute"
 ELEMENT_REMOVE_ATTRIBUTE = "Element.removeAttribute"
+ELEMENT_REMOVE_ATTRIBUTE_NS = "Element.removeAttributeNS"
 ELEMENT_CHILDREN = "Element.children"
 ELEMENT_NAMESPACE_URI = "Element.namespaceURI"
 ELEMENT_PREFIX = "Element.prefix"
@@ -336,6 +337,7 @@ ELEMENT_HOST = (
     # and exceptions have a sound design.
     ELEMENT_SET_ATTRIBUTE,
     ELEMENT_REMOVE_ATTRIBUTE,
+    ELEMENT_REMOVE_ATTRIBUTE_NS,
     ELEMENT_CHILDREN,
     ELEMENT_NAMESPACE_URI,
     ELEMENT_PREFIX,
@@ -1580,8 +1582,13 @@ def _select_element_host_member(
                 f"`{qualified_name}` must take no arguments, found {len(arguments)}"
             )
         return member
-    if member_name in {"getAttributeNS", "hasAttributeNS"}:
-        expected_attributes = {"Pure"} if member_name == "getAttributeNS" else set()
+    if member_name in {"getAttributeNS", "hasAttributeNS", "removeAttributeNS"}:
+        if member_name == "getAttributeNS":
+            expected_attributes = {"Pure"}
+        elif member_name == "removeAttributeNS":
+            expected_attributes = {"CEReactions"}
+        else:
+            expected_attributes = set()
         actual_attributes = set(member._extendedAttrDict)
         if actual_attributes != expected_attributes:
             raise WebIDLSelectionError(
@@ -1598,6 +1605,9 @@ def _select_element_host_member(
         if member_name == "getAttributeNS":
             valid_return = return_type.nullable() and return_type.inner.isDOMString()
             expected_return = "nullable `DOMString`"
+        elif member_name == "removeAttributeNS":
+            valid_return = return_type.nullable() is False and return_type.tag() == WebIDL.IDLType.Tags.undefined
+            expected_return = "non-nullable `undefined`"
         else:
             valid_return = return_type.nullable() is False and return_type.isBoolean()
             expected_return = "non-nullable `boolean`"

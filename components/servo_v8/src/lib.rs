@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 40;
+const ABI_VERSION: u32 = 41;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -412,6 +412,12 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
         force: Option<bool>,
     ) -> ToggleAttributeResult;
     unsafe fn remove_attribute(&self, host_context: *mut c_void, name: &str) -> bool;
+    unsafe fn remove_attribute_ns(
+        &self,
+        host_context: *mut c_void,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> bool;
     fn node_type(&self) -> u16;
     fn node_name(&self) -> String;
     fn is_connected(&self) -> bool;
@@ -599,6 +605,17 @@ pub struct ElementHostVTable {
     >,
     pub remove_attribute:
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
+    pub remove_attribute_ns: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            u8,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+        ) -> u8,
+    >,
     pub get_node_type: Option<unsafe extern "C" fn(*mut c_void, *mut u16) -> u8>,
     pub get_node_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
     pub get_is_connected: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
@@ -1485,6 +1502,32 @@ unsafe extern "C" fn element_host_remove_attribute<T: ElementHostBinding>(
     unsafe { (&*native.cast::<T>()).remove_attribute(host_context, name) as u8 }
 }
 
+unsafe extern "C" fn element_host_remove_attribute_ns<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    namespace_is_null: u8,
+    namespace: *const u8,
+    namespace_length: usize,
+    local_name: *const u8,
+    local_name_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends these byte ranges for the synchronous call.
+    let Some(namespace) =
+        (unsafe { element_host_nullable_utf8(namespace_is_null, namespace, namespace_length) })
+    else {
+        return 0;
+    };
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(local_name) = (unsafe { element_host_utf8(local_name, local_name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    unsafe { (&*native.cast::<T>()).remove_attribute_ns(host_context, namespace, local_name) as u8 }
+}
+
 unsafe extern "C" fn element_host_get_node_type<T: ElementHostBinding>(
     native: *mut c_void,
     output: *mut u16,
@@ -2143,6 +2186,7 @@ fn element_host_vtable<T: NodeHostBinding>() -> ElementHostVTable {
         has_attribute_ns: Some(element_host_has_attribute_ns::<T>),
         toggle_attribute: Some(element_host_toggle_attribute::<T>),
         remove_attribute: Some(element_host_remove_attribute::<T>),
+        remove_attribute_ns: Some(element_host_remove_attribute_ns::<T>),
         get_node_type: Some(element_host_get_node_type::<T>),
         get_node_name: Some(element_host_get_node_name::<T>),
         get_is_connected: Some(element_host_get_is_connected::<T>),
@@ -3448,6 +3492,22 @@ mod tests {
                 .map(|(_, _, value)| value.clone())
         }
 
+        fn remove_ns(&self, namespace: Option<&str>, local_name: &str) {
+            let namespace = namespace.filter(|namespace| !namespace.is_empty());
+            if namespace.is_none() {
+                self.attributes
+                    .borrow_mut()
+                    .retain(|(attribute, _)| attribute != local_name);
+                return;
+            }
+            self.namespaced_attributes.borrow_mut().retain(
+                |(attribute_namespace, attribute_local_name, _)| {
+                    !(Some(attribute_namespace.as_str()) == namespace
+                        && attribute_local_name == local_name)
+                },
+            );
+        }
+
         fn set(&self, name: &str, value: &str) {
             if let Some((_, current)) = self
                 .attributes
@@ -3849,6 +3909,20 @@ mod tests {
                 .attributes
                 .borrow_mut()
                 .retain(|(attribute, _)| attribute != &name);
+            true
+        }
+
+        unsafe fn remove_attribute_ns(
+            &self,
+            host_context: *mut c_void,
+            namespace: Option<&str>,
+            local_name: &str,
+        ) -> bool {
+            assert!(!host_context.is_null());
+            if self.state.remove_fails.get() {
+                return false;
+            }
+            self.state.remove_ns(namespace, local_name);
             true
         }
 
@@ -9493,11 +9567,14 @@ mod tests {
                 prototype, 'toggleAttribute');
               const removeDescriptor = Object.getOwnPropertyDescriptor(
                 prototype, 'removeAttribute');
+              const removeNsDescriptor = Object.getOwnPropertyDescriptor(
+                prototype, 'removeAttributeNS');
               const descriptorProof = [
-                [toggleDescriptor, 'toggleAttribute'],
-                [removeDescriptor, 'removeAttribute'],
-              ].every(([descriptor, name]) => descriptor &&
-                descriptor.value.name === name && descriptor.value.length === 1 &&
+                [toggleDescriptor, 'toggleAttribute', 1],
+                [removeDescriptor, 'removeAttribute', 1],
+                [removeNsDescriptor, 'removeAttributeNS', 2],
+              ].every(([descriptor, name, length]) => descriptor &&
+                descriptor.value.name === name && descriptor.value.length === length &&
                 descriptor.writable && descriptor.enumerable && descriptor.configurable &&
                 !Object.hasOwn(target, name));
 
@@ -9513,6 +9590,9 @@ mod tests {
               let removeWrongBrand = false;
               try { removeDescriptor.value.call({}, brandArg); }
               catch (error) { removeWrongBrand = error instanceof TypeError; }
+              let removeNsWrongBrand = false;
+              try { removeNsDescriptor.value.call({}, brandArg, brandArg); }
+              catch (error) { removeNsWrongBrand = error instanceof TypeError; }
 
               let toggleMissing = false;
               try { toggleDescriptor.value.call(target); }
@@ -9520,6 +9600,13 @@ mod tests {
               let removeMissing = false;
               try { removeDescriptor.value.call(target); }
               catch (error) { removeMissing = error instanceof TypeError; }
+              let removeNsArityTouched = false;
+              let removeNsMissing = false;
+              try { removeNsDescriptor.value.call(target, { toString() {
+                removeNsArityTouched = true;
+                return null;
+              }}); }
+              catch (error) { removeNsMissing = error instanceof TypeError; }
 
               let toggleSymbol = false;
               try { target.toggleAttribute(Symbol('name')); }
@@ -9527,6 +9614,12 @@ mod tests {
               let removeSymbol = false;
               try { target.removeAttribute(Symbol('name')); }
               catch (error) { removeSymbol = error instanceof TypeError; }
+              let removeNsNamespaceSymbol = false;
+              try { target.removeAttributeNS(Symbol('namespace'), 'href'); }
+              catch (error) { removeNsNamespaceSymbol = error instanceof TypeError; }
+              let removeNsLocalNameSymbol = false;
+              try { target.removeAttributeNS(null, Symbol('localName')); }
+              catch (error) { removeNsLocalNameSymbol = error instanceof TypeError; }
 
               const conversionSentinel = {};
               let toggleConversion = false;
@@ -9539,6 +9632,15 @@ mod tests {
                 throw conversionSentinel;
               }}); }
               catch (error) { removeConversion = error === conversionSentinel; }
+              let removeNsSecondConverted = false;
+              let removeNsConversion = false;
+              try { target.removeAttributeNS({ toString() {
+                throw conversionSentinel;
+              }}, { toString() {
+                removeNsSecondConverted = true;
+                return 'href';
+              }}); }
+              catch (error) { removeNsConversion = error === conversionSentinel; }
 
               target.removeAttribute('data-force');
               const forceAbsent = target.toggleAttribute('data-force') === true &&
@@ -9568,6 +9670,17 @@ mod tests {
                 toString() { return 'DATA-CASE'; }
               }) === undefined && !target.hasAttribute('data-case');
 
+              const xlink = 'http://www.w3.org/1999/xlink';
+              const removeNsOrder = [];
+              const removeNsReturn = target.removeAttributeNS(
+                { toString() { removeNsOrder.push('namespace'); return xlink; } },
+                { toString() { removeNsOrder.push('localName'); return 'href'; } },
+              ) === undefined && removeNsOrder.join(',') === 'namespace,localName' &&
+                !target.hasAttributeNS(xlink, 'href');
+              const removeNsNullNamespace =
+                target.removeAttributeNS(undefined, 'data-proof') === undefined &&
+                !target.hasAttributeNS(null, 'data-proof');
+
               let invalidCharacter = false;
               try { target.toggleAttribute(''); }
               catch (error) {
@@ -9579,11 +9692,14 @@ mod tests {
               globalThis.attributeTarget = target;
               globalThis.attributeMutationProof = descriptorProof &&
                 !brandTouched && toggleWrongBrand && removeWrongBrand &&
-                toggleMissing && removeMissing && toggleSymbol && removeSymbol &&
-                toggleConversion && removeConversion && forceAbsent && forceUndefined &&
+                removeNsWrongBrand && toggleMissing && removeMissing &&
+                removeNsMissing && !removeNsArityTouched && toggleSymbol && removeSymbol &&
+                removeNsNamespaceSymbol && removeNsLocalNameSymbol &&
+                toggleConversion && removeConversion && removeNsConversion &&
+                !removeNsSecondConverted && forceAbsent && forceUndefined &&
                 forceNull && forceTrueAbsent && forceTruePresent && forceFalsePresent &&
                 forceFalseAbsent && forceSymbol && removeReturn && caseAdded &&
-                caseRemoved && invalidCharacter;
+                caseRemoved && removeNsReturn && removeNsNullNamespace && invalidCharacter;
             })();"#,
             "element-attribute-mutations.js",
             1,
@@ -9615,7 +9731,11 @@ mod tests {
               let removeFailure = false;
               try { attributeTarget.removeAttribute('data-host-failure'); }
               catch (error) { removeFailure = error instanceof TypeError; }
-              globalThis.attributeHostFailureProof = toggleFailure && removeFailure;
+              let removeNsFailure = false;
+              try { attributeTarget.removeAttributeNS(null, 'data-host-failure'); }
+              catch (error) { removeNsFailure = error instanceof TypeError; }
+              globalThis.attributeHostFailureProof =
+                toggleFailure && removeFailure && removeNsFailure;
             })();"#,
             "element-attribute-host-failure.js",
             1,
@@ -9647,7 +9767,10 @@ mod tests {
                   let removeFailure = false;
                   try { attributeTarget.removeAttribute('data-no-context'); }
                   catch (error) { removeFailure = error instanceof TypeError; }
-                  return toggleFailure && removeFailure;
+                  let removeNsFailure = false;
+                  try { attributeTarget.removeAttributeNS(null, 'data-no-context'); }
+                  catch (error) { removeNsFailure = error instanceof TypeError; }
+                  return toggleFailure && removeFailure && removeNsFailure;
                 })()"#,
                 )
                 .unwrap()
@@ -10318,6 +10441,118 @@ mod tests {
                 ),
                 0,
             );
+
+            let remove_attribute_ns = element_host_remove_attribute_ns::<ElementHostProbe>;
+            assert_eq!(
+                remove_attribute_ns(
+                    std::ptr::null_mut(),
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                ),
+                0,
+            );
+            assert_eq!(
+                remove_attribute_ns(
+                    native,
+                    std::ptr::null_mut(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                ),
+                0,
+            );
+            assert_eq!(
+                remove_attribute_ns(
+                    native,
+                    host_context,
+                    2,
+                    std::ptr::null(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                ),
+                0,
+            );
+            assert_eq!(
+                remove_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    xlink.as_ptr(),
+                    0,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                ),
+                0,
+            );
+            assert_eq!(
+                remove_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    1,
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                ),
+                0,
+            );
+            assert_eq!(
+                remove_attribute_ns(
+                    native,
+                    host_context,
+                    0,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    data_proof.as_ptr(),
+                    data_proof.len(),
+                ),
+                0,
+            );
+            assert_eq!(
+                remove_attribute_ns(
+                    native,
+                    host_context,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                ),
+                0,
+            );
+            assert_eq!(
+                remove_attribute_ns(
+                    native,
+                    host_context,
+                    0,
+                    xlink.as_ptr(),
+                    xlink.len(),
+                    href.as_ptr(),
+                    href.len(),
+                ),
+                1,
+            );
+            assert_eq!(
+                has_attribute_ns(
+                    native,
+                    host_context,
+                    0,
+                    xlink.as_ptr(),
+                    xlink.len(),
+                    href.as_ptr(),
+                    href.len(),
+                    &mut attribute_boolean_output,
+                ),
+                1,
+            );
+            assert_eq!(attribute_boolean_output, 0);
 
             assert_eq!(
                 closest(
