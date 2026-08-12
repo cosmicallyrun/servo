@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 37u
+#define SERVO_V8_ABI_VERSION 38u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -122,6 +122,20 @@ typedef struct ServoV8NodeMutationOutcome {
   ServoV8InterfaceValue value;
 } ServoV8NodeMutationOutcome;
 
+#define SERVO_V8_ATTRIBUTE_MUTATION_RETURNED 0u
+#define SERVO_V8_ATTRIBUTE_MUTATION_DOM_EXCEPTION 1u
+#define SERVO_V8_ATTRIBUTE_MUTATION_HOST_FAILURE 2u
+
+#define SERVO_V8_ATTRIBUTE_MUTATION_EXCEPTION_NONE 0u
+#define SERVO_V8_ATTRIBUTE_MUTATION_EXCEPTION_INVALID_CHARACTER 1u
+
+typedef struct ServoV8ToggleAttributeOutcome {
+  uint32_t status;
+  uint32_t exception_kind;
+  ServoV8OwnedUtf8 exception_message;
+  uint8_t value;
+} ServoV8ToggleAttributeOutcome;
+
 typedef struct ServoV8ElementHostVTable {
   uint8_t (*get_local_name)(void* native, ServoV8OwnedUtf8* output);
   uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
@@ -167,6 +181,17 @@ typedef struct ServoV8ElementHostVTable {
                               const uint8_t* local_name,
                               size_t local_name_length,
                               uint8_t* output);
+  uint8_t (*toggle_attribute)(void* native,
+                              void* host_context,
+                              const uint8_t* name,
+                              size_t name_length,
+                              uint8_t force_is_present,
+                              uint8_t force,
+                              ServoV8ToggleAttributeOutcome* output);
+  uint8_t (*remove_attribute)(void* native,
+                              void* host_context,
+                              const uint8_t* name,
+                              size_t name_length);
   uint8_t (*get_node_type)(void* native, uint16_t* output);
   uint8_t (*get_node_name)(void* native, ServoV8OwnedUtf8* output);
   uint8_t (*get_is_connected)(void* native, uint8_t* output);

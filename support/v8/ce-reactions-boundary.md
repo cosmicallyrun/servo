@@ -1,8 +1,8 @@
 # V8-originated custom-element reactions
 
 Status: implemented for the current `Document.bgColor`, `Element.id`,
-`Element.className`, `Node.textContent`, and `Element.remove()` mutation
-surface.
+`Element.className`, `Element.toggleAttribute`, `Element.removeAttribute`,
+`Node.textContent`, `Element.remove()`, and Node structural-mutation surface.
 
 ## The mixed-engine hazard
 
@@ -28,8 +28,8 @@ queue when there is none. The backup path schedules a
 
 The resulting sequence is:
 
-1. V8 enters a `Document.bgColor`, Element attribute, or `Node.textContent`
-   setter, or calls `Element.remove()`.
+1. V8 enters a `Document.bgColor`, Element attribute mutation, or
+   `Node.textContent` setter, or calls an Element/Node structural mutation.
 2. Rust mutates the real Servo attribute and enqueues its reaction.
 3. Rust and C++ return; the V8 script or V8 microtask finishes.
 4. The authoritative-entry guard and sidecar borrow are released.

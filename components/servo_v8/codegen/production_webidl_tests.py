@@ -306,6 +306,46 @@ class ProductionElementTests(unittest.TestCase):
         self.assertTrue(names_return.inner.isDOMString())
         self.assertEqual(names_arguments, [])
         self.assertEqual(set(get_attribute_names._extendedAttrDict), {"Pure"})
+        toggle_attribute = members[production_webidl.ELEMENT_TOGGLE_ATTRIBUTE]
+        toggle_return, toggle_arguments = toggle_attribute.signatures()[0]
+        self.assertTrue(toggle_return.isBoolean())
+        self.assertFalse(toggle_return.nullable())
+        self.assertEqual(set(toggle_attribute._extendedAttrDict), {"CEReactions", "Throws"})
+        self.assertEqual(
+            [argument.identifier.name for argument in toggle_arguments], ["name", "force"]
+        )
+        self.assertTrue(toggle_arguments[0].type.isDOMString())
+        self.assertFalse(toggle_arguments[0].optional)
+        self.assertTrue(toggle_arguments[1].type.isBoolean())
+        self.assertTrue(toggle_arguments[1].optional)
+        self.assertIsNone(toggle_arguments[1].defaultValue)
+        set_attribute = members[production_webidl.ELEMENT_SET_ATTRIBUTE]
+        set_return, set_arguments = set_attribute.signatures()[0]
+        self.assertEqual(set_return.prettyName(), "undefined")
+        self.assertFalse(set_return.nullable())
+        self.assertEqual(set(set_attribute._extendedAttrDict), {"CEReactions", "Throws"})
+        self.assertEqual(
+            [argument.identifier.name for argument in set_arguments], ["name", "value"]
+        )
+        self.assertTrue(set_arguments[0].type.isDOMString())
+        value_type = set_arguments[1].type
+        self.assertTrue(value_type.isUnion())
+        self.assertEqual(
+            [type_.prettyName() for type_ in value_type.memberTypes],
+            ["(TrustedHTML or TrustedScript or TrustedScriptURL)", "DOMString"],
+        )
+        self.assertEqual(
+            [type_.prettyName() for type_ in value_type.memberTypes[0].memberTypes],
+            ["TrustedHTML", "TrustedScript", "TrustedScriptURL"],
+        )
+        remove_attribute = members[production_webidl.ELEMENT_REMOVE_ATTRIBUTE]
+        remove_return, remove_arguments = remove_attribute.signatures()[0]
+        self.assertEqual(remove_return.prettyName(), "undefined")
+        self.assertFalse(remove_return.nullable())
+        self.assertEqual(set(remove_attribute._extendedAttrDict), {"CEReactions"})
+        self.assertEqual([argument.identifier.name for argument in remove_arguments], ["name"])
+        self.assertTrue(remove_arguments[0].type.isDOMString())
+        self.assertFalse(remove_arguments[0].optional)
         for qualified_name in (
             production_webidl.ELEMENT_FIRST_ELEMENT_CHILD,
             production_webidl.ELEMENT_LAST_ELEMENT_CHILD,
@@ -1658,6 +1698,115 @@ class SyntheticSelectionTests(unittest.TestCase):
                 parser_results,
                 f"Element.{member}",
             )
+
+    def parse_element_attribute_mutation_operation(self, declaration: str):
+        return self.parse(
+            {
+                "Element.webidl": f"""
+                    interface TrustedHTML {{}};
+                    interface TrustedScript {{}};
+                    interface TrustedScriptURL {{}};
+                    typedef (TrustedHTML or TrustedScript or TrustedScriptURL) TrustedType;
+                    interface Element {{ {declaration} }};
+                """,
+            }
+        )
+
+    def assert_element_attribute_mutation_rejected(
+        self,
+        declaration: str,
+        member: str,
+        expected: str,
+    ) -> None:
+        parser_results = self.parse_element_attribute_mutation_operation(declaration)
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_element_host_member(
+                parser_results,
+                f"Element.{member}",
+            )
+
+    def test_selects_exact_element_attribute_mutation_operations(self) -> None:
+        parser_results = self.parse_element_attribute_mutation_operation(
+            """
+                [CEReactions, Throws]
+                boolean toggleAttribute(DOMString name, optional boolean force);
+                [CEReactions, Throws]
+                undefined setAttribute(
+                    DOMString name, (TrustedType or DOMString) value
+                );
+                [CEReactions]
+                undefined removeAttribute(DOMString name);
+            """
+        )
+        for qualified_name in (
+            production_webidl.ELEMENT_TOGGLE_ATTRIBUTE,
+            production_webidl.ELEMENT_SET_ATTRIBUTE,
+            production_webidl.ELEMENT_REMOVE_ATTRIBUTE,
+        ):
+            with self.subTest(member=qualified_name):
+                member = production_webidl._select_element_host_member(
+                    parser_results, qualified_name
+                )
+                self.assertTrue(member.isMethod())
+
+    def test_rejects_element_attribute_mutation_operation_drift(self) -> None:
+        cases = (
+            (
+                "[CEReactions] boolean toggleAttribute("
+                "DOMString name, optional boolean force);",
+                "toggleAttribute",
+                "`Element.toggleAttribute` must carry exactly ['CEReactions', "
+                "'Throws'], got ['CEReactions']",
+            ),
+            (
+                "[CEReactions, Throws] boolean toggleAttribute("
+                "DOMString name, optional boolean force = false);",
+                "toggleAttribute",
+                "`Element.toggleAttribute` second argument must be optional "
+                "non-nullable `boolean force`",
+            ),
+            (
+                "[CEReactions, Throws] undefined setAttribute("
+                "DOMString name, ((TrustedHTML or TrustedScript) or DOMString) value);",
+                "setAttribute",
+                "`Element.setAttribute` second argument must be required "
+                "non-nullable `(TrustedType or DOMString) value`",
+            ),
+            (
+                "[CEReactions, Throws] undefined setAttribute("
+                "DOMString name, (DOMString or TrustedType) value);",
+                "setAttribute",
+                "`Element.setAttribute` second argument must be required "
+                "non-nullable `(TrustedType or DOMString) value`",
+            ),
+            (
+                "[CEReactions, Throws] boolean setAttribute("
+                "DOMString name, (TrustedType or DOMString) value);",
+                "setAttribute",
+                "`Element.setAttribute` must return non-nullable `undefined`, "
+                "got `boolean`",
+            ),
+            (
+                "[CEReactions, Throws] undefined removeAttribute(DOMString name);",
+                "removeAttribute",
+                "`Element.removeAttribute` must carry exactly ['CEReactions'], "
+                "got ['CEReactions', 'Throws']",
+            ),
+            (
+                "[CEReactions] undefined removeAttribute(optional DOMString name);",
+                "removeAttribute",
+                "`Element.removeAttribute` must take required non-nullable "
+                "`DOMString name`",
+            ),
+        )
+        for declaration, member, expected in cases:
+            with self.subTest(member=member, declaration=declaration):
+                self.assert_element_attribute_mutation_rejected(
+                    declaration, member, expected
+                )
 
     def test_selects_exact_writable_element_id(self) -> None:
         parser_results = self.parse(

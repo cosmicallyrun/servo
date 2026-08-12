@@ -668,6 +668,68 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
     }
 
+    unsafe fn toggle_attribute(
+        &self,
+        host_context: *mut c_void,
+        name: &str,
+        force: Option<bool>,
+    ) -> servo_v8::ToggleAttributeResult {
+        if host_context.is_null() {
+            return servo_v8::ToggleAttributeResult::HostFailure;
+        }
+        // SAFETY: The authoritative entry lends its live owner-thread context
+        // only for this synchronous production Element operation.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // Do not create or pop a CEReactions queue here. Attribute changes
+        // enqueue through Servo's existing outer or backup queue, which is
+        // deliberately drained only after this V8 callback has unwound.
+        let result = self
+            .element
+            .root()
+            .ToggleAttribute(cx, DOMString::from(name), force);
+        // Servo's Fallible result must cross the bridge as typed data, never
+        // as a pending SpiderMonkey DOMException while V8 owns this frame.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::ToggleAttributeResult::HostFailure;
+        }
+        match result {
+            Ok(value) => servo_v8::ToggleAttributeResult::Returned(value),
+            Err(Error::InvalidCharacter(message)) => {
+                servo_v8::ToggleAttributeResult::DomException {
+                    kind: servo_v8::AttributeMutationException::InvalidCharacter,
+                    message: message
+                        .unwrap_or_else(|| "The string contains invalid characters.".to_owned()),
+                }
+            },
+            // The exact production declaration currently reaches only the
+            // InvalidCharacter branch. Keep any later Servo expansion fail
+            // closed until its V8 error mapping is designed explicitly.
+            Err(_) => servo_v8::ToggleAttributeResult::HostFailure,
+        }
+    }
+
+    unsafe fn remove_attribute(&self, host_context: *mut c_void, name: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative entry lends this context for one
+        // synchronous production Element operation.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        // As with toggleAttribute, leave CEReactions on Servo's outer or
+        // backup queue rather than invoking a SpiderMonkey callback under V8.
+        self.element
+            .root()
+            .RemoveAttribute(cx, DOMString::from(name));
+        // RemoveAttribute has no declared error result. Still protect the V8
+        // caller from any unexpected pending SpiderMonkey exception.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return false;
+        }
+        true
+    }
+
     fn get_elements_by_class_name(&self, class_names: &str) -> servo_v8::HTMLCollectionHandle {
         let element = self.element.root();
         v8_class_collection_handle(element.upcast::<Node>(), class_names)

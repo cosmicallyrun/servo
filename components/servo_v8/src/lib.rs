@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 37;
+const ABI_VERSION: u32 = 38;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -254,6 +254,22 @@ pub enum NodeMutationResult {
     HostFailure,
 }
 
+/// The only DOMException currently reachable from `toggleAttribute`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttributeMutationException {
+    InvalidCharacter,
+}
+
+/// The complete result space for `Element.toggleAttribute`.
+pub enum ToggleAttributeResult {
+    Returned(bool),
+    DomException {
+        kind: AttributeMutationException,
+        message: String,
+    },
+    HostFailure,
+}
+
 /// A static NodeList created for one querySelectorAll call.
 ///
 /// # Safety
@@ -389,6 +405,13 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
         namespace: Option<&str>,
         local_name: &str,
     ) -> Option<bool>;
+    unsafe fn toggle_attribute(
+        &self,
+        host_context: *mut c_void,
+        name: &str,
+        force: Option<bool>,
+    ) -> ToggleAttributeResult;
+    unsafe fn remove_attribute(&self, host_context: *mut c_void, name: &str) -> bool;
     fn node_type(&self) -> u16;
     fn node_name(&self) -> String;
     fn is_connected(&self) -> bool;
@@ -473,6 +496,20 @@ pub struct RawNodeMutationOutcome {
     pub value: RawInterfaceValue,
 }
 
+const ATTRIBUTE_MUTATION_RETURNED: u32 = 0;
+const ATTRIBUTE_MUTATION_DOM_EXCEPTION: u32 = 1;
+const ATTRIBUTE_MUTATION_HOST_FAILURE: u32 = 2;
+const ATTRIBUTE_MUTATION_EXCEPTION_NONE: u32 = 0;
+const ATTRIBUTE_MUTATION_EXCEPTION_INVALID_CHARACTER: u32 = 1;
+
+#[repr(C)]
+pub struct RawToggleAttributeOutcome {
+    pub status: u32,
+    pub exception_kind: u32,
+    pub exception_message: OwnedUtf8,
+    pub value: u8,
+}
+
 #[repr(C)]
 pub struct OptionalOwnedUtf8 {
     pub is_null: u8,
@@ -544,6 +581,19 @@ pub struct ElementHostVTable {
             *mut u8,
         ) -> u8,
     >,
+    pub toggle_attribute: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            u8,
+            u8,
+            *mut RawToggleAttributeOutcome,
+        ) -> u8,
+    >,
+    pub remove_attribute:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
     pub get_node_type: Option<unsafe extern "C" fn(*mut c_void, *mut u16) -> u8>,
     pub get_node_name: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
     pub get_is_connected: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
@@ -1107,6 +1157,33 @@ fn raw_node_mutation_outcome(result: NodeMutationResult) -> RawNodeMutationOutco
     }
 }
 
+fn raw_toggle_attribute_outcome(result: ToggleAttributeResult) -> RawToggleAttributeOutcome {
+    match result {
+        ToggleAttributeResult::Returned(value) => RawToggleAttributeOutcome {
+            status: ATTRIBUTE_MUTATION_RETURNED,
+            exception_kind: ATTRIBUTE_MUTATION_EXCEPTION_NONE,
+            exception_message: raw_empty_owned_utf8(),
+            value: value as u8,
+        },
+        ToggleAttributeResult::DomException { kind, message } => RawToggleAttributeOutcome {
+            status: ATTRIBUTE_MUTATION_DOM_EXCEPTION,
+            exception_kind: match kind {
+                AttributeMutationException::InvalidCharacter => {
+                    ATTRIBUTE_MUTATION_EXCEPTION_INVALID_CHARACTER
+                },
+            },
+            exception_message: raw_owned_utf8(message),
+            value: 0,
+        },
+        ToggleAttributeResult::HostFailure => RawToggleAttributeOutcome {
+            status: ATTRIBUTE_MUTATION_HOST_FAILURE,
+            exception_kind: ATTRIBUTE_MUTATION_EXCEPTION_NONE,
+            exception_message: raw_empty_owned_utf8(),
+            value: 0,
+        },
+    }
+}
+
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -1337,6 +1414,59 @@ unsafe extern "C" fn element_host_has_attribute_ns<T: ElementHostBinding>(
     // SAFETY: output is non-null and points to caller-owned writable storage.
     unsafe { *output = value as u8 };
     1
+}
+
+unsafe extern "C" fn element_host_toggle_attribute<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+    force_is_present: u8,
+    force: u8,
+    output: *mut RawToggleAttributeOutcome,
+) -> u8 {
+    if native.is_null()
+        || host_context.is_null()
+        || output.is_null()
+        || force_is_present > 1
+        || force > 1
+        || (force_is_present == 0 && force != 0)
+    {
+        return 0;
+    }
+    // SAFETY: C++ lends this byte range for one synchronous callback.
+    let Some(name) = (unsafe { element_host_utf8(name, name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable supplies the installed live host and context.
+    let result = unsafe {
+        (&*native.cast::<T>()).toggle_attribute(
+            host_context,
+            name,
+            (force_is_present != 0).then_some(force != 0),
+        )
+    };
+    // SAFETY: output is caller-owned writable storage, and the whole owned
+    // outcome transfers atomically.
+    unsafe { *output = raw_toggle_attribute_outcome(result) };
+    1
+}
+
+unsafe extern "C" fn element_host_remove_attribute<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: C++ lends this byte range for one synchronous callback.
+    let Some(name) = (unsafe { element_host_utf8(name, name_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable supplies the installed live host and context.
+    unsafe { (&*native.cast::<T>()).remove_attribute(host_context, name) as u8 }
 }
 
 unsafe extern "C" fn element_host_get_node_type<T: ElementHostBinding>(
@@ -1960,6 +2090,8 @@ fn element_host_vtable<T: NodeHostBinding>() -> ElementHostVTable {
         has_attribute: Some(element_host_has_attribute::<T>),
         get_attribute_ns: Some(element_host_get_attribute_ns::<T>),
         has_attribute_ns: Some(element_host_has_attribute_ns::<T>),
+        toggle_attribute: Some(element_host_toggle_attribute::<T>),
+        remove_attribute: Some(element_host_remove_attribute::<T>),
         get_node_type: Some(element_host_get_node_type::<T>),
         get_node_name: Some(element_host_get_node_name::<T>),
         get_is_connected: Some(element_host_get_is_connected::<T>),
@@ -3068,6 +3200,7 @@ mod tests {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     static OPTIONAL_STRING_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     static UTF8_SEQUENCE_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static ATTRIBUTE_MUTATION_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
         static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
@@ -3595,6 +3728,59 @@ mod tests {
         ) -> Option<bool> {
             assert!(!host_context.is_null());
             Some(self.state.get_ns(namespace, local_name).is_some())
+        }
+
+        unsafe fn toggle_attribute(
+            &self,
+            host_context: *mut c_void,
+            name: &str,
+            force: Option<bool>,
+        ) -> ToggleAttributeResult {
+            assert!(!host_context.is_null());
+            if self.state.remove_fails.get() {
+                return ToggleAttributeResult::HostFailure;
+            }
+            if name.is_empty()
+                || name.chars().any(|character| {
+                    character.is_ascii_whitespace() || matches!(character, '/' | '=' | '>' | '\0')
+                })
+            {
+                return ToggleAttributeResult::DomException {
+                    kind: AttributeMutationException::InvalidCharacter,
+                    message: "The string contains invalid characters.".to_owned(),
+                };
+            }
+            let name = name.to_ascii_lowercase();
+            let present = self.state.get(&name).is_some();
+            let result = match (present, force) {
+                (false, None | Some(true)) => {
+                    self.state.set(&name, "");
+                    true
+                },
+                (false, Some(false)) => false,
+                (true, None | Some(false)) => {
+                    self.state
+                        .attributes
+                        .borrow_mut()
+                        .retain(|(attribute, _)| attribute != &name);
+                    false
+                },
+                (true, Some(true)) => true,
+            };
+            ToggleAttributeResult::Returned(result)
+        }
+
+        unsafe fn remove_attribute(&self, host_context: *mut c_void, name: &str) -> bool {
+            assert!(!host_context.is_null());
+            if self.state.remove_fails.get() {
+                return false;
+            }
+            let name = name.to_ascii_lowercase();
+            self.state
+                .attributes
+                .borrow_mut()
+                .retain(|(attribute, _)| attribute != &name);
+            true
         }
 
         fn node_type(&self) -> u16 {
@@ -4913,6 +5099,69 @@ mod tests {
         // SAFETY: output is non-null and writable for this callback.
         unsafe { *output = outcome };
         1
+    }
+
+    unsafe extern "C" fn adversarial_attribute_owner_drop(owner: *mut c_void) {
+        if owner.is_null() {
+            return;
+        }
+        // SAFETY: The adversarial callback transfers exactly one Box<Vec<u8>>
+        // for each owner and the bridge must return it exactly once.
+        drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
+        ATTRIBUTE_MUTATION_OWNER_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn adversarial_attribute_owned(value: &str) -> OwnedUtf8 {
+        let owner = Box::new(value.as_bytes().to_vec());
+        OwnedUtf8 {
+            data: owner.as_ptr(),
+            length: owner.len(),
+            owner: Box::into_raw(owner).cast(),
+            drop_owner: Some(adversarial_attribute_owner_drop),
+        }
+    }
+
+    unsafe extern "C" fn adversarial_element_toggle_attribute(
+        native: *mut c_void,
+        host_context: *mut c_void,
+        name: *const u8,
+        name_length: usize,
+        force_is_present: u8,
+        force: u8,
+        output: *mut RawToggleAttributeOutcome,
+    ) -> u8 {
+        if native.is_null() || host_context.is_null() || output.is_null() {
+            return 0;
+        }
+        // SAFETY: The custom vtable is installed for exactly this host type.
+        let mode = unsafe { &*native.cast::<ElementHostProbe>() }.id();
+        if mode == "malformed-owner" {
+            // The owned message is intentionally paired with an invalid
+            // returned boolean. C++ must release it before rejecting the
+            // malformed outcome.
+            unsafe {
+                *output = RawToggleAttributeOutcome {
+                    status: ATTRIBUTE_MUTATION_RETURNED,
+                    exception_kind: ATTRIBUTE_MUTATION_EXCEPTION_NONE,
+                    exception_message: adversarial_attribute_owned("malformed"),
+                    value: 2,
+                };
+            }
+            return 1;
+        }
+        // SAFETY: The adversarial wrapper preserves the direct thunk's ABI
+        // validation for every mode other than the malformed probe above.
+        unsafe {
+            element_host_toggle_attribute::<ElementHostProbe>(
+                native,
+                host_context,
+                name,
+                name_length,
+                force_is_present,
+                force,
+                output,
+            )
+        }
     }
 
     unsafe extern "C" fn adversarial_optional_string_owner_drop(owner: *mut c_void) {
@@ -8550,6 +8799,444 @@ mod tests {
         }
         assert_eq!(&*calls.borrow(), &[""]);
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn element_attribute_mutations_preserve_webidl_conversion_and_exception_shape() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let element_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        let target_state = Rc::clone(&document.id_element_state);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const target = document.getElementById('target');
+              const prototype = Object.getPrototypeOf(target);
+              const toggleDescriptor = Object.getOwnPropertyDescriptor(
+                prototype, 'toggleAttribute');
+              const removeDescriptor = Object.getOwnPropertyDescriptor(
+                prototype, 'removeAttribute');
+              const descriptorProof = [
+                [toggleDescriptor, 'toggleAttribute'],
+                [removeDescriptor, 'removeAttribute'],
+              ].every(([descriptor, name]) => descriptor &&
+                descriptor.value.name === name && descriptor.value.length === 1 &&
+                descriptor.writable && descriptor.enumerable && descriptor.configurable &&
+                !Object.hasOwn(target, name));
+
+              const brandSentinel = {};
+              let brandTouched = false;
+              const brandArg = new Proxy({}, { get() {
+                brandTouched = true;
+                throw brandSentinel;
+              }});
+              let toggleWrongBrand = false;
+              try { toggleDescriptor.value.call({}, brandArg); }
+              catch (error) { toggleWrongBrand = error instanceof TypeError; }
+              let removeWrongBrand = false;
+              try { removeDescriptor.value.call({}, brandArg); }
+              catch (error) { removeWrongBrand = error instanceof TypeError; }
+
+              let toggleMissing = false;
+              try { toggleDescriptor.value.call(target); }
+              catch (error) { toggleMissing = error instanceof TypeError; }
+              let removeMissing = false;
+              try { removeDescriptor.value.call(target); }
+              catch (error) { removeMissing = error instanceof TypeError; }
+
+              let toggleSymbol = false;
+              try { target.toggleAttribute(Symbol('name')); }
+              catch (error) { toggleSymbol = error instanceof TypeError; }
+              let removeSymbol = false;
+              try { target.removeAttribute(Symbol('name')); }
+              catch (error) { removeSymbol = error instanceof TypeError; }
+
+              const conversionSentinel = {};
+              let toggleConversion = false;
+              try { target.toggleAttribute({ toString() {
+                throw conversionSentinel;
+              }}); }
+              catch (error) { toggleConversion = error === conversionSentinel; }
+              let removeConversion = false;
+              try { target.removeAttribute({ toString() {
+                throw conversionSentinel;
+              }}); }
+              catch (error) { removeConversion = error === conversionSentinel; }
+
+              target.removeAttribute('data-force');
+              const forceAbsent = target.toggleAttribute('data-force') === true &&
+                target.hasAttribute('data-force');
+              target.removeAttribute('data-force');
+              const forceUndefined =
+                target.toggleAttribute('data-force', undefined) === true &&
+                target.hasAttribute('data-force');
+              const forceNull = target.toggleAttribute('data-force', null) === false &&
+                !target.hasAttribute('data-force');
+              const forceTrueAbsent = target.toggleAttribute('data-force', true) === true &&
+                target.hasAttribute('data-force');
+              const forceTruePresent = target.toggleAttribute('data-force', true) === true &&
+                target.hasAttribute('data-force');
+              const forceFalsePresent = target.toggleAttribute('data-force', false) === false &&
+                !target.hasAttribute('data-force');
+              const forceFalseAbsent = target.toggleAttribute('data-force', false) === false &&
+                !target.hasAttribute('data-force');
+              const forceSymbol = target.toggleAttribute('data-force', Symbol('force')) === true &&
+                target.hasAttribute('data-force');
+              const removeReturn = target.removeAttribute('data-force') === undefined &&
+                !target.hasAttribute('data-force');
+
+              const caseAdded = target.toggleAttribute('DATA-CASE') === true &&
+                target.hasAttribute('data-case');
+              const caseRemoved = target.removeAttribute({
+                toString() { return 'DATA-CASE'; }
+              }) === undefined && !target.hasAttribute('data-case');
+
+              let invalidCharacter = false;
+              try { target.toggleAttribute(''); }
+              catch (error) {
+                invalidCharacter = error instanceof DOMException &&
+                  error.name === 'InvalidCharacterError' && error.code === 5 &&
+                  error.message === 'The string contains invalid characters.';
+              }
+
+              globalThis.attributeTarget = target;
+              globalThis.attributeMutationProof = descriptorProof &&
+                !brandTouched && toggleWrongBrand && removeWrongBrand &&
+                toggleMissing && removeMissing && toggleSymbol && removeSymbol &&
+                toggleConversion && removeConversion && forceAbsent && forceUndefined &&
+                forceNull && forceTrueAbsent && forceTruePresent && forceFalsePresent &&
+                forceFalseAbsent && forceSymbol && removeReturn && caseAdded &&
+                caseRemoved && invalidCharacter;
+            })();"#,
+            "element-attribute-mutations.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token remains live for this synchronous probe.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "attributeMutationProof")
+                .unwrap()
+        );
+
+        target_state.remove_fails.set(true);
+        let host_failure_script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              let toggleFailure = false;
+              try { attributeTarget.toggleAttribute('data-host-failure'); }
+              catch (error) { toggleFailure = error instanceof TypeError; }
+              let removeFailure = false;
+              try { attributeTarget.removeAttribute('data-host-failure'); }
+              catch (error) { removeFailure = error instanceof TypeError; }
+              globalThis.attributeHostFailureProof = toggleFailure && removeFailure;
+            })();"#,
+            "element-attribute-host-failure.js",
+            1,
+        ));
+        // SAFETY: The token remains live for this synchronous probe.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                host_failure_script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "attributeHostFailureProof")
+                .unwrap()
+        );
+
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    r#"(() => {
+                  let toggleFailure = false;
+                  try { attributeTarget.toggleAttribute('data-no-context'); }
+                  catch (error) { toggleFailure = error instanceof TypeError; }
+                  let removeFailure = false;
+                  try { attributeTarget.removeAttribute('data-no-context'); }
+                  catch (error) { removeFailure = error instanceof TypeError; }
+                  return toggleFailure && removeFailure;
+                })()"#,
+                )
+                .unwrap()
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(element_drops.get(), 1);
+        assert_eq!(document_drops.get(), 1);
+    }
+
+    #[test]
+    fn element_attribute_mutation_thunks_validate_abi_inputs() {
+        let element_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(Cell::new(0)),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        let mut host_context_token = 0_u8;
+        let host_context = (&mut host_context_token as *mut u8).cast::<c_void>();
+        // SAFETY: document and the stand-in Element identity remain live for
+        // this entire synchronous thunk probe.
+        let handle = unsafe { document.get_element_by_id(host_context, "target") }.unwrap();
+        let native = handle.native;
+        let toggle = element_host_toggle_attribute::<ElementHostProbe>;
+        let remove = element_host_remove_attribute::<ElementHostProbe>;
+        let invalid_utf8 = [0xff];
+        let valid_name = b"data-direct";
+        let mut output = RawToggleAttributeOutcome {
+            status: u32::MAX,
+            exception_kind: u32::MAX,
+            exception_message: raw_empty_owned_utf8(),
+            value: u8::MAX,
+        };
+
+        // SAFETY: Each invalid pointer/flag combination is intentional. No
+        // callback is entered for a rejected ABI shape.
+        unsafe {
+            assert_eq!(
+                toggle(
+                    std::ptr::null_mut(),
+                    host_context,
+                    valid_name.as_ptr(),
+                    valid_name.len(),
+                    0,
+                    0,
+                    &mut output,
+                ),
+                0
+            );
+            assert_eq!(
+                toggle(
+                    native,
+                    std::ptr::null_mut(),
+                    valid_name.as_ptr(),
+                    valid_name.len(),
+                    0,
+                    0,
+                    &mut output,
+                ),
+                0
+            );
+            assert_eq!(
+                toggle(
+                    native,
+                    host_context,
+                    valid_name.as_ptr(),
+                    valid_name.len(),
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            assert_eq!(
+                toggle(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    0,
+                    0,
+                    &mut output,
+                ),
+                0
+            );
+            assert_eq!(
+                toggle(
+                    native,
+                    host_context,
+                    valid_name.as_ptr(),
+                    valid_name.len(),
+                    2,
+                    0,
+                    &mut output,
+                ),
+                0
+            );
+            assert_eq!(
+                toggle(
+                    native,
+                    host_context,
+                    valid_name.as_ptr(),
+                    valid_name.len(),
+                    0,
+                    1,
+                    &mut output,
+                ),
+                0
+            );
+            assert_eq!(
+                toggle(
+                    native,
+                    host_context,
+                    valid_name.as_ptr(),
+                    valid_name.len(),
+                    1,
+                    2,
+                    &mut output,
+                ),
+                0
+            );
+
+            assert_eq!(
+                toggle(
+                    native,
+                    host_context,
+                    valid_name.as_ptr(),
+                    valid_name.len(),
+                    0,
+                    0,
+                    &mut output,
+                ),
+                1
+            );
+            assert_eq!(output.status, ATTRIBUTE_MUTATION_RETURNED);
+            assert_eq!(output.exception_kind, ATTRIBUTE_MUTATION_EXCEPTION_NONE);
+            assert_eq!(output.value, 1);
+            assert_eq!(output.exception_message.length, 0);
+
+            assert_eq!(
+                toggle(native, host_context, std::ptr::null(), 0, 0, 0, &mut output,),
+                1
+            );
+            assert_eq!(output.status, ATTRIBUTE_MUTATION_DOM_EXCEPTION);
+            assert_eq!(
+                output.exception_kind,
+                ATTRIBUTE_MUTATION_EXCEPTION_INVALID_CHARACTER
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    output.exception_message.data,
+                    output.exception_message.length,
+                ),
+                b"The string contains invalid characters."
+            );
+            output.exception_message.drop_owner.unwrap()(output.exception_message.owner);
+
+            assert_eq!(remove(native, host_context, invalid_utf8.as_ptr(), 1), 0);
+            assert_eq!(
+                remove(std::ptr::null_mut(), host_context, valid_name.as_ptr(), 1),
+                0
+            );
+            assert_eq!(
+                remove(native, std::ptr::null_mut(), valid_name.as_ptr(), 1),
+                0
+            );
+            assert_eq!(
+                remove(native, host_context, valid_name.as_ptr(), valid_name.len()),
+                1
+            );
+            element_host_drop::<ElementHostProbe>(native);
+        }
+        assert_eq!(element_drops.get(), 1);
+    }
+
+    #[test]
+    fn element_attribute_mutation_releases_malformed_outcome_owner() {
+        let before = ATTRIBUTE_MUTATION_OWNER_DROPS.load(Ordering::SeqCst);
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let mut vtable = element_host_vtable::<ElementHostProbe>();
+        vtable.toggle_attribute = Some(adversarial_element_toggle_attribute);
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The complete vtable contains callbacks for one exact host
+        // type and C++ copies it synchronously.
+        let installed =
+            unsafe { servo_v8_install_element_host(runtime.raw.as_ptr(), &vtable, &mut error) };
+        assert_eq!(
+            installed,
+            1,
+            "custom Element vtable install failed: {:?}",
+            error_from(&storage, &error)
+        );
+
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let element_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        document.id_element_state.set("id", "malformed-owner");
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const target = document.getElementById('target');
+              let rejected = false;
+              try { target.toggleAttribute('x'); }
+              catch (error) { rejected = error instanceof TypeError; }
+              globalThis.malformedAttributeOutcomeProof = rejected;
+            })();"#,
+            "element-attribute-malformed-outcome.js",
+            1,
+        ));
+        let mut host_context_token = 0_u8;
+        // SAFETY: The token remains live for this synchronous probe.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context_token as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "malformedAttributeOutcomeProof")
+                .unwrap()
+        );
+        assert_eq!(
+            ATTRIBUTE_MUTATION_OWNER_DROPS.load(Ordering::SeqCst),
+            before + 1
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(element_drops.get(), 1);
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(
+            ATTRIBUTE_MUTATION_OWNER_DROPS.load(Ordering::SeqCst),
+            before + 1
+        );
     }
 
     #[test]

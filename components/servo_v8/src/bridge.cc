@@ -1257,6 +1257,11 @@ bool IsValidUtf8(const uint8_t* data, size_t length) {
   return true;
 }
 
+bool IsCanonicalEmptyOwnedUtf8(const ServoV8OwnedUtf8& value) {
+  return !value.data && value.length == 0 && !value.owner &&
+         !value.drop_owner;
+}
+
 // Finds or creates the wrapper for one DOM object, preserving identity.
 //
 // A hit drops the surplus host the caller speculatively allocated, so
@@ -2168,12 +2173,12 @@ bool ElementHostOperationName(
   v8::Isolate* isolate = info.GetIsolate();
   // Brand-check before required-argument checks and user-code conversion.
   if (!ElementHostCallbackState(info, realm_output, native_output)) return false;
-  if (!(*realm_output)->document_host.active_host_context) {
-    ThrowTypeError(isolate, "Element operation requires a live host context");
-    return false;
-  }
   if (info.Length() < 1) {
     ThrowTypeError(isolate, member_name);
+    return false;
+  }
+  if (!(*realm_output)->document_host.active_host_context) {
+    ThrowTypeError(isolate, "Element operation requires a live host context");
     return false;
   }
   return info[0]->ToString(isolate->GetCurrentContext()).ToLocal(name_output);
@@ -2385,6 +2390,108 @@ void ElementHostHasAttributeNS(
     return;
   }
   info.GetReturnValue().Set(result != 0);
+}
+
+void ElementHostToggleAttribute(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  v8::Local<v8::String> name_string;
+  if (!ElementHostOperationName(
+          info, "Element.toggleAttribute requires 1 argument", &realm,
+          &native, &name_string)) {
+    return;
+  }
+  v8::String::Utf8Value name(isolate, name_string);
+  if (!*name && name.length() != 0) return;
+  const bool force_is_present = info.Length() > 1 && !info[1]->IsUndefined();
+  const bool force = force_is_present && info[1]->BooleanValue(isolate);
+  ServoV8ToggleAttributeOutcome outcome{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.toggle_attribute(
+        native, realm->document_host.active_host_context,
+        reinterpret_cast<const uint8_t*>(*name),
+        static_cast<size_t>(name.length()), force_is_present ? 1 : 0,
+        force ? 1 : 0, &outcome);
+  }
+  DocumentHostOwnedUtf8Scope message_scope(realm->runtime,
+                                            &outcome.exception_message);
+  if (!succeeded) {
+    ThrowTypeError(isolate, "Element.toggleAttribute host callback failed");
+    return;
+  }
+  const bool returned =
+      outcome.status == SERVO_V8_ATTRIBUTE_MUTATION_RETURNED;
+  const bool dom_exception =
+      outcome.status == SERVO_V8_ATTRIBUTE_MUTATION_DOM_EXCEPTION;
+  const bool host_failure =
+      outcome.status == SERVO_V8_ATTRIBUTE_MUTATION_HOST_FAILURE;
+  const bool canonical_non_exception =
+      outcome.exception_kind == SERVO_V8_ATTRIBUTE_MUTATION_EXCEPTION_NONE &&
+      IsCanonicalEmptyOwnedUtf8(outcome.exception_message);
+  const bool valid_exception =
+      outcome.exception_kind ==
+          SERVO_V8_ATTRIBUTE_MUTATION_EXCEPTION_INVALID_CHARACTER &&
+      outcome.exception_message.data && outcome.exception_message.owner &&
+      outcome.exception_message.drop_owner &&
+      outcome.exception_message.length <=
+          static_cast<size_t>(std::numeric_limits<int>::max()) &&
+      IsValidUtf8(outcome.exception_message.data,
+                  outcome.exception_message.length);
+  const bool valid_shape =
+      (returned && outcome.value <= 1 && canonical_non_exception) ||
+      (dom_exception && outcome.value == 0 && valid_exception) ||
+      (host_failure && outcome.value == 0 && canonical_non_exception);
+  if (!valid_shape) {
+    ThrowTypeError(isolate, "invalid Element.toggleAttribute outcome");
+    return;
+  }
+  if (host_failure) {
+    ThrowTypeError(isolate, "Element.toggleAttribute host callback failed");
+    return;
+  }
+  if (dom_exception) {
+    v8::Local<v8::String> message;
+    if (outcome.exception_message.length == 0) {
+      message = v8::String::Empty(isolate);
+    } else if (!v8::String::NewFromUtf8(
+                    isolate,
+                    reinterpret_cast<const char*>(outcome.exception_message.data),
+                    v8::NewStringType::kNormal,
+                    static_cast<int>(outcome.exception_message.length))
+                    .ToLocal(&message)) {
+      return;
+    }
+    ThrowDomException(realm, isolate->GetCurrentContext(), message,
+                      V8String(isolate, "InvalidCharacterError"));
+    return;
+  }
+  info.GetReturnValue().Set(outcome.value != 0);
+}
+
+void ElementHostRemoveAttribute(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  v8::Local<v8::String> name_string;
+  if (!ElementHostOperationName(
+          info, "Element.removeAttribute requires 1 argument", &realm,
+          &native, &name_string)) {
+    return;
+  }
+  v8::String::Utf8Value name(isolate, name_string);
+  if (!*name && name.length() != 0) return;
+  RustCallbackScope callback_scope(realm->runtime);
+  if (!realm->runtime->element_host_vtable.remove_attribute(
+          native, realm->document_host.active_host_context,
+          reinterpret_cast<const uint8_t*>(*name),
+          static_cast<size_t>(name.length()))) {
+    ThrowTypeError(isolate, "Element.removeAttribute host callback failed");
+  }
 }
 
 using ElementSelectorElementOperation = uint8_t (*)(
@@ -2869,11 +2976,6 @@ void NodeHostHasChildNodes(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   ElementHostGetBoolean(info, &ServoV8ElementHostVTable::has_child_nodes,
                         "Node.hasChildNodes host callback failed");
-}
-
-bool IsCanonicalEmptyOwnedUtf8(const ServoV8OwnedUtf8& value) {
-  return !value.data && value.length == 0 && !value.owner &&
-         !value.drop_owner;
 }
 
 void ReturnNodeMutationOutcome(
@@ -3537,6 +3639,10 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"getAttributeNS", &ElementHostGetAttributeNS, 2,
        v8::SideEffectType::kHasNoSideEffect},
       {"hasAttributeNS", &ElementHostHasAttributeNS, 2,
+       v8::SideEffectType::kHasSideEffect},
+      {"toggleAttribute", &ElementHostToggleAttribute, 1,
+       v8::SideEffectType::kHasSideEffect},
+      {"removeAttribute", &ElementHostRemoveAttribute, 1,
        v8::SideEffectType::kHasSideEffect},
       {"getElementsByTagName", &ElementHostGetElementsByTagName, 1,
        v8::SideEffectType::kHasSideEffect},
@@ -4890,6 +4996,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_attribute_names || !vtable->get_attribute ||
       !vtable->has_attribute ||
       !vtable->get_attribute_ns || !vtable->has_attribute_ns ||
+      !vtable->toggle_attribute || !vtable->remove_attribute ||
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->get_parent_element ||

@@ -82,6 +82,9 @@ ELEMENT_GET_ATTRIBUTE = "Element.getAttribute"
 ELEMENT_GET_ATTRIBUTE_NS = "Element.getAttributeNS"
 ELEMENT_HAS_ATTRIBUTE = "Element.hasAttribute"
 ELEMENT_HAS_ATTRIBUTE_NS = "Element.hasAttributeNS"
+ELEMENT_TOGGLE_ATTRIBUTE = "Element.toggleAttribute"
+ELEMENT_SET_ATTRIBUTE = "Element.setAttribute"
+ELEMENT_REMOVE_ATTRIBUTE = "Element.removeAttribute"
 ELEMENT_CHILDREN = "Element.children"
 ELEMENT_NAMESPACE_URI = "Element.namespaceURI"
 ELEMENT_PREFIX = "Element.prefix"
@@ -310,6 +313,12 @@ ELEMENT_HOST = (
     ELEMENT_GET_ATTRIBUTE_NS,
     ELEMENT_HAS_ATTRIBUTE,
     ELEMENT_HAS_ATTRIBUTE_NS,
+    ELEMENT_TOGGLE_ATTRIBUTE,
+    # Gate the exact Trusted-Type-or-DOMString declaration even though the V8
+    # facade intentionally does not expose it until cross-engine policy calls
+    # and exceptions have a sound design.
+    ELEMENT_SET_ATTRIBUTE,
+    ELEMENT_REMOVE_ATTRIBUTE,
     ELEMENT_CHILDREN,
     ELEMENT_NAMESPACE_URI,
     ELEMENT_PREFIX,
@@ -1514,6 +1523,144 @@ def _select_element_host_member(
                     f"`{qualified_name}` arguments carry extended attributes "
                     "that are not implemented: "
                     + ", ".join(sorted(argument_attributes))
+                )
+        return member
+    if member_name in {"toggleAttribute", "removeAttribute"}:
+        expected_attributes = (
+            {"CEReactions", "Throws"}
+            if member_name == "toggleAttribute"
+            else {"CEReactions"}
+        )
+        actual_attributes = set(member._extendedAttrDict)
+        if actual_attributes != expected_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+                f"got {sorted(actual_attributes)}"
+            )
+        signatures = member.signatures()
+        if len(signatures) != 1:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+            )
+        return_type, arguments = signatures[0]
+        valid_return = not return_type.nullable() and (
+            return_type.isBoolean()
+            if member_name == "toggleAttribute"
+            else return_type.tag() == WebIDL.IDLType.Tags.undefined
+        )
+        if not valid_return:
+            expected = "boolean" if member_name == "toggleAttribute" else "undefined"
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must return non-nullable `{expected}`, "
+                f"got `{return_type.prettyName()}`"
+            )
+        expected_count = 2 if member_name == "toggleAttribute" else 1
+        if len(arguments) != expected_count:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take exactly {expected_count} argument(s), "
+                f"found {len(arguments)}"
+            )
+        name = arguments[0]
+        if (
+            name.identifier.name != "name"
+            or name.optional
+            or name.variadic
+            or name.defaultValue is not None
+            or name.type.nullable()
+            or not name.type.isDOMString()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take required non-nullable `DOMString name`"
+            )
+        if member_name == "toggleAttribute":
+            force = arguments[1]
+            if (
+                force.identifier.name != "force"
+                or not force.optional
+                or force.variadic
+                or force.defaultValue is not None
+                or force.type.nullable()
+                or not force.type.isBoolean()
+            ):
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` second argument must be optional non-nullable `boolean force`"
+                )
+        for argument in arguments:
+            attributes = set(argument._extendedAttrDict) | set(
+                argument.type._extendedAttrDict
+            )
+            if attributes:
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` arguments carry extended attributes that are not implemented: "
+                    + ", ".join(sorted(attributes))
+                )
+        return member
+    if member_name == "setAttribute":
+        actual_attributes = set(member._extendedAttrDict)
+        if actual_attributes != {"CEReactions", "Throws"}:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must carry exactly ['CEReactions', 'Throws'], "
+                f"got {sorted(actual_attributes)}"
+            )
+        signatures = member.signatures()
+        if len(signatures) != 1:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+            )
+        return_type, arguments = signatures[0]
+        if return_type.nullable() or return_type.tag() != WebIDL.IDLType.Tags.undefined:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must return non-nullable `undefined`, "
+                f"got `{return_type.prettyName()}`"
+            )
+        if len(arguments) != 2:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` must take exactly 2 arguments, found {len(arguments)}"
+            )
+        name, value = arguments
+        if (
+            name.identifier.name != "name"
+            or name.optional
+            or name.variadic
+            or name.defaultValue is not None
+            or name.type.nullable()
+            or not name.type.isDOMString()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` first argument must be required non-nullable `DOMString name`"
+            )
+        # `TrustedType` is a typedef for the three Trusted Type interfaces.
+        # WebIDL conversion works over flattened union member types, so pin
+        # that effective conversion set and order instead of the parser's
+        # incidental typedef nesting.
+        flattened_members = value.type.flatMemberTypes if value.type.isUnion() else []
+        if (
+            value.identifier.name != "value"
+            or value.optional
+            or value.variadic
+            or value.defaultValue is not None
+            or value.type.nullable()
+            or tuple(type_.prettyName() for type_ in flattened_members)
+            != ("TrustedHTML", "TrustedScript", "TrustedScriptURL", "DOMString")
+            or any(
+                not type_.isInterface() or type_.nullable()
+                for type_ in flattened_members[:3]
+            )
+            or not flattened_members[-1].isDOMString()
+            or flattened_members[-1].nullable()
+        ):
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` second argument must be required non-nullable "
+                "`(TrustedType or DOMString) value`"
+            )
+        for argument in arguments:
+            attributes = set(argument._extendedAttrDict) | set(
+                argument.type._extendedAttrDict
+            )
+            if attributes:
+                raise WebIDLSelectionError(
+                    f"`{qualified_name}` arguments carry extended attributes that are not implemented: "
+                    + ", ".join(sorted(attributes))
                 )
         return member
     if member_name == "remove":

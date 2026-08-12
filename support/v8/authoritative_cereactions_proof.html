@@ -3,8 +3,9 @@
 Runtime proof that V8-originated CEReactions run only after V8 unwinds.
 
 A customized built-in <body> observes bgcolor, an autonomous custom element
-observes id and class, and its custom child observes disconnection caused by
-`Element.remove()`. The V8-authoritative script mutates all four through the
+observes id, class, and one attribute changed by `toggleAttribute` then
+`removeAttribute`, and its custom child observes disconnection caused by
+`Element.remove()`. The V8-authoritative script mutates all of them through the
 host bridge. Servo leaves the resulting reactions on its rooted backup queue and
 invokes the callbacks at the existing microtask checkpoint, after the V8
 setters, authoritative-entry guard, and sidecar borrow have unwound. Each
@@ -23,8 +24,8 @@ run_proofs.sh, which builds only the classic-script feature:
       -o /tmp/cereactions.png support/v8/authoritative_cereactions_proof.html
 
 Expected: no panic, every pixel lime, the title reporting two body reactions,
-two Element attribute reactions, and one child disconnection; six
-Document.hidden host calls at teardown (the realm probe and five callbacks);
+four Element attribute reactions, and one child disconnection; eight
+Document.hidden host calls at teardown (the realm probe and seven callbacks);
 and no "answered from the host's own native source" warning.
 -->
 <html>
@@ -43,7 +44,9 @@ and no "answered from the host's own native source" warning.
       customElements.define("v8-body", V8Body, { extends: "body" });
 
       class V8Element extends HTMLElement {
-        static get observedAttributes() { return ["id", "class"]; }
+        static get observedAttributes() {
+          return ["id", "class", "data-v8-toggle"];
+        }
         attributeChangedCallback(name, oldValue, newValue) {
           // Ignore parser-time initialization. Only mutations made by the V8
           // script below are part of this ordering proof.
@@ -76,6 +79,8 @@ and no "answered from the host's own native source" warning.
       var target = document.getElementById("target");
       target.id = "changed-id";
       target.className = "after";
+      target.toggleAttribute("data-v8-toggle", true);
+      target.removeAttribute("data-v8-toggle");
       target.remove();
     </script>
     <script>

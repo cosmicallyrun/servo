@@ -245,6 +245,23 @@ all four operations, their descriptors/brands/returns/error variants, live
 and static collection behavior, a SpiderMonkey follow-up observation, and
 leaves one visible rendered `Hello` for the browser screenshot milestone.
 
+ABI v38 adds `Element.toggleAttribute` and `Element.removeAttribute`. Both
+methods call Servo's production Element algorithms with the same ephemeral
+SpiderMonkey context used by the existing Element attribute readers and
+setters. `toggleAttribute` carries its `InvalidCharacterError` through a
+typed POD outcome and creates the result as a realm-local V8 `DOMException`;
+`removeAttribute` has no production throwing branch. Both preserve V8-side
+WebIDL receiver branding, required-argument checks, DOMString conversion,
+optional-boolean semantics, and the Element prototype descriptor surface.
+They leave custom-element reactions on Servo's outer or backup queue and
+clear unexpected SpiderMonkey exceptions before returning. `setAttribute` is
+deliberately deferred: its `(TrustedType or DOMString)` union and default
+Trusted Types policy may execute SpiderMonkey policy code, so exposing only a
+string-shaped approximation would be semantically dishonest and unsafe under
+the sidecar borrow. `authoritative_attribute_mutation_proof.html` validates
+both operations, conversion/error behavior, and a SpiderMonkey observation of
+the V8-mutated DOM.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script
@@ -508,6 +525,7 @@ The proof suite uses that same counting argument:
 | `authoritative_attribute_namespace_proof.html` | HTML/SVG namespace-aware attribute reads preserve receiver brands, ordered conversion, nullable values, and XLink distinction |
 | `authoritative_attribute_names_proof.html` | getAttributeNames copies ordered HTML/SVG names into fresh mutable snapshots, including current parsed-XLink local-name parity |
 | `authoritative_node_mutation_proof.html` | all four Element-backed Node mutations call Servo's production algorithms, preserve wrapper identity and live/static views, map DOMExceptions into V8, and leave a visible rendered Hello |
+| `authoritative_attribute_mutation_proof.html` | toggleAttribute/removeAttribute use Servo's production attribute machinery with exact optional-boolean conversion, V8-owned InvalidCharacterError, and cross-engine DOM visibility |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -531,7 +549,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 37 and remains experimental. The original
+The current exported C ABI is version 38 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

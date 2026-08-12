@@ -1,0 +1,172 @@
+<!doctype html>
+<!--
+Runtime proof for ABI v38's narrow Element attribute-mutation slice.
+
+The V8-authoritative script exercises toggleAttribute and removeAttribute
+against the real Servo Element methods. It pins the Element.prototype surface,
+WebIDL conversion order for DOMString/optional boolean arguments, the
+InvalidCharacterError result, live attribute state, and an unmarked
+SpiderMonkey observation of the same production DOM.
+
+setAttribute intentionally is not part of ABI v38: its Trusted Types union can
+invoke a SpiderMonkey default policy, which cannot safely cross this V8
+sidecar boundary yet.
+
+Run via support/v8/run_proofs.sh once ABI v38 is installed.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Element attribute mutation proof</title>
+    <style>#target, #svg { display: none; }</style>
+  </head>
+  <body bgcolor="red">
+    <div id="target" data-existing="yes"></div>
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg">
+      <g id="svg-target" viewBox="0 0 1 1"></g>
+    </svg>
+    <script data-servo-v8="authoritative">
+      const target = document.getElementById("target");
+      const elementPrototype = Object.getPrototypeOf(target);
+      const toggle = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "toggleAttribute",
+      );
+      const remove = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "removeAttribute",
+      );
+
+      for (const [name, descriptor, length] of [
+        ["toggleAttribute", toggle, 1],
+        ["removeAttribute", remove, 1],
+      ]) {
+        let wrongBrand = false;
+        let conversionTouched = false;
+        try {
+          descriptor.value.call({}, {
+            toString() {
+              conversionTouched = true;
+              return "unused";
+            },
+          });
+        } catch (error) {
+          wrongBrand = error instanceof TypeError;
+        }
+        if (
+          Object.hasOwn(target, name) || !descriptor ||
+          typeof descriptor.value !== "function" ||
+          descriptor.value.name !== name || descriptor.value.length !== length ||
+          !descriptor.writable || !descriptor.enumerable || !descriptor.configurable ||
+          !wrongBrand || conversionTouched
+        ) {
+          throw new Error("bad Element.prototype." + name + " surface");
+        }
+      }
+
+      // Missing required names must fail before a host callback. `undefined`
+      // is a supplied DOMString and therefore stringifies normally.
+      let missingName = false;
+      let symbolRejected = false;
+      try { toggle.value.call(target); } catch (error) {
+        missingName = error instanceof TypeError;
+      }
+      try { remove.value.call(target, Symbol("name")); } catch (error) {
+        symbolRejected = error instanceof TypeError;
+      }
+      if (!missingName || !symbolRejected) {
+        throw new Error("attribute methods did not use WebIDL DOMString conversion");
+      }
+
+      const conversionOrder = [];
+      const name = {
+        toString() {
+          conversionOrder.push("name");
+          return "data-converted";
+        },
+      };
+      // The optional boolean conversion does not invoke user code. Undefined
+      // means omitted; null is present and converts to false.
+      if (
+        target.toggleAttribute(name, undefined) !== true ||
+        conversionOrder.join(",") !== "name" ||
+        !target.hasAttribute("data-converted") ||
+        target.toggleAttribute("data-converted", null) !== false ||
+        target.hasAttribute("data-converted")
+      ) {
+        throw new Error("toggleAttribute optional boolean conversion is wrong");
+      }
+
+      if (
+        target.toggleAttribute("data-flag") !== true ||
+        target.getAttribute("data-flag") !== "" ||
+        target.toggleAttribute("data-flag", true) !== true ||
+        target.toggleAttribute("data-flag") !== false ||
+        target.hasAttribute("data-flag") ||
+        target.toggleAttribute("data-flag", false) !== false
+      ) {
+        throw new Error("toggleAttribute did not use Servo's attribute algorithm");
+      }
+
+      let invalidCharacter = false;
+      try { target.toggleAttribute(""); } catch (error) {
+        invalidCharacter = error instanceof DOMException &&
+          error.name === "InvalidCharacterError" && error.code === 5;
+      }
+      if (!invalidCharacter) {
+        throw new Error("toggleAttribute did not return InvalidCharacterError");
+      }
+
+      const removeOrder = [];
+      target.removeAttribute({
+        toString() {
+          removeOrder.push("remove");
+          return "DATA-EXISTING";
+        },
+      });
+      if (
+        removeOrder.join(",") !== "remove" ||
+        target.hasAttribute("data-existing") ||
+        target.removeAttribute("data-missing") !== undefined ||
+        target.hasAttribute("data-missing")
+      ) {
+        throw new Error("removeAttribute did not mutate the HTML attribute list");
+      }
+
+      // The HTML parser adjusts SVG's canonical `viewBox` spelling. SVG
+      // mutation itself does not use the HTML ASCII-lowercasing rule, so
+      // `viewBox` and `viewbox` remain two distinct local names.
+      const svgTarget = document.getElementById("svg-target");
+      if (
+        !svgTarget || !svgTarget.hasAttribute("viewBox") ||
+        svgTarget.hasAttribute("viewbox") ||
+        svgTarget.toggleAttribute("viewbox", true) !== true ||
+        svgTarget.getAttribute("viewBox") !== "0 0 1 1" ||
+        svgTarget.getAttribute("viewbox") !== "" ||
+        svgTarget.removeAttribute("viewBox") !== undefined ||
+        svgTarget.hasAttribute("viewBox") ||
+        !svgTarget.hasAttribute("viewbox") ||
+        svgTarget.removeAttribute("viewbox") !== undefined ||
+        svgTarget.hasAttribute("viewbox")
+      ) {
+        throw new Error("SVG attribute local-name casing was not preserved");
+      }
+
+      target.toggleAttribute("data-v8-attribute-proof", true);
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey observes exactly the DOM state modified by V8.
+      const target = document.getElementById("target");
+      const svgTarget = document.getElementById("svg-target");
+      if (
+        !target || !svgTarget || target.hasAttribute("data-existing") ||
+        !target.hasAttribute("data-v8-attribute-proof") ||
+        target.hasAttribute("data-flag") || target.hasAttribute("data-converted") ||
+        svgTarget.hasAttribute("viewBox") || svgTarget.hasAttribute("viewbox")
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>
