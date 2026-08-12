@@ -146,6 +146,21 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertEqual(tag_arguments[0].identifier.name, "qualifiedName")
         self.assertTrue(tag_arguments[0].type.isDOMString())
         self.assertEqual(set(tag_query._extendedAttrDict), set())
+        tag_ns_query = attributes[
+            production_webidl.DOCUMENT_GET_ELEMENTS_BY_TAG_NAME_NS
+        ]
+        tag_ns_return, tag_ns_arguments = tag_ns_query.signatures()[0]
+        self.assertEqual(tag_ns_return.name, "HTMLCollection")
+        self.assertFalse(tag_ns_return.nullable())
+        self.assertEqual(
+            [argument.identifier.name for argument in tag_ns_arguments],
+            ["namespace", "qualifiedName"],
+        )
+        self.assertTrue(tag_ns_arguments[0].type.nullable())
+        self.assertTrue(tag_ns_arguments[0].type.inner.isDOMString())
+        self.assertFalse(tag_ns_arguments[1].type.nullable())
+        self.assertTrue(tag_ns_arguments[1].type.isDOMString())
+        self.assertEqual(set(tag_ns_query._extendedAttrDict), set())
         method = attributes[production_webidl.DOCUMENT_GET_ELEMENT_BY_ID]
         return_type, arguments = method.signatures()[0]
         self.assertEqual(return_type.inner.name, "Element")
@@ -412,6 +427,19 @@ class ProductionElementTests(unittest.TestCase):
         self.assertEqual(tag_arguments[0].identifier.name, "localName")
         self.assertTrue(tag_arguments[0].type.isDOMString())
         self.assertEqual(set(tag_query._extendedAttrDict), set())
+        tag_ns_query = members[production_webidl.ELEMENT_GET_ELEMENTS_BY_TAG_NAME_NS]
+        tag_ns_return, tag_ns_arguments = tag_ns_query.signatures()[0]
+        self.assertEqual(tag_ns_return.name, "HTMLCollection")
+        self.assertFalse(tag_ns_return.nullable())
+        self.assertEqual(
+            [argument.identifier.name for argument in tag_ns_arguments],
+            ["namespace", "localName"],
+        )
+        self.assertTrue(tag_ns_arguments[0].type.nullable())
+        self.assertTrue(tag_ns_arguments[0].type.inner.isDOMString())
+        self.assertFalse(tag_ns_arguments[1].type.nullable())
+        self.assertTrue(tag_ns_arguments[1].type.isDOMString())
+        self.assertEqual(set(tag_ns_query._extendedAttrDict), set())
         query_all_return, query_all_arguments = members[
             production_webidl.ELEMENT_QUERY_SELECTOR_ALL
         ].signatures()[0]
@@ -1334,6 +1362,117 @@ class SyntheticSelectionTests(unittest.TestCase):
                 "HTMLCollection",
                 "localName",
             )
+
+    def assert_get_elements_by_tag_name_ns_rejected(
+        self,
+        interface_name: str,
+        second_argument_name: str,
+        declaration: str,
+        expected: str,
+    ) -> None:
+        qualified_name = f"{interface_name}.getElementsByTagNameNS"
+        parser_results = self.parse(
+            {
+                f"{interface_name}.webidl": f"""
+                    interface HTMLCollection {{}};
+                    interface {interface_name} {{ {declaration} }};
+                """,
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl.select_nullable_domstring_domstring_to_nonnullable_interface_operation(
+                parser_results,
+                qualified_name,
+                "HTMLCollection",
+                second_argument_name,
+            )
+
+    def test_selects_exact_document_and_element_get_elements_by_tag_name_ns(self) -> None:
+        for interface_name, second_argument_name in (
+            ("Document", "qualifiedName"),
+            ("Element", "localName"),
+        ):
+            with self.subTest(interface=interface_name):
+                parser_results = self.parse(
+                    {
+                        f"{interface_name}.webidl": f"""
+                            interface HTMLCollection {{}};
+                            interface {interface_name} {{
+                              HTMLCollection getElementsByTagNameNS(
+                                  DOMString? namespace,
+                                  DOMString {second_argument_name});
+                            }};
+                        """,
+                    }
+                )
+                method = production_webidl.select_nullable_domstring_domstring_to_nonnullable_interface_operation(
+                    parser_results,
+                    f"{interface_name}.getElementsByTagNameNS",
+                    "HTMLCollection",
+                    second_argument_name,
+                )
+                return_type, arguments = method.signatures()[0]
+                self.assertEqual(return_type.name, "HTMLCollection")
+                self.assertEqual(set(method._extendedAttrDict), set())
+                self.assertEqual(
+                    [argument.identifier.name for argument in arguments],
+                    ["namespace", second_argument_name],
+                )
+                self.assertTrue(arguments[0].type.nullable())
+                self.assertFalse(arguments[1].type.nullable())
+
+    def test_rejects_get_elements_by_tag_name_ns_shape_drift(self) -> None:
+        qualified_name = production_webidl.DOCUMENT_GET_ELEMENTS_BY_TAG_NAME_NS
+        cases = (
+            (
+                "[Pure] HTMLCollection getElementsByTagNameNS("
+                "DOMString? namespace, DOMString qualifiedName);",
+                f"`{qualified_name}` must carry no extended attributes, got ['Pure']",
+            ),
+            (
+                "HTMLCollection? getElementsByTagNameNS("
+                "DOMString? namespace, DOMString qualifiedName);",
+                f"`{qualified_name}` must return non-nullable `HTMLCollection`, "
+                "got `HTMLCollection?`",
+            ),
+            (
+                "HTMLCollection getElementsByTagNameNS("
+                "DOMString namespace, DOMString qualifiedName);",
+                f"`{qualified_name}` first argument must be required nullable "
+                "`DOMString? namespace`",
+            ),
+            (
+                "HTMLCollection getElementsByTagNameNS("
+                "DOMString? namespace, DOMString localName);",
+                f"`{qualified_name}` second argument must be required non-nullable "
+                "`DOMString qualifiedName`",
+            ),
+            (
+                "HTMLCollection getElementsByTagNameNS("
+                "DOMString? namespace, optional DOMString qualifiedName);",
+                f"`{qualified_name}` second argument must be required non-nullable "
+                "`DOMString qualifiedName`",
+            ),
+        )
+        for declaration, expected in cases:
+            with self.subTest(declaration=declaration):
+                self.assert_get_elements_by_tag_name_ns_rejected(
+                    "Document", "qualifiedName", declaration, expected
+                )
+
+    def test_rejects_element_get_elements_by_tag_name_ns_name_drift(self) -> None:
+        qualified_name = production_webidl.ELEMENT_GET_ELEMENTS_BY_TAG_NAME_NS
+        self.assert_get_elements_by_tag_name_ns_rejected(
+            "Element",
+            "localName",
+            "HTMLCollection getElementsByTagNameNS("
+            "DOMString? namespace, DOMString qualifiedName);",
+            f"`{qualified_name}` second argument must be required non-nullable "
+            "`DOMString localName`",
+        )
 
     def assert_get_element_by_id_rejected(self, declaration: str, expected: str) -> None:
         parser_results = self.parse(

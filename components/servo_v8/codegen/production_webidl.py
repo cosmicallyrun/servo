@@ -53,6 +53,7 @@ NODE_REPLACE_CHILD = "Node.replaceChild"
 NODE_REMOVE_CHILD = "Node.removeChild"
 DOCUMENT_DOCUMENT_ELEMENT = "Document.documentElement"
 DOCUMENT_GET_ELEMENTS_BY_TAG_NAME = "Document.getElementsByTagName"
+DOCUMENT_GET_ELEMENTS_BY_TAG_NAME_NS = "Document.getElementsByTagNameNS"
 DOCUMENT_GET_ELEMENTS_BY_CLASS_NAME = "Document.getElementsByClassName"
 DOCUMENT_HEAD = "Document.head"
 DOCUMENT_CHILDREN = "Document.children"
@@ -99,6 +100,7 @@ ELEMENT_CLOSEST = "Element.closest"
 ELEMENT_MATCHES = "Element.matches"
 ELEMENT_WEBKIT_MATCHES_SELECTOR = "Element.webkitMatchesSelector"
 ELEMENT_GET_ELEMENTS_BY_TAG_NAME = "Element.getElementsByTagName"
+ELEMENT_GET_ELEMENTS_BY_TAG_NAME_NS = "Element.getElementsByTagNameNS"
 ELEMENT_GET_ELEMENTS_BY_CLASS_NAME = "Element.getElementsByClassName"
 ELEMENT_QUERY_SELECTOR_ALL = "Element.querySelectorAll"
 ELEMENT_REMOVE = "Element.remove"
@@ -122,6 +124,9 @@ READONLY_NULLABLE_INTERFACE = "readonly nullable interface"
 PURE_READONLY_NULLABLE_INTERFACE = "Pure readonly nullable interface"
 SAMEOBJECT_READONLY_INTERFACE = "SameObject readonly interface"
 DOMSTRING_TO_NONNULLABLE_INTERFACE = "operation DOMString -> non-nullable interface"
+NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE = (
+    "operation nullable DOMString, DOMString -> non-nullable interface"
+)
 PURE_DOMSTRING_TO_NULLABLE_INTERFACE = "Pure operation DOMString -> nullable interface"
 PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE = (
     "Pure Throws operation DOMString -> nullable interface"
@@ -223,6 +228,12 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     DocumentHostMember(
         DOCUMENT_GET_ELEMENTS_BY_TAG_NAME,
         DOMSTRING_TO_NONNULLABLE_INTERFACE,
+        "HTMLCollection",
+        expected_argument_name="qualifiedName",
+    ),
+    DocumentHostMember(
+        DOCUMENT_GET_ELEMENTS_BY_TAG_NAME_NS,
+        NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE,
         "HTMLCollection",
         expected_argument_name="qualifiedName",
     ),
@@ -338,6 +349,7 @@ ELEMENT_HOST = (
     ELEMENT_MATCHES,
     ELEMENT_WEBKIT_MATCHES_SELECTOR,
     ELEMENT_GET_ELEMENTS_BY_TAG_NAME,
+    ELEMENT_GET_ELEMENTS_BY_TAG_NAME_NS,
     ELEMENT_GET_ELEMENTS_BY_CLASS_NAME,
     ELEMENT_QUERY_SELECTOR_ALL,
     ELEMENT_REMOVE,
@@ -784,6 +796,101 @@ def select_domstring_to_nonnullable_interface_operation(
             "attributes that are not implemented: "
             + ", ".join(sorted(argument_attributes))
         )
+    return member
+
+
+def select_nullable_domstring_domstring_to_nonnullable_interface_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+    expected_interface: str,
+    expected_second_argument_name: str,
+) -> WebIDL.IDLMethod:
+    """Select an ordinary collection operation with the exact namespace pair."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{interface_name}`, found {len(interfaces)}"
+        )
+    members = [
+        member
+        for member in interfaces[0].members
+        if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+    member = members[0]
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must be an ordinary instance operation"
+        )
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry no extended attributes, "
+            f"got {sorted(actual_attributes)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if (
+        return_type.nullable()
+        or not return_type.isInterface()
+        or return_type.name != expected_interface
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `{expected_interface}`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if len(arguments) != 2:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly two arguments, found {len(arguments)}"
+        )
+    namespace, name = arguments
+    if (
+        namespace.identifier.name != "namespace"
+        or namespace.optional
+        or namespace.variadic
+        or namespace.defaultValue is not None
+        or not namespace.type.nullable()
+        or not namespace.type.inner.isDOMString()
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` first argument must be required nullable "
+            "`DOMString? namespace`"
+        )
+    if (
+        name.identifier.name != expected_second_argument_name
+        or name.optional
+        or name.variadic
+        or name.defaultValue is not None
+        or name.type.nullable()
+        or not name.type.isDOMString()
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` second argument must be required non-nullable "
+            f"`DOMString {expected_second_argument_name}`"
+        )
+    for argument in arguments:
+        argument_attributes = set(argument._extendedAttrDict) | set(
+            argument.type._extendedAttrDict
+        )
+        if argument_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` argument `{argument.identifier.name}` carries extended "
+                "attributes that are not implemented: "
+                + ", ".join(sorted(argument_attributes))
+            )
     return member
 
 
@@ -1432,6 +1539,13 @@ def _select_element_host_member(
             qualified_name,
             "HTMLCollection",
             expected_argument_name,
+        )
+    if member_name == "getElementsByTagNameNS":
+        return select_nullable_domstring_domstring_to_nonnullable_interface_operation(
+            parser_results,
+            qualified_name,
+            "HTMLCollection",
+            "localName",
         )
     if member_name == "querySelectorAll":
         return select_newobject_throws_domstring_to_interface_operation(
@@ -2173,6 +2287,7 @@ def _select_document_host_member(
         PURE_READONLY_NULLABLE_INTERFACE,
         SAMEOBJECT_READONLY_INTERFACE,
         DOMSTRING_TO_NONNULLABLE_INTERFACE,
+        NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE,
         PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
         PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
         NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
@@ -2210,6 +2325,23 @@ def _select_document_host_member(
                     f"`{member.qualified_name}` collection shape must pin its argument name"
                 )
             return select_domstring_to_nonnullable_interface_operation(
+                parser_results,
+                member.qualified_name,
+                member.expected_interface,
+                member.expected_argument_name,
+            )
+        if member.shape == NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE:
+            if member.expected_interface != "HTMLCollection":
+                raise WebIDLSelectionError(
+                    f"`{member.qualified_name}` namespace collection shape must return "
+                    "`HTMLCollection`"
+                )
+            if member.expected_argument_name is None:
+                raise WebIDLSelectionError(
+                    f"`{member.qualified_name}` namespace collection shape must pin "
+                    "its second argument name"
+                )
+            return select_nullable_domstring_domstring_to_nonnullable_interface_operation(
                 parser_results,
                 member.qualified_name,
                 member.expected_interface,

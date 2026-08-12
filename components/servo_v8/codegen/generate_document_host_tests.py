@@ -53,6 +53,10 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_elements_by_tag_name)(void* native,",
             "const uint8_t* qualified_name,",
             "size_t qualified_name_length,",
+            "uint8_t (*get_elements_by_tag_name_ns)(void* native,",
+            "uint8_t namespace_is_null,",
+            "const uint8_t* namespace_,",
+            "size_t namespace_length,",
             "uint8_t (*get_elements_by_class_name)(void* native,",
             "const uint8_t* class_names,",
             "size_t class_names_length,",
@@ -95,6 +99,9 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "fn head(&self) -> Option<InterfaceHandle>;",
             "fn children(&self) -> HTMLCollectionHandle;",
             "fn get_elements_by_tag_name(&self, qualified_name: &str) -> HTMLCollectionHandle;",
+            "fn get_elements_by_tag_name_ns(",
+            "namespace: Option<&str>,",
+            "qualified_name: &str,",
             "fn get_elements_by_class_name(&self, class_names: &str) -> HTMLCollectionHandle;",
             "pub struct RawHTMLCollectionValue {",
             "output: *mut RawHTMLCollectionValue,",
@@ -119,6 +126,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "set_title: Some(document_host_set_title::<T>)",
             "get_element_by_id: Some(document_host_get_element_by_id::<T>)",
             "get_elements_by_tag_name: Some(document_host_get_elements_by_tag_name::<T>)",
+            "get_elements_by_tag_name_ns: Some(document_host_get_elements_by_tag_name_ns::<T>)",
             "get_elements_by_class_name: Some(document_host_get_elements_by_class_name::<T>)",
             "query_selector: Some(document_host_query_selector::<T>)",
             "query_selector_all: Some(document_host_query_selector_all::<T>)",
@@ -146,6 +154,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "DocumentHostGetHead(",
             "DocumentHostGetChildren(",
             "DocumentHostCallGetElementsByTagName(",
+            "DocumentHostCallGetElementsByTagNameNs(",
             "DocumentHostCallGetElementsByClassName(",
             "ServoV8HTMLCollectionValue value{};",
             "!realm->runtime->html_collection_host_installed",
@@ -167,6 +176,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "value.is_null > 1",
             "Document.getElementById requires one argument",
             "Document.getElementsByTagName requires one argument",
+            "Document.getElementsByTagNameNS requires two arguments",
             "Document.getElementsByClassName requires one argument",
             "DropUnownedNodeListHost(state->runtime, outcome.native);",
             "ReturnSelectorNodeListOutcome(realm, context, outcome, \"Document.querySelectorAll\"",
@@ -322,6 +332,58 @@ class DocumentHostGenerationTests(unittest.TestCase):
         self.assertIn("WrapperForHTMLCollectionValue", cpp_callback)
         self.assertIn("DropUnownedHTMLCollectionHost", cpp_callback)
 
+    def test_generates_namespace_collection_conversion_and_thunk_validation(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        rust_trait = rust.split(
+            "pub unsafe trait DocumentHostBinding: Sized + 'static {", 1
+        )[1].split("\n}", 1)[0]
+        rust_thunk = rust.split(
+            'unsafe extern "C" fn document_host_get_elements_by_tag_name_ns', 1
+        )[1].split("\n}", 1)[0]
+        cpp_callback = cpp.split(
+            "void DocumentHostCallGetElementsByTagNameNs(", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn("fn get_elements_by_tag_name_ns(", rust_trait)
+        self.assertIn("namespace: Option<&str>", rust_trait)
+        self.assertIn("qualified_name: &str", rust_trait)
+        self.assertNotIn("host_context", rust_thunk)
+        for fragment in (
+            "namespace_is_null > 1",
+            "namespace_is_null == 1 && (!namespace_.is_null() || namespace_length != 0)",
+            "namespace_is_null == 0 && namespace_.is_null() && namespace_length != 0",
+            "qualified_name.is_null() && qualified_name_length != 0",
+            "std::str::from_utf8(bytes)",
+            "std::str::from_utf8(qualified_name_bytes)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, rust_thunk)
+
+        ordered_fragments = (
+            "if (!state || !state->native || !state->vtable.get_elements_by_tag_name_ns)",
+            "html_collection_host_installed",
+            "if (info.Length() < 2)",
+            "info[0]->IsNullOrUndefined()",
+            "info[0]->ToString(context)",
+            "info[1]->ToString(context)",
+            "v8::String::Utf8Value namespace_utf8",
+            "RustCallbackScope callback_scope",
+        )
+        positions = [cpp_callback.index(fragment) for fragment in ordered_fragments]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("active_host_context", cpp_callback)
+        self.assertIn("namespace_is_null ? 1 : 0", cpp_callback)
+        self.assertIn("namespace_is_null\n            ? nullptr", cpp_callback)
+        self.assertIn("DropUnownedHTMLCollectionHost", cpp_callback)
+        self.assertIn("WrapperForHTMLCollectionValue", cpp_callback)
+
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallGetElementsByTagNameNs,", 1
+        )[1].split(".ToLocal", 1)[0]
+        self.assertIn("v8::Local<v8::Data>(), 2,", install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", install)
+
     def test_generates_distinct_ordinary_and_legacy_null_conversion(self) -> None:
         output = self.outputs[generate_document_host.CPP_NAME]
         bg_color_setter = output.split("void DocumentHostSetBgColor(", 1)[1].split(
@@ -353,6 +415,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
                 slot = generate.snake_case(member_name)
                 operation_shapes = {
                     production_webidl.DOMSTRING_TO_NONNULLABLE_INTERFACE,
+                    production_webidl.NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE,
                     production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
@@ -372,6 +435,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             with self.subTest(member=member.qualified_name):
                 if member.shape in {
                     production_webidl.DOMSTRING_TO_NONNULLABLE_INTERFACE,
+                    production_webidl.NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE,
                     production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,

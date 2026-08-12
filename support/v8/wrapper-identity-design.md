@@ -24,6 +24,9 @@ sequence snapshots use no wrapper-cache entry.
 ABI version 36 adds fresh live `Document.getElementsByTagName` and
 `Element.getElementsByTagName` HTMLCollections, reusing the per-call collection
 identity and Element item cache introduced at ABI version 29.
+ABI version 40 adds the namespace/local-name variants for both receivers; they
+reuse the same collection lifetime and item cache with a distinct exact-match
+filter.
 `Document.documentElement`, `Document.head`, `Document.getElementById()`, the
 Element/Node scalar slices, Element removal, and ParentNode traversal are built
 on it.
@@ -161,8 +164,9 @@ identifies the object it was created for.
 
 The manifest carries `Document.documentElement`, `Document.head`, the
 ParentNode children/first/last/count getters, `Document.getElementById`, and
-`Document.getElementsByClassName` and `Document.getElementsByTagName` like any
-other members, while separately gating the exact matching Element declarations.
+`Document.getElementsByClassName`, `Document.getElementsByTagName`, and
+`Document.getElementsByTagNameNS` like any other members, while separately
+gating the exact matching Element declarations.
 It pins their
 declared interfaces (`Element`, `HTMLHeadElement`, and `HTMLCollection`). The
 Document generator emits its ABI slot, Rust trait method, thunk, checked C++
@@ -172,8 +176,10 @@ Interface attributes use the `readonly nullable interface` shape; `children`
 uses an exact `[SameObject]` non-nullable `HTMLCollection` shape; ParentNode's
 two interface getters additionally require exact `[Pure]`, its count uses a
 32-bit unsigned shape, and `getElementById` pins one required DOMString argument
-and `[Pure]`. The class-name and tag-name operations pin one required DOMString
-argument, a non-nullable `HTMLCollection` result, and no extended attributes.
+and `[Pure]`. The class-name and qualified tag-name operations pin one required
+DOMString argument; namespace tag-name operations pin a nullable DOMString
+namespace followed by one required DOMString local name. All return a
+non-nullable `HTMLCollection` and carry no extended attributes.
 WebIDL drift
 in any declared return type remains a build failure rather than silent type
 erasure.
@@ -201,8 +207,9 @@ representing different JavaScript objects. The collection cell holds a
 callback. Cache hits discard the speculative host; major-GC pruning and realm
 teardown walk both maps and release both kinds of roots.
 
-`Document.getElementsByClassName`, `Element.getElementsByClassName`, and the two
-`getElementsByTagName` operations are live but not `[SameObject]`. This
+`Document.getElementsByClassName`, `Element.getElementsByClassName`, and the
+qualified-name and namespace/local-name `getElementsByTagName` operations are
+live but not `[SameObject]`. This
 implementation returns a fresh collection wrapper for every call, which the
 DOM Standard permits, and uses the collection host's own native address as a
 unique cache key. Keying only on the receiver would incorrectly alias
@@ -212,6 +219,14 @@ reused, the old weak entry is already cleared and lookup erases it before
 installing the new wrapper. Items still enter the ordinary Element cache, so
 collection access, selectors, and `getElementById` converge on one wrapper for
 each underlying Element.
+
+ABI v40's namespace filter stores the normalized namespace and local name on
+that per-call host. Collection reads share Servo's production predicate:
+namespace `*` and local-name `*` are independent wildcards, null and the empty
+string denote the empty namespace, and all non-wildcard comparisons are exact
+and case-sensitive. Keeping this predicate in the production
+`HTMLCollection` module prevents the V8 facade from drifting on SVG, MathML,
+custom namespaces, or HTML case behavior.
 
 ## Borrowed Node mutation inputs
 
@@ -309,6 +324,8 @@ still clears the cache synchronously and releases live Servo hosts first.
 `authoritative_query_selector_all_proof.html`, and
 `authoritative_children_collection_proof.html`, and
 `authoritative_get_elements_by_class_name_proof.html`, and
+`authoritative_get_elements_by_tag_name_proof.html`, and
+`authoritative_get_elements_by_tag_name_ns_proof.html`, and
 `authoritative_element_remove_proof.html`, and
 `authoritative_element_sibling_proof.html`, and
 `authoritative_element_namespace_proof.html`, and

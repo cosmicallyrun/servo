@@ -1460,6 +1460,215 @@ def _domstring_to_nonnullable_interface_cpp_vtable_terms(
     return [f"vtable.{_rust_member_name(member.attribute)}"]
 
 
+def _namespace_collection_arguments(
+    member: Member,
+) -> tuple[WebIDL.IDLArgument, WebIDL.IDLArgument]:
+    _, arguments = member.attribute.signatures()[0]
+    return arguments[0], arguments[1]
+
+
+def _namespace_collection_header_slots(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    _, second = _namespace_collection_arguments(member)
+    second_name = _rust_member_name(second)
+    return [
+        f"  uint8_t (*{name})(void* native,",
+        f"{C_SIGNATURE_INDENT}uint8_t namespace_is_null,",
+        f"{C_SIGNATURE_INDENT}const uint8_t* namespace_,",
+        f"{C_SIGNATURE_INDENT}size_t namespace_length,",
+        f"{C_SIGNATURE_INDENT}const uint8_t* {second_name},",
+        f"{C_SIGNATURE_INDENT}size_t {second_name}_length,",
+        f"{C_SIGNATURE_INDENT}ServoV8HTMLCollectionValue* output);",
+    ]
+
+
+def _namespace_collection_rust_trait_members(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    _, second = _namespace_collection_arguments(member)
+    second_name = _rust_member_name(second)
+    return [
+        "    /// Returns a fresh live collection for one namespace/local-name query.",
+        f"    fn {name}(",
+        "        &self,",
+        "        namespace: Option<&str>,",
+        f"        {second_name}: &str,",
+        "    ) -> HTMLCollectionHandle;",
+    ]
+
+
+def _namespace_collection_rust_vtable_fields(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"    pub {name}: Option<",
+        "        unsafe extern \"C\" fn(",
+        "            *mut c_void,",
+        "            u8,",
+        "            *const u8,",
+        "            usize,",
+        "            *const u8,",
+        "            usize,",
+        "            *mut RawHTMLCollectionValue,",
+        "        ) -> u8,",
+        "    >,",
+    ]
+
+
+def _namespace_collection_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    _, second = _namespace_collection_arguments(member)
+    second_name = _rust_member_name(second)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{name}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    namespace_is_null: u8,",
+            "    namespace_: *const u8,",
+            "    namespace_length: usize,",
+            f"    {second_name}: *const u8,",
+            f"    {second_name}_length: usize,",
+            "    output: *mut RawHTMLCollectionValue,",
+            ") -> u8 {",
+            "    if native.is_null() || output.is_null() || namespace_is_null > 1 ||",
+            "        (namespace_is_null == 1 && (!namespace_.is_null() || namespace_length != 0)) ||",
+            "        (namespace_is_null == 0 && namespace_.is_null() && namespace_length != 0) ||",
+            f"        ({second_name}.is_null() && {second_name}_length != 0)",
+            "    {",
+            "        return 0;",
+            "    }",
+            "    let namespace = if namespace_is_null == 1 {",
+            "        None",
+            "    } else {",
+            "        let bytes = if namespace_length == 0 {",
+            "            &[]",
+            "        } else {",
+            "            // SAFETY: The ABI contract lends this byte range for the callback.",
+            "            unsafe { std::slice::from_raw_parts(namespace_, namespace_length) }",
+            "        };",
+            "        let Ok(namespace) = std::str::from_utf8(bytes) else {",
+            "            return 0;",
+            "        };",
+            "        Some(namespace)",
+            "    };",
+            f"    let {second_name}_bytes = if {second_name}_length == 0 {{",
+            "        &[]",
+            "    } else {",
+            "        // SAFETY: The ABI contract lends this byte range for the callback.",
+            f"        unsafe {{ std::slice::from_raw_parts({second_name}, {second_name}_length) }}",
+            "    };",
+            f"    let Ok({second_name}) = std::str::from_utf8({second_name}_bytes) else {{",
+            "        return 0;",
+            "    };",
+            "    // SAFETY: The vtable contract supplies this exact live Box<T>.",
+            f"    let handle = unsafe {{ &*native.cast::<T>() }}.{name}(namespace, {second_name});",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe {",
+            "        *output = RawHTMLCollectionValue {",
+            "            key: handle.key,",
+            "            native: handle.native,",
+            "        };",
+            "    }",
+            "    1",
+            "}",
+        ],
+    )
+
+
+def _namespace_collection_rust_vtable_init(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [f"            {name}: Some(document_host_{name}::<T>),"]
+
+
+def _namespace_collection_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    callback = _cpp_member_name(member.attribute)
+    _, second = _namespace_collection_arguments(member)
+    second_name = _rust_member_name(second)
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostCall{callback}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{name}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->html_collection_host_installed ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->html_collection_template.IsEmpty() ||",
+            "      realm->element_template.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "HTMLCollection host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  if (info.Length() < 2) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} requires two arguments");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            "  const bool namespace_is_null = info[0]->IsNullOrUndefined();",
+            "  v8::Local<v8::String> namespace_value;",
+            "  if (namespace_is_null) {",
+            "    namespace_value = v8::String::Empty(isolate);",
+            "  } else if (!info[0]->ToString(context).ToLocal(&namespace_value)) {",
+            "    return;",
+            "  }",
+            f"  v8::Local<v8::String> {second_name}_value;",
+            f"  if (!info[1]->ToString(context).ToLocal(&{second_name}_value)) return;",
+            "  v8::String::Utf8Value namespace_utf8(isolate, namespace_value);",
+            f"  v8::String::Utf8Value {second_name}_utf8(isolate, {second_name}_value);",
+            "  if ((!*namespace_utf8 && namespace_utf8.length() != 0) ||",
+            f"      (!*{second_name}_utf8 && {second_name}_utf8.length() != 0)) {{",
+            f'    ThrowTypeError(isolate, "{qualified_name} argument conversion failed");',
+            "    return;",
+            "  }",
+            "  ServoV8HTMLCollectionValue value{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{name}(",
+            "        state->native, namespace_is_null ? 1 : 0,",
+            "        namespace_is_null",
+            "            ? nullptr",
+            "            : reinterpret_cast<const uint8_t*>(*namespace_utf8),",
+            "        namespace_is_null ? 0 : static_cast<size_t>(namespace_utf8.length()),",
+            f"        reinterpret_cast<const uint8_t*>(*{second_name}_utf8),",
+            f"        static_cast<size_t>({second_name}_utf8.length()), &value) != 0;",
+            "  }",
+            "  if (!succeeded) {",
+            "    DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            f'    ThrowTypeError(isolate, "{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            "  if (!value.key || !value.native) {",
+            "    DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            f'    ThrowTypeError(isolate, "invalid {qualified_name} interface result");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Object> wrapper =",
+            "      WrapperForHTMLCollectionValue(realm, context, value);",
+            "  if (wrapper.IsEmpty()) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} wrapper could not be created");',
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(wrapper);",
+            "}",
+        ],
+    )
+
+
+def _namespace_collection_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_rust_member_name(member.attribute)}"]
+
+
 # This operation has the same nullable Element result contract as the
 # interface-valued attributes above, but it also converts one JavaScript value
 # to DOMString and passes the embedding's ephemeral JSContext through to Servo.
@@ -2583,6 +2792,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(),
         cpp_bodies=_domstring_to_nonnullable_interface_cpp_bodies,
         cpp_vtable_terms=_domstring_to_nonnullable_interface_cpp_vtable_terms,
+    ),
+    production_webidl.NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE: ShapeEmitter(
+        header_type_blocks=(_HTML_COLLECTION_C_TYPE,),
+        header_slots=_namespace_collection_header_slots,
+        rust_type_blocks=(_HTML_COLLECTION_RUST_TYPE,),
+        rust_trait_members=_namespace_collection_rust_trait_members,
+        rust_vtable_fields=_namespace_collection_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_namespace_collection_rust_thunks,
+        rust_vtable_init=_namespace_collection_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_namespace_collection_cpp_bodies,
+        cpp_vtable_terms=_namespace_collection_cpp_vtable_terms,
     ),
     production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE: ShapeEmitter(
         header_type_blocks=(),

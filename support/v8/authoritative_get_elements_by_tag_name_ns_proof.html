@@ -1,0 +1,308 @@
+<!doctype html>
+<!--
+Runtime proof for Document/Element getElementsByTagNameNS() and their fresh,
+live HTMLCollection hosts. It pins Web IDL branding, arity and ordered string
+conversion; exact namespace/local-name wildcard matching; scope, case,
+identity and liveness; and observation of the V8 mutations by SpiderMonkey.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative getElementsByTagNameNS proof</title>
+    <style>
+      .fixture { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="scope" class="fixture">
+      <article id="first" name="named-first">
+        first
+        <span id="nested">nested</span>
+      </article>
+      <svg id="graphic" xmlns="http://www.w3.org/2000/svg">
+        <circle id="first-circle"></circle>
+      </svg>
+      <math id="math-root" xmlns="http://www.w3.org/1998/Math/MathML">
+        <mi id="math-item">x</mi>
+      </math>
+    </section>
+    <div id="outside" class="fixture">
+      <svg xmlns="http://www.w3.org/2000/svg">
+        <circle id="late-circle"></circle>
+      </svg>
+    </div>
+    <script>
+      // Build namespace/case combinations that the HTML parser cannot express.
+      const nativeScopeForSetup = document.getElementById("scope");
+      const customUpper = document.createElementNS("urn:servo:v40", "p:MiXeD");
+      customUpper.id = "custom-upper";
+      nativeScopeForSetup.appendChild(customUpper);
+      const customLower = document.createElementNS("urn:servo:v40", "mixed");
+      customLower.id = "custom-lower";
+      nativeScopeForSetup.appendChild(customLower);
+      const noNamespace = document.createElementNS(null, "plain");
+      noNamespace.id = "no-namespace";
+      nativeScopeForSetup.appendChild(noNamespace);
+    </script>
+    <script data-servo-v8="authoritative">
+      const HTML_NS = "http://www.w3.org/1999/xhtml";
+      const SVG_NS = "http://www.w3.org/2000/svg";
+      const MATH_NS = "http://www.w3.org/1998/Math/MathML";
+      const CUSTOM_NS = "urn:servo:v40";
+      const scope = document.querySelector("#scope");
+      const first = document.querySelector("#first");
+      const graphic = document.querySelector("#graphic");
+      const firstCircle = document.querySelector("#first-circle");
+      const lateCircle = document.querySelector("#late-circle");
+      const customUpper = document.querySelector("#custom-upper");
+      const customLower = document.querySelector("#custom-lower");
+      const noNamespace = document.querySelector("#no-namespace");
+
+      const documentDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document),
+        "getElementsByTagNameNS",
+      );
+      const elementDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(scope),
+        "getElementsByTagNameNS",
+      );
+      for (const [receiver, descriptor] of [
+        [document, documentDescriptor],
+        [scope, elementDescriptor],
+      ]) {
+        if (
+          !descriptor ||
+          typeof descriptor.value !== "function" ||
+          descriptor.value.name !== "getElementsByTagNameNS" ||
+          descriptor.value.length !== 2 ||
+          !descriptor.writable ||
+          !descriptor.enumerable ||
+          !descriptor.configurable ||
+          Object.hasOwn(receiver, "getElementsByTagNameNS")
+        ) {
+          throw new Error("bad getElementsByTagNameNS method descriptor");
+        }
+      }
+
+      let wrongBrandConversions = 0;
+      for (const descriptor of [documentDescriptor, elementDescriptor]) {
+        let rejected = false;
+        try {
+          descriptor.value.call(
+            {},
+            { toString() { wrongBrandConversions++; return "*"; } },
+            { toString() { wrongBrandConversions++; return "*"; } },
+          );
+        } catch (error) {
+          rejected = error instanceof TypeError;
+        }
+        if (!rejected) {
+          throw new Error("getElementsByTagNameNS accepted the wrong receiver");
+        }
+      }
+      if (wrongBrandConversions !== 0) {
+        throw new Error("getElementsByTagNameNS converted before its brand check");
+      }
+
+      const namespaceError = new Error("namespace conversion sentinel");
+      const localNameError = new Error("local-name conversion sentinel");
+      for (const receiver of [document, scope]) {
+        let arityConversions = 0;
+        let missingRejected = false;
+        let oneArgumentRejected = false;
+        let namespaceSymbolRejected = false;
+        let localNameSymbolRejected = false;
+        try {
+          receiver.getElementsByTagNameNS();
+        } catch (error) {
+          missingRejected = error instanceof TypeError;
+        }
+        try {
+          receiver.getElementsByTagNameNS({
+            toString() { arityConversions++; return SVG_NS; },
+          });
+        } catch (error) {
+          oneArgumentRejected = error instanceof TypeError;
+        }
+        try {
+          receiver.getElementsByTagNameNS(Symbol("namespace"), "circle");
+        } catch (error) {
+          namespaceSymbolRejected = error instanceof TypeError;
+        }
+        try {
+          receiver.getElementsByTagNameNS(SVG_NS, Symbol("circle"));
+        } catch (error) {
+          localNameSymbolRejected = error instanceof TypeError;
+        }
+
+        const conversionOrder = [];
+        const converted = receiver.getElementsByTagNameNS(
+          {
+            toString() {
+              conversionOrder.push("namespace");
+              return SVG_NS;
+            },
+          },
+          {
+            toString() {
+              conversionOrder.push("localName");
+              return "circle";
+            },
+          },
+        );
+
+        let laterConversionRan = false;
+        let namespaceThrowPreserved = false;
+        try {
+          receiver.getElementsByTagNameNS(
+            { toString() { throw namespaceError; } },
+            { toString() { laterConversionRan = true; return "circle"; } },
+          );
+        } catch (error) {
+          namespaceThrowPreserved = error === namespaceError;
+        }
+
+        let firstConversionRan = false;
+        let localNameThrowPreserved = false;
+        try {
+          receiver.getElementsByTagNameNS(
+            { toString() { firstConversionRan = true; return SVG_NS; } },
+            { toString() { throw localNameError; } },
+          );
+        } catch (error) {
+          localNameThrowPreserved = error === localNameError;
+        }
+
+        if (
+          !missingRejected ||
+          !oneArgumentRejected ||
+          arityConversions !== 0 ||
+          !namespaceSymbolRejected ||
+          !localNameSymbolRejected ||
+          conversionOrder.join(",") !== "namespace,localName" ||
+          !(converted instanceof HTMLCollection) ||
+          !namespaceThrowPreserved ||
+          laterConversionRan ||
+          !firstConversionRan ||
+          !localNameThrowPreserved
+        ) {
+          throw new Error("bad getElementsByTagNameNS Web IDL conversion");
+        }
+      }
+
+      const documentCircles = document.getElementsByTagNameNS(SVG_NS, "circle");
+      const scopedCircles = scope.getElementsByTagNameNS(SVG_NS, "circle");
+      const scopedSvg = scope.getElementsByTagNameNS(SVG_NS, "*");
+      const scopedAll = scope.getElementsByTagNameNS("*", "*");
+      const customAll = scope.getElementsByTagNameNS(CUSTOM_NS, "*");
+      const nullNamespace = scope.getElementsByTagNameNS(null, "plain");
+      const undefinedNamespace = scope.getElementsByTagNameNS(undefined, "plain");
+      const emptyNamespace = scope.getElementsByTagNameNS("", "plain");
+
+      if (
+        !(documentCircles instanceof HTMLCollection) ||
+        !(scopedCircles instanceof HTMLCollection) ||
+        documentCircles === document.getElementsByTagNameNS(SVG_NS, "circle") ||
+        scopedCircles === scope.getElementsByTagNameNS(SVG_NS, "circle") ||
+        documentCircles === scopedCircles ||
+        scopedCircles === scope.children ||
+        scopedCircles === scope.getElementsByTagName("circle") ||
+        documentCircles.length !== 2 ||
+        documentCircles[0] !== firstCircle ||
+        documentCircles[1] !== lateCircle ||
+        scopedCircles.length !== 1 ||
+        scopedCircles[0] !== firstCircle ||
+        scopedCircles.item(0) !== firstCircle ||
+        scopedCircles[1] !== undefined ||
+        scopedCircles.item(1) !== null ||
+        scopedCircles["first-circle"] !== firstCircle ||
+        scopedCircles.namedItem("first-circle") !== firstCircle ||
+        scopedSvg.length !== 2 ||
+        scopedSvg[0] !== graphic ||
+        scopedSvg[1] !== firstCircle ||
+        scope.getElementsByTagNameNS("*", "circle")[0] !== firstCircle ||
+        scope.getElementsByTagNameNS(HTML_NS, "article")[0] !== first ||
+        scope.getElementsByTagNameNS(HTML_NS, "ARTICLE").length !== 0 ||
+        scope.getElementsByTagNameNS(HTML_NS, "section").length !== 0 ||
+        document.getElementsByTagNameNS(HTML_NS, "section")[0] !== scope ||
+        scope.getElementsByTagNameNS(MATH_NS, "*").length !== 2 ||
+        customAll.length !== 2 ||
+        customAll[0] !== customUpper ||
+        customAll[1] !== customLower ||
+        scope.getElementsByTagNameNS(CUSTOM_NS, "MiXeD")[0] !== customUpper ||
+        scope.getElementsByTagNameNS(CUSTOM_NS, "mixed")[0] !== customLower ||
+        scope.getElementsByTagNameNS(CUSTOM_NS, "p:MiXeD").length !== 0 ||
+        nullNamespace.length !== 1 ||
+        nullNamespace[0] !== noNamespace ||
+        undefinedNamespace.length !== 1 ||
+        undefinedNamespace[0] !== noNamespace ||
+        emptyNamespace.length !== 1 ||
+        emptyNamespace[0] !== noNamespace ||
+        scope.getElementsByTagNameNS("*", "plain")[0] !== noNamespace ||
+        scope.getElementsByTagNameNS("**", "*").length !== 0 ||
+        scope.getElementsByTagNameNS("*", "**").length !== 0 ||
+        scopedAll.length !== 9
+      ) {
+        throw new Error("bad namespace collection scope, wildcard, order, or case matching");
+      }
+
+      firstCircle.namespaceMarker = 40;
+      if (
+        document.getElementById("first-circle") !== firstCircle ||
+        scope.querySelector("#first-circle").namespaceMarker !== 40 ||
+        documentCircles[0] !== firstCircle
+      ) {
+        throw new Error("namespace collection items missed the Element wrapper cache");
+      }
+
+      scope.appendChild(lateCircle);
+      if (
+        scopedCircles.length !== 2 ||
+        scopedCircles[0] !== firstCircle ||
+        scopedCircles[1] !== lateCircle ||
+        scopedSvg.length !== 3 ||
+        scopedSvg[2] !== lateCircle ||
+        scopedAll.length !== 10 ||
+        documentCircles.length !== 2
+      ) {
+        throw new Error("namespace collections were not live after insertion");
+      }
+
+      firstCircle.remove();
+      if (
+        scopedCircles.length !== 1 ||
+        scopedCircles[0] !== lateCircle ||
+        scopedCircles["first-circle"] !== undefined ||
+        scopedCircles.namedItem("first-circle") !== null ||
+        scopedSvg.length !== 2 ||
+        scopedSvg[0] !== graphic ||
+        scopedSvg[1] !== lateCircle ||
+        scopedAll.length !== 9 ||
+        documentCircles.length !== 1 ||
+        documentCircles[0] !== lateCircle ||
+        firstCircle.isConnected
+      ) {
+        throw new Error("namespace collections were not live after removal");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      const nativeScopeAfterV8 = document.getElementById("scope");
+      const nativeLateCircle = document.getElementById("late-circle");
+      if (
+        document.getElementById("first-circle") !== null ||
+        !nativeLateCircle ||
+        nativeLateCircle.parentElement !== nativeScopeAfterV8 ||
+        nativeScopeAfterV8.getElementsByTagNameNS(
+          "http://www.w3.org/2000/svg",
+          "circle",
+        ).length !== 1
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

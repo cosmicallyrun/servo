@@ -77,9 +77,11 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.childElementCount`, `Document.getElementById`,
 `Document.createElement`, and `Document.querySelector`,
 `Document.querySelectorAll`, and
-`Document.getElementsByClassName`, `Document.getElementsByTagName`, plus
+`Document.getElementsByClassName`, `Document.getElementsByTagName`,
+`Document.getElementsByTagNameNS`, plus
 `Element.children`, `Element.querySelectorAll`,
 `Element.getElementsByClassName`, `Element.getElementsByTagName`,
+`Element.getElementsByTagNameNS`,
 `Element.remove`,
 `Element.previousElementSibling`, `Element.nextElementSibling`, `Element.closest`,
 `Element.matches`, `Element.webkitMatchesSelector`, `Element.namespaceURI`,
@@ -288,6 +290,22 @@ sets up the registry in an unmarked SpiderMonkey script, checks the matching
 fail-closed path and the union conversion cases, then uses `textContent` and
 the existing Element-backed Node mutation methods to reparent a real target
 and render `Hello`.
+
+ABI v40 adds `Document.getElementsByTagNameNS` and
+`Element.getElementsByTagNameNS`. Each call returns a fresh live
+`HTMLCollection` rooted at its receiver and shares the existing collection
+teardown, supported-name, and Element-wrapper machinery. Nullable namespace
+conversion preserves Web IDL ordering before Servo normalizes both null and
+the empty string to the empty namespace. The host uses the same predicate as
+Servo's production collection: `*` is independently special in the namespace
+and local-name positions, while every other value matches the element's
+namespace and local name exactly and case-sensitively. Element queries include
+descendants only, never their receiver. The operation cannot invoke a
+SpiderMonkey callback and needs no borrowed JSContext or exception transport.
+`authoritative_get_elements_by_tag_name_ns_proof.html` covers descriptors,
+branding, arity and conversions, namespace normalization, both wildcards,
+case and prefix behavior, Document/Element scope, wrapper identity, and live
+insertion/removal observed by both engines.
 
 ## Compile real Servo scripts in the V8 shadow
 

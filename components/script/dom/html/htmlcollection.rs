@@ -5,7 +5,7 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
-use html5ever::{LocalName, QualName, local_name, namespace_url, ns};
+use html5ever::{LocalName, Namespace, QualName, local_name, namespace_url, ns};
 use js::context::{JSContext, NoGC};
 use script_bindings::dom::UnrootedDom;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
@@ -25,6 +25,20 @@ use crate::dom::window::Window;
 
 pub(crate) trait CollectionFilter: JSTraceable {
     fn filter<'a>(&self, elem: &'a Element, root: &'a Node) -> bool;
+}
+
+/// The namespace/local-name predicate shared by production
+/// `getElementsByTagNameNS()` collections and the experimental V8 facade.
+///
+/// Keeping the wildcard checks here prevents the cross-engine collection from
+/// growing a subtly different interpretation of null namespaces or `*`.
+pub(crate) fn matches_qual_tag_name(
+    element: &Element,
+    namespace: &Namespace,
+    local_name: &LocalName,
+) -> bool {
+    (namespace == &namespace_url!("*") || namespace == element.namespace())
+        && (local_name == &local_name!("*") || local_name == element.local_name())
 }
 
 /// Alternative to [`CollectionFilter`] that provides elements directly via
@@ -304,9 +318,7 @@ impl HTMLCollection {
         }
         impl CollectionFilter for TagNameNSFilter {
             fn filter(&self, elem: &Element, _root: &Node) -> bool {
-                ((self.qname.ns == namespace_url!("*")) || (self.qname.ns == *elem.namespace())) &&
-                    ((self.qname.local == local_name!("*")) ||
-                        (self.qname.local == *elem.local_name()))
+                matches_qual_tag_name(elem, &self.qname.ns, &self.qname.local)
             }
         }
         let filter = TagNameNSFilter { qname };

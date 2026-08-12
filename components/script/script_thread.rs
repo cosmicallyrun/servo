@@ -56,7 +56,7 @@ use encoding_rs::Encoding;
 use fonts::{FontContext, SystemFontServiceProxy};
 use headers::{HeaderMapExt, LastModified, ReferrerPolicy as ReferrerPolicyHeader};
 #[cfg(feature = "v8-shadow")]
-use html5ever::{LocalName, local_name, ns};
+use html5ever::{LocalName, Namespace, local_name, ns};
 use http::header::REFRESH;
 use hyper_serde::Serde;
 use ipc_channel::router::ROUTER;
@@ -164,6 +164,8 @@ use crate::dom::document::{
 };
 use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::html::htmlcollection::matches_qual_tag_name;
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, ProcessingMode};
 #[cfg(feature = "v8-shadow")]
 use crate::dom::node::iterators::ShadowIncluding;
@@ -269,6 +271,10 @@ enum V8HTMLCollectionKind {
         qualified_name: LocalName,
         ascii_lower_qualified_name: LocalName,
     },
+    DescendantsByNamespaceAndLocalName {
+        namespace: Namespace,
+        local_name: LocalName,
+    },
     DescendantsByClass(Vec<Atom>),
 }
 
@@ -314,6 +320,15 @@ impl V8HTMLCollectionHost {
                         },
                     }
                 })
+                .collect(),
+            V8HTMLCollectionKind::DescendantsByNamespaceAndLocalName {
+                namespace,
+                local_name,
+            } => root
+                .traverse_preorder(ShadowIncluding::No)
+                .skip(1)
+                .filter_map(DomRoot::downcast::<Element>)
+                .filter(|element| matches_qual_tag_name(element, namespace, local_name))
                 .collect(),
             V8HTMLCollectionKind::DescendantsByClass(classes) => {
                 if classes.is_empty() {
@@ -441,6 +456,30 @@ fn v8_tag_collection_handle(root: &Node, qualified_name: &str) -> servo_v8::HTML
             kind: V8HTMLCollectionKind::DescendantsByQualifiedName {
                 qualified_name,
                 ascii_lower_qualified_name,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
+fn v8_tag_ns_collection_handle(
+    root: &Node,
+    namespace: Option<&str>,
+    local_name: &str,
+) -> servo_v8::HTMLCollectionHandle {
+    // Web IDL converts null and undefined to None; the DOM algorithm then
+    // normalizes both that null and the empty string to the empty namespace.
+    let namespace = Namespace::from(namespace.unwrap_or(""));
+    let local_name = LocalName::from(local_name);
+    // SAFETY: As with the other non-[SameObject] descendant queries, the host
+    // owns a Trusted root and receives a unique per-call wrapper-cache key.
+    // Collection reads only traverse Servo's current tree and cannot enter JS.
+    unsafe {
+        servo_v8::HTMLCollectionHandle::new_unique(V8HTMLCollectionHost {
+            root: Trusted::new(root),
+            kind: V8HTMLCollectionKind::DescendantsByNamespaceAndLocalName {
+                namespace,
+                local_name,
             },
         })
     }
@@ -742,6 +781,15 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
     fn get_elements_by_tag_name(&self, qualified_name: &str) -> servo_v8::HTMLCollectionHandle {
         let element = self.element.root();
         v8_tag_collection_handle(element.upcast::<Node>(), qualified_name)
+    }
+
+    fn get_elements_by_tag_name_ns(
+        &self,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> servo_v8::HTMLCollectionHandle {
+        let element = self.element.root();
+        v8_tag_ns_collection_handle(element.upcast::<Node>(), namespace, local_name)
     }
 
     fn node_type(&self) -> u16 {
@@ -1236,6 +1284,15 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
     fn get_elements_by_tag_name(&self, qualified_name: &str) -> servo_v8::HTMLCollectionHandle {
         let document = self.document.root();
         v8_tag_collection_handle(document.upcast::<Node>(), qualified_name)
+    }
+
+    fn get_elements_by_tag_name_ns(
+        &self,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> servo_v8::HTMLCollectionHandle {
+        let document = self.document.root();
+        v8_tag_ns_collection_handle(document.upcast::<Node>(), namespace, local_name)
     }
 
     unsafe fn get_element_by_id(

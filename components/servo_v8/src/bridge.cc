@@ -2860,6 +2860,82 @@ void ElementHostGetElementsByTagName(
   info.GetReturnValue().Set(wrapper);
 }
 
+void ElementHostGetElementsByTagNameNS(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // WebIDL checks the receiver brand and required argument count before it
+  // runs user-controlled conversion for either argument.
+  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->html_collection_host_installed ||
+      !realm->runtime->element_host_installed ||
+      realm->html_collection_template.IsEmpty() ||
+      realm->element_template.IsEmpty() ||
+      !realm->runtime->element_host_vtable.get_elements_by_tag_name_ns) {
+    ThrowTypeError(isolate,
+                   "HTMLCollection host is not installed in this realm");
+    return;
+  }
+  if (info.Length() < 2) {
+    ThrowTypeError(
+        isolate, "Element.getElementsByTagNameNS requires 2 arguments");
+    return;
+  }
+
+  const bool namespace_is_null = info[0]->IsNullOrUndefined();
+  v8::Local<v8::String> namespace_string;
+  if (namespace_is_null) {
+    namespace_string = v8::String::Empty(isolate);
+  } else if (!info[0]
+                  ->ToString(isolate->GetCurrentContext())
+                  .ToLocal(&namespace_string)) {
+    return;
+  }
+  v8::Local<v8::String> local_name_string;
+  if (!info[1]
+           ->ToString(isolate->GetCurrentContext())
+           .ToLocal(&local_name_string)) {
+    return;
+  }
+  v8::String::Utf8Value namespace_utf8(isolate, namespace_string);
+  v8::String::Utf8Value local_name_utf8(isolate, local_name_string);
+  if ((!*namespace_utf8 && namespace_utf8.length() != 0) ||
+      (!*local_name_utf8 && local_name_utf8.length() != 0)) {
+    return;
+  }
+
+  ServoV8HTMLCollectionValue value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded =
+        realm->runtime->element_host_vtable.get_elements_by_tag_name_ns(
+            native, namespace_is_null ? 1 : 0,
+            namespace_is_null
+                ? nullptr
+                : reinterpret_cast<const uint8_t*>(*namespace_utf8),
+            namespace_is_null ? 0
+                              : static_cast<size_t>(namespace_utf8.length()),
+            reinterpret_cast<const uint8_t*>(*local_name_utf8),
+            static_cast<size_t>(local_name_utf8.length()), &value) != 0;
+  }
+  if (!succeeded || !value.key || !value.native) {
+    DropUnownedHTMLCollectionHost(realm->runtime, value.native);
+    ThrowTypeError(
+        isolate, "Element.getElementsByTagNameNS host callback failed");
+    return;
+  }
+  v8::Local<v8::Object> wrapper = WrapperForHTMLCollectionValue(
+      realm, isolate->GetCurrentContext(), value);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(
+        isolate, "Element.getElementsByTagNameNS wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(wrapper);
+}
+
 void ElementHostGetLastElementChild(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   ElementHostGetInterface(
@@ -3650,6 +3726,8 @@ bool InstallElementPrototype(ServoV8RealmState* realm,
       {"removeAttribute", &ElementHostRemoveAttribute, 1,
        v8::SideEffectType::kHasSideEffect},
       {"getElementsByTagName", &ElementHostGetElementsByTagName, 1,
+       v8::SideEffectType::kHasSideEffect},
+      {"getElementsByTagNameNS", &ElementHostGetElementsByTagNameNS, 2,
        v8::SideEffectType::kHasSideEffect},
       {"getElementsByClassName", &ElementHostGetElementsByClassName, 1,
        v8::SideEffectType::kHasSideEffect},
@@ -5009,6 +5087,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->append_child || !vtable->replace_child ||
       !vtable->remove_child ||
       !vtable->get_children || !vtable->get_elements_by_tag_name ||
+      !vtable->get_elements_by_tag_name_ns ||
       !vtable->get_elements_by_class_name ||
       !vtable->get_first_element_child || !vtable->get_last_element_child ||
       !vtable->get_child_element_count ||
