@@ -1082,6 +1082,11 @@ v8::Local<v8::Object> WrapperForHTMLCollectionValue(
     v8::Local<v8::Context> context,
     const ServoV8HTMLCollectionValue& value);
 
+// Generated Document callbacks validate owned UTF-8 outcomes before the
+// hand-written Element facade definitions later in this translation unit.
+bool IsValidUtf8(const uint8_t* data, size_t length);
+bool IsCanonicalEmptyOwnedUtf8(const ServoV8OwnedUtf8& value);
+
 void ReturnSelectorElementOutcome(
     ServoV8RealmState* realm,
     v8::Local<v8::Context> context,

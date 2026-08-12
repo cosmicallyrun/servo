@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Runs every V8-authoritative runtime proof and checks both signals each one
-# relies on: the rendered colour, and the per-realm host-call counts logged at
-# teardown.
+# relies on: the rendered colour (or the rendered screenshot proof marker),
+# and the per-realm host-call counts logged at teardown.
 #
-# Each proof page starts with a red body and toggles document.bgColor once per
-# execution, so the final colour counts executions rather than merely observing
-# that some engine ran. Lime is reachable only when V8 executed the script
-# exactly once; if SpiderMonkey had also run it the page would be red.
+# Uniform proof pages start with a red body and toggle document.bgColor once
+# per execution, so the final colour counts executions rather than merely
+# observing that some engine ran. Lime is reachable only when V8 executed the
+# script exactly once; if SpiderMonkey had also run it the page would be red.
+# The createElement screenshot proof instead leaves a marker from its
+# unmarked SpiderMonkey follow-up and intentionally renders non-uniform text.
 #
 # Usage:
 #   cargo build -p servoshell --features v8-classic-script-authoritative
@@ -62,6 +64,9 @@ proofs=(
   "authoritative_attribute_namespace_proof.html:(0, 255, 0):1:1"
   "authoritative_attribute_names_proof.html:(0, 255, 0):1:1"
   "authoritative_attribute_mutation_proof.html:(0, 255, 0):1:1"
+  # This proof intentionally renders text, so its screenshot is non-uniform;
+  # the unmarked follow-up script emits the PASS marker and checks the DOM.
+  "authoritative_create_element_proof.html:rendered:0:1"
   # bgColor is set by the SpiderMonkey error handler, not by V8.
   "authoritative_job_error_proof.html:(0, 255, 0):0:0"
 )
@@ -72,8 +77,14 @@ for proof in "${proofs[@]}"; do
   png="$out/${page%.html}.png"
   log="$out/${page%.html}.log"
 
+  extra_args=()
+  if [ "$page" = "authoritative_create_element_proof.html" ]; then
+    # The pre-V8 fixture registers customized built-ins through Servo's native
+    # custom-element implementation before the V8 script runs.
+    extra_args+=(--enable-experimental-web-platform-features)
+  fi
   RUST_LOG=warn,script::script_thread=debug \
-    "$servoshell" -z -x --hard-fail -o "$png" "$here/$page" >"$log" 2>&1
+    "$servoshell" -z -x --hard-fail "${extra_args[@]}" -o "$png" "$here/$page" >"$log" 2>&1
 
   # Realm teardown reports the host-call counts this proof depends on.
   counts="$(sed -n 's/.*, \([0-9]*\) Document.bgColor getter, \([0-9]*\) Document.bgColor setter,.*/\1 \2/p' "$log" | tail -1)"
@@ -92,12 +103,28 @@ except Exception as error:
     print(f"unreadable: {error}"); sys.exit(0)
 data = image.get_flattened_data() if hasattr(image, "get_flattened_data") else image.getdata()
 colours = Counter(data)
-# A proof is only meaningful if the whole page is one colour.
+# Uniform proofs are meaningful only when the whole page is one colour; the
+# createElement screenshot proof is intentionally reported as a mixed image.
 print(colours.most_common(1)[0][0] if len(colours) == 1 else f"mixed: {colours.most_common(3)}")
 PY
 )"
 
   extra_ok=1
+  rgb_ok=1
+  if [ "$expected_rgb" = "rendered" ]; then
+    # A failed authoritative script leaves the body red. Successful execution
+    # renders the Hello fixture on a lime body and is therefore non-uniform.
+    if [ "$actual_rgb" = "(255, 0, 0)" ] ||
+       [[ "$actual_rgb" == unreadable:* ]]; then
+      rgb_ok=0
+    fi
+    if ! grep -Fq "RESULT createElement v39 PASS constructors=0/0 text=Hello" "$log"; then
+      echo "        missing createElement screenshot proof marker"
+      extra_ok=0
+    fi
+  elif [ "$actual_rgb" != "$expected_rgb" ]; then
+    rgb_ok=0
+  fi
   if [ "$page" = "authoritative_console_proof.html" ]; then
     for marker in \
       "SERVO_V8_CONSOLE_DEBUG 1" \
@@ -113,7 +140,7 @@ PY
     done
   fi
 
-  if [ "$actual_rgb" = "$expected_rgb" ] &&
+  if [ "$rgb_ok" -eq 1 ] &&
      [ "$actual_get" = "$expected_get" ] &&
      [ "$actual_set" = "$expected_set" ] &&
      [ "$extra_ok" -eq 1 ]; then

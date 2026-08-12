@@ -1,6 +1,7 @@
 # V8-originated custom-element reactions
 
-Status: implemented for the current `Document.bgColor`, `Element.id`,
+Status: implemented for the current `Document.createElement`,
+`Document.bgColor`, `Element.id`,
 `Element.className`, `Element.toggleAttribute`, `Element.removeAttribute`,
 `Node.textContent`, `Element.remove()`, and Node structural-mutation surface.
 
@@ -10,7 +11,8 @@ Status: implemented for the current `Document.bgColor`, `Element.id`,
 `Element.remove()` are `[CEReactions]`. Servo's ordinary SpiderMonkey binding
 pushes an element queue, performs the mutation, then pops the queue and invokes
 the callbacks before returning to JavaScript. Doing the same inside a V8 host
-call runs SpiderMonkey `attributeChangedCallback` code while V8, the C ABI
+call runs SpiderMonkey `attributeChangedCallback` or custom-element constructor
+code while V8, the C ABI
 callback, and a mutable borrow of the sidecar are all still on the native
 stack. A callback that reaches a V8-authoritative API then recursively enters
 the same isolate and `RefCell`.
@@ -26,11 +28,24 @@ uses whichever outer queue is already active, or its rooted backup element
 queue when there is none. The backup path schedules a
 `Microtask::CustomElementReaction` on Servo's SpiderMonkey microtask queue.
 
+`Document.createElement` has one additional safety boundary. A matching
+customized-built-in definition (`localName` plus `options.is`) would invoke a
+SpiderMonkey constructor synchronously inside Servo's `Element::create`
+algorithm. The V8 host therefore rejects that matching case with a V8
+`TypeError` before entering Servo. Ordinary creation and definitions whose
+built-in local name does not match continue through the production creation
+algorithm. This is intentionally fail-closed: the V8 sidecar does not yet
+bridge `CustomElementRegistry`, constructor calls, upgrade reactions, or their
+exception ordering. The createElement browser proof registers definitions in
+an unmarked SpiderMonkey script and verifies both the constructor counter and
+the unrelated-definition path.
+
 The resulting sequence is:
 
-1. V8 enters a `Document.bgColor`, Element attribute mutation, or
+1. V8 enters a `Document.createElement`, `Document.bgColor`, Element attribute mutation, or
    `Node.textContent` setter, or calls an Element/Node structural mutation.
-2. Rust mutates the real Servo attribute and enqueues its reaction.
+2. Rust performs the production creation or mutation and enqueues any
+   resulting reaction.
 3. Rust and C++ return; the V8 script or V8 microtask finishes.
 4. The authoritative-entry guard and sidecar borrow are released.
 5. At Servo's existing checkpoint, V8 jobs drain first and Servo's queue drains

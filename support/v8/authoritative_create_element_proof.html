@@ -1,0 +1,306 @@
+<!doctype html>
+<!--
+Browser proof for ABI v39's narrow Document.createElement slice.
+
+The first ordinary script deliberately registers two customized built-ins in
+SpiderMonkey before the authoritative V8 script runs. A matching `is` value
+must fail closed in V8: the host must not call Servo's synchronous custom
+element constructor while V8 owns the sidecar borrow. An unrelated definition
+must not prevent ordinary element creation.
+
+The V8 script pins the Document.prototype descriptor, Web IDL DOMString and
+(DOMString or ElementCreationOptions) conversion order, dictionary prototype
+lookup, HTML name normalization, fresh wrapper identity, and the V8-owned
+InvalidCharacterError. It then sets an existing target's textContent and
+reparents that real Element through a newly-created shell so the final page
+renders Hello.
+
+Run via support/v8/run_proofs.sh after ABI v39 is installed. The page is
+intentionally non-uniform because it is the browser screenshot milestone.
+The custom-element matching behavior is deliberately fail-closed and is not
+yet a complete custom-element-registry bridge.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Document.createElement proof</title>
+    <style>
+      body { color: #101010; font: 48px/1.2 sans-serif; }
+      #fixture, #probe-parent { display: none; }
+      #visible-target { padding: 32px; }
+    </style>
+    <script>
+      // This fixture runs on SpiderMonkey before the V8-authoritative script.
+      // A matching customized built-in would synchronously invoke this
+      // constructor under Servo's native binding if the host did not fail
+      // closed first.
+      window.__smMatchingConstructorCalls = 0;
+      window.__smUnrelatedConstructorCalls = 0;
+      class V8MatchingDefinition extends HTMLDivElement {
+        constructor() {
+          super();
+          window.__smMatchingConstructorCalls++;
+        }
+      }
+      customElements.define("v8-matching", V8MatchingDefinition, {
+        extends: "div",
+      });
+      class V8UnrelatedDefinition extends HTMLSpanElement {
+        constructor() {
+          super();
+          window.__smUnrelatedConstructorCalls++;
+        }
+      }
+      customElements.define("v8-unrelated", V8UnrelatedDefinition, {
+        extends: "span",
+      });
+    </script>
+  </head>
+  <body bgcolor="red">
+    <main id="fixture">
+      <section id="target"><span id="old-content">old</span></section>
+    </main>
+    <div id="probe-parent"></div>
+    <main id="visible-target"><div id="placeholder">placeholder</div></main>
+    <script data-servo-v8="authoritative">
+      const documentPrototype = Object.getPrototypeOf(document);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        documentPrototype,
+        "createElement",
+      );
+      if (
+        !descriptor || typeof descriptor.value !== "function" ||
+        descriptor.value.name !== "createElement" || descriptor.value.length !== 1 ||
+        !descriptor.writable || !descriptor.enumerable || !descriptor.configurable ||
+        Object.hasOwn(document, "createElement")
+      ) {
+        throw new Error("bad Document.prototype.createElement descriptor");
+      }
+
+      let brandTouched = false;
+      let wrongBrand = false;
+      try {
+        descriptor.value.call({}, {
+          toString() {
+            brandTouched = true;
+            return "div";
+          },
+        });
+      } catch (error) {
+        wrongBrand = error instanceof TypeError;
+      }
+      if (!wrongBrand || brandTouched) {
+        throw new Error("createElement did not brand-check before conversion");
+      }
+
+      let missingArgument = false;
+      try { descriptor.value.call(document); }
+      catch (error) { missingArgument = error instanceof TypeError; }
+      let localNameSymbol = false;
+      try { document.createElement(Symbol("localName")); }
+      catch (error) { localNameSymbol = error instanceof TypeError; }
+      if (!missingArgument || !localNameSymbol) {
+        throw new Error("createElement required DOMString conversion is wrong");
+      }
+
+      // The required localName conversion is sequenced before conversion of
+      // the optional union. A failed localName must not touch options.
+      const localNameSentinel = {};
+      let optionsTouchedAfterLocalFailure = 0;
+      const optionsAfterLocalFailure = Object.create({
+        get is() {
+          optionsTouchedAfterLocalFailure++;
+          return undefined;
+        },
+      });
+      let localNameConversion = false;
+      try {
+        document.createElement({
+          toString() { throw localNameSentinel; },
+        }, optionsAfterLocalFailure);
+      } catch (error) {
+        localNameConversion = error === localNameSentinel;
+      }
+      if (!localNameConversion || optionsTouchedAfterLocalFailure !== 0) {
+        throw new Error("createElement converted options before localName");
+      }
+
+      const conversionOrder = [];
+      const orderedOptionsPrototype = {};
+      Object.defineProperty(orderedOptionsPrototype, "is", {
+        get() {
+          conversionOrder.push("is");
+          return {
+            toString() {
+              conversionOrder.push("is-string");
+              return "v8-ordered-is";
+            },
+          };
+        },
+      });
+      const orderedOptions = Object.create(orderedOptionsPrototype);
+      const orderedElement = document.createElement({
+        toString() {
+          conversionOrder.push("localName");
+          return "DIV";
+        },
+      }, orderedOptions);
+      if (
+        conversionOrder.join(",") !== "localName,is,is-string" ||
+        orderedElement.localName !== "div" || orderedElement.tagName !== "DIV"
+      ) {
+        throw new Error("createElement conversion order or HTML folding is wrong");
+      }
+
+      // Missing and undefined options use the empty dictionary default. Null
+      // also selects the dictionary member of this union. Primitive strings,
+      // numbers, and booleans select DOMString; Symbols have no valid union
+      // member because ToString(Symbol()) throws.
+      const omitted = document.createElement("DIV");
+      const undefinedOptions = document.createElement("span", undefined);
+      const nullOptions = document.createElement("section", null);
+      const stringOptions = document.createElement("article", "v8-string-branch");
+      const numberOptions = document.createElement("aside", 7);
+      const booleanOptions = document.createElement("nav", false);
+      let symbolOptions = false;
+      try { document.createElement("div", Symbol("options")); }
+      catch (error) { symbolOptions = error instanceof TypeError; }
+      if (
+        omitted.localName !== "div" || undefinedOptions.localName !== "span" ||
+        nullOptions.localName !== "section" || stringOptions.localName !== "article" ||
+        numberOptions.localName !== "aside" || booleanOptions.localName !== "nav" ||
+        !symbolOptions
+      ) {
+        throw new Error("createElement union conversion is wrong");
+      }
+
+      // Objects, including boxed Strings, choose the dictionary member. Their
+      // `is` property is read once; their object-to-string conversion is not
+      // consulted. This is observable with a throwing toString and a getter.
+      let objectGetterCalls = 0;
+      let objectToStringCalls = 0;
+      const objectOptions = Object.create({
+        get is() {
+          objectGetterCalls++;
+          return undefined;
+        },
+      });
+      objectOptions.toString = function() {
+        objectToStringCalls++;
+        throw new Error("dictionary conversion called toString");
+      };
+      const objectElement = document.createElement("div", objectOptions);
+
+      let boxedGetterCalls = 0;
+      const boxedString = new String("v8-boxed-string");
+      boxedString.toString = function() {
+        throw new Error("boxed String was converted as DOMString");
+      };
+      Object.defineProperty(boxedString, "is", {
+        configurable: true,
+        get() {
+          boxedGetterCalls++;
+          return undefined;
+        },
+      });
+      const boxedElement = document.createElement("div", boxedString);
+      if (
+        objectGetterCalls !== 1 || objectToStringCalls !== 0 ||
+        boxedGetterCalls !== 1 || objectElement.localName !== "div" ||
+        boxedElement.localName !== "div"
+      ) {
+        throw new Error("createElement dictionary or boxed-String union is wrong");
+      }
+
+      let invalidName = false;
+      try {
+        document.createElement("bad name");
+      } catch (error) {
+        invalidName = error instanceof DOMException &&
+          error.name === "InvalidCharacterError" && error.code === 5 &&
+          error.message === "The string contains invalid characters.";
+      }
+      if (!invalidName) {
+        throw new Error("createElement did not return InvalidCharacterError");
+      }
+
+      const freshA = document.createElement("div");
+      const freshB = document.createElement("div");
+      if (freshA === freshB || freshA.localName !== "div" || freshB.localName !== "div") {
+        throw new Error("createElement did not return distinct fresh Elements");
+      }
+
+      // A definition matching both localName and `is` is deliberately rejected
+      // before Servo can synchronously invoke the SpiderMonkey constructor.
+      let matchingDefinitionRejected = false;
+      try {
+        document.createElement("div", { is: "v8-matching" });
+      } catch (error) {
+        matchingDefinitionRejected = error instanceof TypeError;
+      }
+
+      // An unrelated registered definition must not make ordinary creation
+      // fail. The second call also proves matching is scoped by localName.
+      const ordinary = document.createElement("div");
+      const unrelatedIs = document.createElement("div", { is: "v8-unrelated" });
+      ordinary.id = "unrelated-ordinary";
+      unrelatedIs.id = "unrelated-is-ordinary";
+      const probeParent = document.getElementById("probe-parent");
+      probeParent.appendChild(ordinary);
+      probeParent.appendChild(unrelatedIs);
+
+      // Use the current Element-backed Node mutation surface to make a real
+      // screenshot. `target` is an existing Servo Element: set its text, move
+      // it into a freshly-created shell, and replace the existing placeholder.
+      const target = document.getElementById("target");
+      const visibleTarget = document.getElementById("visible-target");
+      const placeholder = document.getElementById("placeholder");
+      target.textContent = "Hello";
+      const shell = document.createElement("article");
+      shell.id = "rendered-shell";
+      if (
+        shell.appendChild(target) !== target ||
+        visibleTarget.replaceChild(shell, placeholder) !== placeholder ||
+        shell.firstElementChild !== target || target.parentElement !== shell ||
+        target.textContent !== "Hello"
+      ) {
+        throw new Error("createElement result could not reparent and render Hello");
+      }
+
+      if (!matchingDefinitionRejected) {
+        throw new Error("matching custom-element definition did not fail closed");
+      }
+      document.bgColor = "lime";
+      document.title = "createElement-v39-pass";
+    </script>
+    <script>
+      // SpiderMonkey observes the final production DOM and the constructor
+      // counters owned by the pre-V8 fixture. No matching custom-element
+      // constructor may have run during the failed V8 call.
+      const target = document.getElementById("target");
+      const shell = document.getElementById("rendered-shell");
+      const visibleTarget = document.getElementById("visible-target");
+      const ordinary = document.getElementById("unrelated-ordinary");
+      const unrelatedIs = document.getElementById("unrelated-is-ordinary");
+      const ok = document.title === "createElement-v39-pass" &&
+        document.body.getAttribute("bgcolor") === "lime" &&
+        window.__smMatchingConstructorCalls === 0 &&
+        window.__smUnrelatedConstructorCalls === 0 &&
+        target && shell && visibleTarget && ordinary && unrelatedIs &&
+        shell.firstElementChild === target && target.parentElement === shell &&
+        target.textContent === "Hello" && shell.textContent === "Hello" &&
+        visibleTarget.firstElementChild === shell;
+      if (ok) {
+        console.log(
+          "RESULT createElement v39 PASS constructors=" +
+            window.__smMatchingConstructorCalls + "/" +
+            window.__smUnrelatedConstructorCalls +
+            " text=" + target.textContent,
+        );
+      } else {
+        console.log("RESULT createElement v39 FAIL");
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

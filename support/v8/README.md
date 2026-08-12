@@ -74,8 +74,9 @@ The production binding slice is generated from the enabled `Document.hidden`,
 `Document.visibilityState`, `Document.readyState`, `Document.title`,
 `Node.nodeType`, `Node.parentElement`, `Document.documentElement`,
 `Document.head`, and `Document.children`, `Document.firstElementChild`,
-`Document.childElementCount`, `Document.getElementById`, and
-`Document.querySelector`, `Document.querySelectorAll`, and
+`Document.childElementCount`, `Document.getElementById`,
+`Document.createElement`, and `Document.querySelector`,
+`Document.querySelectorAll`, and
 `Document.getElementsByClassName`, `Document.getElementsByTagName`, plus
 `Element.children`, `Element.querySelectorAll`,
 `Element.getElementsByClassName`, `Element.getElementsByTagName`,
@@ -103,6 +104,7 @@ state appearing upstream becomes a build failure rather than an unvalidated
 string.
 
 `Document.documentElement`, `Document.head`, `Document.getElementById`,
+`Document.createElement`,
 `Document.querySelector`, the
 ParentNode traversal getters, and the Element slice are the members whose value
 or receiver is another DOM object, and they rest on per-realm weak wrapper caches
@@ -262,6 +264,31 @@ the sidecar borrow. `authoritative_attribute_mutation_proof.html` validates
 both operations, conversion/error behavior, and a SpiderMonkey observation of
 the V8-mutated DOM.
 
+ABI v39 adds the narrow `Document.createElement` operation. Its required
+`localName` is converted first, then the optional
+`(DOMString or ElementCreationOptions)` union is converted with Web IDL's
+dictionary-versus-string rules. Returned elements are fresh Servo DOM objects
+with fresh per-realm wrappers, and HTML local names are ASCII-lowercased by
+Servo while `tagName` retains the HTML uppercase projection. Invalid local
+names become V8-owned `InvalidCharacterError` DOMExceptions.
+
+The production declaration pinned by this slice is
+`[CEReactions, NewObject, Throws] Element createElement(DOMString localName,
+optional (DOMString or ElementCreationOptions) options = {});`.
+
+The operation is deliberately fail-closed for a customized built-in whose
+registered definition matches both the requested local name and `options.is`:
+it throws a V8 `TypeError` before invoking Servo's synchronous custom-element
+constructor. An unrelated registered definition does not block ordinary
+creation, including a definition whose built-in local name does not match.
+This is a safety boundary, not a custom-element registry bridge: V8 cannot
+yet execute or observe SpiderMonkey custom-element constructors, upgrade
+reactions, or registry callbacks. `authoritative_create_element_proof.html`
+sets up the registry in an unmarked SpiderMonkey script, checks the matching
+fail-closed path and the union conversion cases, then uses `textContent` and
+the existing Element-backed Node mutation methods to reparent a real target
+and render `Hello`.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script
@@ -407,7 +434,7 @@ surface is deliberately limited to `window`, the `console` logging slice,
 string getters, `document.visibilityState`, `document.readyState`,
 `document.title`, `document.nodeType`, `document.documentElement`,
 `document.head`, the ParentNode `children`/first/last/count getters, and
-`document.getElementById()`, `document.querySelector()`,
+`document.getElementById()`, `document.createElement()`, `document.querySelector()`,
 `document.querySelectorAll()`, `document.getElementsByClassName()`, and
 `document.getElementsByTagName()`.
 Elements returned through that
@@ -526,6 +553,7 @@ The proof suite uses that same counting argument:
 | `authoritative_attribute_names_proof.html` | getAttributeNames copies ordered HTML/SVG names into fresh mutable snapshots, including current parsed-XLink local-name parity |
 | `authoritative_node_mutation_proof.html` | all four Element-backed Node mutations call Servo's production algorithms, preserve wrapper identity and live/static views, map DOMExceptions into V8, and leave a visible rendered Hello |
 | `authoritative_attribute_mutation_proof.html` | toggleAttribute/removeAttribute use Servo's production attribute machinery with exact optional-boolean conversion, V8-owned InvalidCharacterError, and cross-engine DOM visibility |
+| `authoritative_create_element_proof.html` | Document.createElement preserves descriptor/brand/conversion order, dictionary/string union behavior, HTML normalization, fresh wrappers, fail-closed matching custom elements, and a rendered Hello screenshot |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -549,7 +577,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 38 and remains experimental. The original
+The current exported C ABI is version 39 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

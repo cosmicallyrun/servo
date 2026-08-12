@@ -62,6 +62,7 @@ DOCUMENT_CHILD_ELEMENT_COUNT = "Document.childElementCount"
 DOCUMENT_GET_ELEMENT_BY_ID = "Document.getElementById"
 DOCUMENT_QUERY_SELECTOR = "Document.querySelector"
 DOCUMENT_QUERY_SELECTOR_ALL = "Document.querySelectorAll"
+DOCUMENT_CREATE_ELEMENT = "Document.createElement"
 WINDOW_OR_WORKER_SET_TIMEOUT = "WindowOrWorkerGlobalScope.setTimeout"
 WINDOW_OR_WORKER_CLEAR_TIMEOUT = "WindowOrWorkerGlobalScope.clearTimeout"
 WINDOW_OR_WORKER_SET_INTERVAL = "WindowOrWorkerGlobalScope.setInterval"
@@ -128,6 +129,7 @@ PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE = (
 NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE = (
     "NewObject Throws operation DOMString -> interface"
 )
+CREATE_ELEMENT = "CEReactions NewObject Throws createElement"
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
@@ -274,6 +276,10 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
         NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
         "NodeList",
     ),
+    # A narrow creation ABI preserves WebIDL's union/dictionary conversion
+    # before Rust is entered. The native side returns a structured outcome so
+    # InvalidCharacterError remains a realm-local V8 DOMException.
+    DocumentHostMember(DOCUMENT_CREATE_ELEMENT, CREATE_ELEMENT, "Element"),
 )
 
 # These operations are installed by a separate per-realm timer host rather
@@ -2138,6 +2144,12 @@ def _select_document_host_member(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
     member: DocumentHostMember,
 ) -> WebIDL.IDLAttribute | WebIDL.IDLMethod:
+    if member.shape == CREATE_ELEMENT:
+        if member.expected_interface != "Element":
+            raise WebIDLSelectionError(
+                f"`{member.qualified_name}` create-element shape must return `Element`"
+            )
+        return _select_create_element_operation(parser_results, member.qualified_name)
     if member.shape == READONLY_ENUM:
         if member.expected_interface is not None:
             raise WebIDLSelectionError(
@@ -2222,6 +2234,138 @@ def _select_document_host_member(
             f"non-interface member `{member.qualified_name}` cannot pin a returned interface"
         )
     return _SHAPE_SELECTORS[member.shape](parser_results, member.qualified_name)
+
+
+def _select_create_element_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLMethod:
+    """Pin the exact WebIDL declaration whose conversion the V8 ABI emits."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{interface_name}`, found {len(interfaces)}"
+        )
+    members = [
+        member for member in interfaces[0].members if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+    member = members[0]
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must be an ordinary instance operation"
+        )
+    actual_attributes = set(member._extendedAttrDict)
+    expected_attributes = {"CEReactions", "NewObject", "Throws"}
+    if actual_attributes != expected_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly {sorted(expected_attributes)}, "
+            f"got {sorted(actual_attributes)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if (
+        return_type.nullable()
+        or not return_type.isInterface()
+        or return_type.name != "Element"
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `Element`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if len(arguments) != 2:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly two arguments, found {len(arguments)}"
+        )
+    local_name, options = arguments
+    if (
+        local_name.identifier.name != "localName"
+        or local_name.optional
+        or local_name.variadic
+        or local_name.defaultValue is not None
+        or local_name.type.nullable()
+        or not local_name.type.isDOMString()
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` first argument must be required non-nullable "
+            "`DOMString localName`"
+        )
+    option_members = options.type.memberTypes if options.type.isUnion() else []
+    if (
+        options.identifier.name != "options"
+        or not options.optional
+        or options.variadic
+        or options.type.nullable()
+        or len(option_members) != 2
+        or not option_members[0].isDOMString()
+        or option_members[0].nullable()
+        or not option_members[1].isDictionary()
+        or option_members[1].nullable()
+        or option_members[1].name != "ElementCreationOptions"
+        or options.defaultValue is None
+        or options.defaultValue.value is not None
+        or not options.defaultValue.type.isDictionary()
+        or options.defaultValue.type.name != "ElementCreationOptions"
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` second argument must be optional non-nullable "
+            "`(DOMString or ElementCreationOptions) options = {}`"
+        )
+    dictionaries = [
+        result
+        for result in parser_results
+        if result.isDictionary() and result.identifier.name == "ElementCreationOptions"
+    ]
+    if len(dictionaries) != 1:
+        raise WebIDLSelectionError(
+            "expected exactly one dictionary `ElementCreationOptions`, "
+            f"found {len(dictionaries)}"
+        )
+    dictionary = dictionaries[0]
+    if dictionary.parent is not None or dictionary._extendedAttrDict:
+        raise WebIDLSelectionError(
+            "`ElementCreationOptions` must have no parent or extended attributes"
+        )
+    if [entry.identifier.name for entry in dictionary.members] != ["is"]:
+        raise WebIDLSelectionError(
+            "`ElementCreationOptions` must declare exactly ['is']"
+        )
+    is_member = dictionary.members[0]
+    if (
+        not is_member.optional
+        or is_member.variadic
+        or is_member.defaultValue is not None
+        or is_member.type.nullable()
+        or not is_member.type.isDOMString()
+        or is_member._extendedAttrDict
+        or is_member.type._extendedAttrDict
+    ):
+        raise WebIDLSelectionError(
+            "`ElementCreationOptions.is` must be optional non-nullable `DOMString is`"
+        )
+    for argument in arguments:
+        argument_attributes = set(argument._extendedAttrDict) | set(
+            argument.type._extendedAttrDict
+        )
+        if argument_attributes:
+            raise WebIDLSelectionError(
+                f"`{qualified_name}` arguments carry extended attributes that are not implemented: "
+                + ", ".join(sorted(argument_attributes))
+            )
+    return member
 
 
 def select_document_host_members(

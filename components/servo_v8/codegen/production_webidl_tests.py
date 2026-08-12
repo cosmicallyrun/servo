@@ -156,6 +156,25 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertEqual(return_type.name, "NodeList")
         self.assertEqual(arguments[0].identifier.name, "selectors")
         self.assertEqual(set(query_all._extendedAttrDict), {"NewObject", "Throws"})
+        create_element = attributes[production_webidl.DOCUMENT_CREATE_ELEMENT]
+        create_return, create_arguments = create_element.signatures()[0]
+        self.assertEqual(create_return.name, "Element")
+        self.assertFalse(create_return.nullable())
+        self.assertEqual(
+            set(create_element._extendedAttrDict), {"CEReactions", "NewObject", "Throws"}
+        )
+        self.assertEqual(
+            [argument.identifier.name for argument in create_arguments],
+            ["localName", "options"],
+        )
+        self.assertTrue(create_arguments[0].type.isDOMString())
+        self.assertFalse(create_arguments[0].optional)
+        self.assertTrue(create_arguments[1].optional)
+        self.assertEqual(
+            [type_.prettyName() for type_ in create_arguments[1].type.memberTypes],
+            ["DOMString", "ElementCreationOptions"],
+        )
+        self.assertIsNone(create_arguments[1].defaultValue.value)
 
     def test_pins_each_real_enum_value_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -552,6 +571,93 @@ class SyntheticSelectionTests(unittest.TestCase):
                 parser_results,
                 production_webidl.DOCUMENT_HIDDEN,
             )
+
+    def create_element_source(
+        self,
+        declaration: str = (
+            "[CEReactions, NewObject, Throws] "
+            "Element createElement(DOMString localName, "
+            "optional (DOMString or ElementCreationOptions) options = {});"
+        ),
+        dictionary: str = "dictionary ElementCreationOptions { DOMString is; };",
+    ) -> str:
+        return f"""
+            interface Element {{}};
+            {dictionary}
+            interface Document {{ {declaration} }};
+        """
+
+    def assert_create_element_rejected(
+        self,
+        declaration: str,
+        expected: str,
+        dictionary: str = "dictionary ElementCreationOptions { DOMString is; };",
+    ) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": self.create_element_source(declaration, dictionary)}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_create_element_operation(
+                parser_results, production_webidl.DOCUMENT_CREATE_ELEMENT
+            )
+
+    def test_selects_exact_create_element_operation(self) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": self.create_element_source()}
+        )
+        method = production_webidl._select_create_element_operation(
+            parser_results, production_webidl.DOCUMENT_CREATE_ELEMENT
+        )
+        return_type, arguments = method.signatures()[0]
+
+        self.assertEqual(return_type.name, "Element")
+        self.assertEqual(
+            set(method._extendedAttrDict), {"CEReactions", "NewObject", "Throws"}
+        )
+        self.assertEqual(
+            [argument.identifier.name for argument in arguments], ["localName", "options"]
+        )
+        self.assertTrue(arguments[0].type.isDOMString())
+        self.assertFalse(arguments[0].optional)
+        self.assertTrue(arguments[1].optional)
+        self.assertEqual(
+            [member.prettyName() for member in arguments[1].type.memberTypes],
+            ["DOMString", "ElementCreationOptions"],
+        )
+        self.assertIsNone(arguments[1].defaultValue.value)
+
+    def test_rejects_create_element_shape_drift(self) -> None:
+        self.assert_create_element_rejected(
+            "[CEReactions, NewObject] Element createElement(DOMString localName, "
+            "optional (DOMString or ElementCreationOptions) options = {});",
+            "`Document.createElement` must carry exactly ['CEReactions', 'NewObject', 'Throws']",
+        )
+        self.assert_create_element_rejected(
+            "[CEReactions, NewObject, Throws] Element createElement(DOMString? localName, "
+            "optional (DOMString or ElementCreationOptions) options = {});",
+            "`Document.createElement` first argument must be required non-nullable `DOMString localName`",
+        )
+        self.assert_create_element_rejected(
+            "[CEReactions, NewObject, Throws] Element createElement(DOMString localName, "
+            "optional (ElementCreationOptions or DOMString) options = {});",
+            "`Document.createElement` second argument must be optional non-nullable "
+            "`(DOMString or ElementCreationOptions) options = {}`",
+        )
+        self.assert_create_element_rejected(
+            "[CEReactions, NewObject, Throws] Element createElement(DOMString localName, "
+            "optional (DOMString or ElementCreationOptions) options = \"legacy\");",
+            "`Document.createElement` second argument must be optional non-nullable "
+            "`(DOMString or ElementCreationOptions) options = {}`",
+        )
+        self.assert_create_element_rejected(
+            "[CEReactions, NewObject, Throws] Element createElement(DOMString localName, "
+            "optional (DOMString or ElementCreationOptions) options = {});",
+            "`ElementCreationOptions.is` must be optional non-nullable `DOMString is`",
+            "dictionary ElementCreationOptions { DOMString? is; };",
+        )
 
     def html_collection_source(
         self,

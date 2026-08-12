@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 38;
+const ABI_VERSION: u32 = 39;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -4466,6 +4466,7 @@ mod tests {
         head_present: bool,
         malformed_children: bool,
         get_element_by_id_calls: Rc<RefCell<Vec<String>>>,
+        create_element_calls: Rc<RefCell<Vec<(String, Option<String>)>>>,
         element_drops: Rc<Cell<usize>>,
         node_list_drops: Rc<Cell<usize>>,
         html_collection_drops: Rc<Cell<usize>>,
@@ -4543,6 +4544,7 @@ mod tests {
                 head_present: true,
                 malformed_children: false,
                 get_element_by_id_calls: Rc::new(RefCell::new(Vec::new())),
+                create_element_calls: Rc::new(RefCell::new(Vec::new())),
                 element_drops: Rc::new(Cell::new(0)),
                 node_list_drops: Rc::new(Cell::new(0)),
                 html_collection_drops: Rc::new(Cell::new(0)),
@@ -4630,6 +4632,51 @@ mod tests {
         fn node_type(&self) -> u16 {
             // Node.DOCUMENT_NODE.
             9
+        }
+
+        unsafe fn create_element(
+            &self,
+            host_context: *mut c_void,
+            local_name: &str,
+            is: Option<&str>,
+        ) -> DocumentCreateElementResult {
+            if host_context.is_null() || local_name == "host-failure" {
+                return DocumentCreateElementResult::HostFailure;
+            }
+            self.create_element_calls
+                .borrow_mut()
+                .push((local_name.to_owned(), is.map(str::to_owned)));
+            if local_name.is_empty() || local_name.chars().any(char::is_whitespace) {
+                return DocumentCreateElementResult::InvalidCharacter(
+                    "The string contains invalid characters.".to_owned(),
+                );
+            }
+            let local_name = local_name.to_ascii_lowercase();
+            let identity = Rc::new(0_u8);
+            let key = Rc::as_ptr(&identity).cast::<c_void>();
+            let state = ElementProbeState::with_attributes(&[]);
+            if let Some(is) = is {
+                state.set("is", is);
+            }
+            // SAFETY: The returned host owns the Rc allocation used as its
+            // identity key and every test runtime installs ElementHostProbe.
+            DocumentCreateElementResult::Created(unsafe {
+                InterfaceHandle::new(
+                    key,
+                    ElementHostProbe {
+                        tag_name: local_name.to_ascii_uppercase(),
+                        local_name,
+                        identity: key,
+                        state,
+                        _owned_identity: Some(identity),
+                        parent_children: None,
+                        parent_state: None,
+                        parent_element: None,
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
         }
 
         fn document_element(&self) -> Option<InterfaceHandle> {
@@ -8609,6 +8656,7 @@ mod tests {
         let callback = vtable.get_element_by_id.unwrap();
         let query_callback = vtable.query_selector.unwrap();
         let query_all_callback = vtable.query_selector_all.unwrap();
+        let create_callback = vtable.create_element.unwrap();
         let mut host_context = 0_u8;
         let host_context = (&mut host_context as *mut u8).cast::<c_void>();
         let mut output = RawInterfaceValue {
@@ -8795,10 +8843,238 @@ mod tests {
             );
             assert_eq!(query_all_output.status, SELECTOR_SYNTAX_ERROR);
             assert!(query_all_output.native.is_null());
+
+            let mut create_output = RawDocumentCreateElementOutcome {
+                status: u32::MAX,
+                exception_message: raw_empty_owned_utf8(),
+                value: raw_null_interface_value(),
+            };
+            assert_eq!(
+                create_callback(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    &mut create_output,
+                ),
+                0,
+            );
+            let div = b"DIV";
+            assert_eq!(
+                create_callback(
+                    native,
+                    host_context,
+                    div.as_ptr(),
+                    div.len(),
+                    2,
+                    std::ptr::null(),
+                    0,
+                    &mut create_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_callback(
+                    native,
+                    host_context,
+                    div.as_ptr(),
+                    div.len(),
+                    1,
+                    b"bad".as_ptr(),
+                    3,
+                    &mut create_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_callback(
+                    native,
+                    std::ptr::null_mut(),
+                    div.as_ptr(),
+                    div.len(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    &mut create_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    &mut create_output,
+                ),
+                1,
+            );
+            assert_eq!(
+                create_output.status,
+                DOCUMENT_CREATE_ELEMENT_INVALID_CHARACTER
+            );
+            create_output.exception_message.drop_owner.unwrap()(
+                create_output.exception_message.owner,
+            );
+            assert_eq!(
+                create_callback(
+                    native,
+                    host_context,
+                    div.as_ptr(),
+                    div.len(),
+                    1,
+                    std::ptr::null(),
+                    0,
+                    &mut create_output,
+                ),
+                1,
+            );
+            assert_eq!(create_output.status, DOCUMENT_CREATE_ELEMENT_CREATED);
+            assert_eq!(create_output.value.is_null, 0);
+            element_host_drop::<ElementHostProbe>(create_output.value.native);
             vtable.drop.unwrap()(native);
         }
         assert_eq!(&*calls.borrow(), &[""]);
         assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn document_create_element_preserves_conversion_identity_and_dom_exception_shape() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let element_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&element_drops);
+        let calls = Rc::clone(&document.create_element_calls);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const prototype = Object.getPrototypeOf(document);
+              const descriptor = Object.getOwnPropertyDescriptor(
+                prototype, 'createElement');
+              let brandTouched = false;
+              let wrongBrand = false;
+              try {
+                descriptor.value.call({}, { toString() {
+                  brandTouched = true;
+                  return 'div';
+                }});
+              } catch (error) { wrongBrand = error instanceof TypeError; }
+              let missing = false;
+              try { document.createElement(); }
+              catch (error) { missing = error instanceof TypeError; }
+
+              const order = [];
+              const options = Object.create({
+                get is() {
+                  order.push('is');
+                  return { toString() { order.push('is-string'); return 'fancy-item'; }};
+                },
+              });
+              const first = document.createElement({
+                toString() { order.push('local'); return 'DIV'; },
+              }, options);
+              const second = document.createElement('div');
+              const omitted = document.createElement('span', undefined);
+              const nullOptions = document.createElement('em', null);
+              document.createElement('strong', 7);
+              let boxedStringified = false;
+              const boxed = new String('discarded');
+              boxed.toString = () => { boxedStringified = true; return 'discarded'; };
+              document.createElement('b', boxed);
+
+              let optionsTouchedAfterLocalThrow = false;
+              const localSentinel = {};
+              let localThrowPreserved = false;
+              try {
+                document.createElement({ toString() { throw localSentinel; } }, {
+                  get is() { optionsTouchedAfterLocalThrow = true; return 'x-y'; },
+                });
+              } catch (error) { localThrowPreserved = error === localSentinel; }
+              let symbolRejected = false;
+              try { document.createElement('i', Symbol('options')); }
+              catch (error) { symbolRejected = error instanceof TypeError; }
+              let invalidOptionsReads = 0;
+              let invalidCharacter = false;
+              try {
+                document.createElement('', {
+                  get is() { invalidOptionsReads++; return 'bad-name'; },
+                });
+              } catch (error) {
+                invalidCharacter = error instanceof DOMException &&
+                  error.name === 'InvalidCharacterError' && error.code === 5;
+              }
+              let hostFailure = false;
+              try { document.createElement('host-failure'); }
+              catch (error) { hostFailure = error instanceof TypeError; }
+
+              globalThis.createElementProof =
+                descriptor && descriptor.value.name === 'createElement' &&
+                descriptor.value.length === 1 && descriptor.writable &&
+                descriptor.enumerable && descriptor.configurable &&
+                !Object.hasOwn(document, 'createElement') && wrongBrand &&
+                !brandTouched && missing && order.join(',') === 'local,is,is-string' &&
+                first.localName === 'div' && first.tagName === 'DIV' &&
+                second.localName === 'div' && first !== second &&
+                omitted.localName === 'span' && nullOptions.localName === 'em' &&
+                !boxedStringified && localThrowPreserved &&
+                !optionsTouchedAfterLocalThrow && symbolRejected &&
+                invalidOptionsReads === 1 && invalidCharacter && hostFailure;
+            })();"#,
+            "document-create-element.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: The token remains live for this synchronous script run and
+        // the probe validates but never retains or dereferences it.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "createElementProof")
+                .unwrap()
+        );
+        assert!(
+            calls
+                .borrow()
+                .contains(&("DIV".to_owned(), Some("fancy-item".to_owned()),))
+        );
+        assert!(
+            calls
+                .borrow()
+                .contains(&(String::new(), Some("bad-name".to_owned())))
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert!(element_drops.get() >= 6);
     }
 
     #[test]

@@ -939,6 +939,61 @@ impl Document {
         self.content_type.matches(APPLICATION, "xhtml+xml")
     }
 
+    /// Normalizes the inputs shared by `Document::CreateElement` and the V8
+    /// sidecar's custom-element preflight. Keeping this beside the production
+    /// WebIDL implementation prevents the preflight from drifting from the
+    /// name, namespace, or `is` matching that can invoke a constructor.
+    fn normalized_create_element_name(
+        &self,
+        mut local_name: DOMString,
+        is: Option<LocalName>,
+    ) -> Fallible<(QualName, Option<LocalName>)> {
+        // Step 1. If localName is not a valid element local name, then throw
+        // an "InvalidCharacterError" DOMException.
+        if !is_valid_element_local_name(&local_name.str()) {
+            debug!("Not a valid element name");
+            return Err(Error::InvalidCharacter(None));
+        }
+
+        if self.is_html_document {
+            local_name.make_ascii_lowercase();
+        }
+
+        let namespace = if self.is_html_document || self.is_xhtml_document() {
+            ns!(html)
+        } else {
+            ns!()
+        };
+        Ok((
+            QualName::new(None, namespace, LocalName::from(local_name)),
+            is,
+        ))
+    }
+
+    /// Returns whether `Document::CreateElement` would synchronously invoke a
+    /// custom-element definition for these V8-originated arguments.
+    ///
+    /// This deliberately performs no creation or upgrade: its caller must
+    /// fail closed before entering the normal Script-created element path,
+    /// where a matching definition can run SpiderMonkey constructor code.
+    #[cfg(feature = "v8-shadow")]
+    pub(crate) fn v8_create_element_has_matching_custom_element_definition(
+        &self,
+        local_name: DOMString,
+        is: Option<DOMString>,
+    ) -> Fallible<bool> {
+        let is = is.map(LocalName::from);
+        let (name, is) = self.normalized_create_element_name(local_name, is)?;
+        let registry = CustomElementRegistry::lookup_a_custom_element_registry(self.upcast());
+        Ok(CustomElementRegistry::lookup_custom_element_definition(
+            registry.as_deref(),
+            &name.ns,
+            &name.local,
+            is.as_ref(),
+        )
+        .is_some())
+    }
+
     pub(crate) fn is_fully_active(&self) -> bool {
         self.activity.get() == DocumentActivity::FullyActive
     }
@@ -5363,33 +5418,16 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     fn CreateElement(
         &self,
         cx: &mut JSContext,
-        mut local_name: DOMString,
+        local_name: DOMString,
         options: StringOrElementCreationOptions,
     ) -> Fallible<DomRoot<Element>> {
-        // Step 1. If localName is not a valid element local name,
-        //      then throw an "InvalidCharacterError" DOMException.
-        if !is_valid_element_local_name(&local_name.str()) {
-            debug!("Not a valid element name");
-            return Err(Error::InvalidCharacter(None));
-        }
-
-        if self.is_html_document {
-            local_name.make_ascii_lowercase();
-        }
-
-        let ns = if self.is_html_document || self.is_xhtml_document() {
-            ns!(html)
-        } else {
-            ns!()
-        };
-
-        let name = QualName::new(None, ns, LocalName::from(local_name));
         let is = match options {
             StringOrElementCreationOptions::String(_) => None,
             StringOrElementCreationOptions::ElementCreationOptions(options) => {
                 options.is.as_ref().map(LocalName::from)
             },
         };
+        let (name, is) = self.normalized_create_element_name(local_name, is)?;
         Ok(Element::create(
             cx,
             name,

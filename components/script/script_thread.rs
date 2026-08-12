@@ -126,6 +126,8 @@ use webgpu_traits::{WebGPUDevice, WebGPUMsg};
 use crate::devtools::DevtoolsState;
 use crate::document_collection::DocumentCollection;
 use crate::document_loader::DocumentLoader;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::Bindings::DocumentBinding::ElementCreationOptions;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
 };
@@ -135,6 +137,8 @@ use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::UnionTypes::StringOrElementCreationOptions;
 #[cfg(feature = "v8-classic-script-authoritative")]
 use crate::dom::bindings::codegen::UnionTypes::TrustedScriptOrString;
 use crate::dom::bindings::conversions::{
@@ -1250,6 +1254,72 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             .root()
             .GetElementById(cx, DOMString::from(element_id))?;
         Some(v8_element_interface_handle(&element))
+    }
+
+    unsafe fn create_element(
+        &self,
+        host_context: *mut c_void,
+        local_name: &str,
+        is: Option<&str>,
+    ) -> servo_v8::DocumentCreateElementResult {
+        if host_context.is_null() {
+            return servo_v8::DocumentCreateElementResult::HostFailure;
+        }
+        // SAFETY: The authoritative V8 entry lends this live owner-thread
+        // SpiderMonkey context only for the synchronous production DOM call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::DocumentCreateElementResult::HostFailure;
+        }
+
+        let document = self.document.root();
+        // `Document::CreateElement` can synchronously construct a custom
+        // element. Never let that SpiderMonkey constructor run while V8 owns
+        // this host callback and the sidecar borrow is live. The Document
+        // helper shares CreateElement's validation, HTML lowercasing,
+        // namespace choice, and `is` lookup tuple, so only a matching
+        // definition is blocked; unrelated registrations still create the
+        // normal production Element below.
+        match document.v8_create_element_has_matching_custom_element_definition(
+            DOMString::from(local_name),
+            is.map(DOMString::from),
+        ) {
+            Ok(true) => return servo_v8::DocumentCreateElementResult::HostFailure,
+            Ok(false) => {},
+            Err(Error::InvalidCharacter(message)) => {
+                return servo_v8::DocumentCreateElementResult::InvalidCharacter(
+                    message.unwrap_or_else(|| "The string contains invalid characters.".to_owned()),
+                );
+            },
+            Err(_) => return servo_v8::DocumentCreateElementResult::HostFailure,
+        }
+
+        let result = document.CreateElement(
+            cx,
+            DOMString::from(local_name),
+            StringOrElementCreationOptions::ElementCreationOptions(ElementCreationOptions {
+                is: is.map(DOMString::from),
+            }),
+        );
+        // CreateElement's declared InvalidCharacter result is transported as
+        // POD to V8. Any unexpected SpiderMonkey exception must not escape
+        // across this host boundary.
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return servo_v8::DocumentCreateElementResult::HostFailure;
+        }
+        match result {
+            Ok(element) => servo_v8::DocumentCreateElementResult::Created(
+                v8_element_interface_handle(&element),
+            ),
+            Err(Error::InvalidCharacter(message)) => {
+                servo_v8::DocumentCreateElementResult::InvalidCharacter(
+                    message.unwrap_or_else(|| "The string contains invalid characters.".to_owned()),
+                )
+            },
+            Err(_) => servo_v8::DocumentCreateElementResult::HostFailure,
+        }
     }
 
     unsafe fn query_selector(
