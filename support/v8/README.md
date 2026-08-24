@@ -336,6 +336,22 @@ same fragment wrapper, and leaves the fragment empty.
 fresh dynamic identities, Node scalars and mutations, the V8 DOMException
 path, and a SpiderMonkey observation of the final real tree.
 
+ABI v43 adds `Document.createTextNode`. The same concrete `Trusted<Node>` host
+now carries a Text interface kind, so Elements, DocumentFragments, and Text
+all use one installed Rust type and cannot cross a monomorphized vtable with a
+different host representation. The operation borrows the ephemeral live
+SpiderMonkey context solely to call Servo's exact
+`DocumentMethods::CreateTextNode(cx, DOMString)`, clears an unexpected pending
+SpiderMonkey exception on either side of that call, and returns a freshly
+boxed Text-kind host without entering V8 or pumping reactions. The selected
+Text facade deliberately remains the common Node surface: `nodeType`,
+`nodeName`, `textContent`, connection/parent state, and structural mutations.
+CharacterData/Text-specific APIs such as `data`, `substringData`, `wholeText`,
+and `splitText` remain unexposed until their Web IDL conversion and mutation
+semantics have an explicit ABI. `authoritative_create_text_node_proof.html`
+pins receiver-before-conversion behavior, Text identity and brands, fragment
+splicing and Element insertion, and SpiderMonkey visibility of `Hello`.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script
@@ -602,6 +618,7 @@ The proof suite uses that same counting argument:
 | `authoritative_attribute_mutation_proof.html` | toggleAttribute/removeAttribute use Servo's production attribute machinery with exact optional-boolean conversion, V8-owned InvalidCharacterError, and cross-engine DOM visibility |
 | `authoritative_create_element_proof.html` | Document.createElement preserves descriptor/brand/conversion order, dictionary/string union behavior, HTML normalization, fresh wrappers, fail-closed matching custom elements, and a rendered Hello screenshot |
 | `authoritative_document_fragment_proof.html` | Document.createDocumentFragment preserves its exact Document method surface and dynamic Node identity; fragment insertion splices production children, preserves the returned fragment wrapper, maps mutation errors in V8, and is visible to SpiderMonkey |
+| `authoritative_create_text_node_proof.html` | Document.createTextNode preserves receiver/argument conversion ordering and fresh Text wrappers; generic Node fragment/Element insertion preserves identity and the final Text is visible to SpiderMonkey |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -625,7 +642,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 42 and remains experimental. The original
+The current exported C ABI is version 43 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

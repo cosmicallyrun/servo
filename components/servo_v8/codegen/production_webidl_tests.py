@@ -196,6 +196,14 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertFalse(fragment_return.nullable())
         self.assertEqual(fragment_arguments, [])
         self.assertEqual(set(fragment._extendedAttrDict), {"NewObject"})
+        text = attributes[production_webidl.DOCUMENT_CREATE_TEXT_NODE]
+        text_return, text_arguments = text.signatures()[0]
+        self.assertEqual(text_return.name, "Text")
+        self.assertFalse(text_return.nullable())
+        self.assertEqual(set(text._extendedAttrDict), {"NewObject"})
+        self.assertEqual([argument.identifier.name for argument in text_arguments], ["data"])
+        self.assertTrue(text_arguments[0].type.isDOMString())
+        self.assertFalse(text_arguments[0].optional)
 
     def test_pins_each_real_enum_value_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -758,6 +766,65 @@ class SyntheticSelectionTests(unittest.TestCase):
         self.assert_create_document_fragment_rejected(
             "[NewObject] DocumentFragment createDocumentFragment(DOMString value);",
             "must take zero arguments",
+        )
+
+    def create_text_node_source(
+        self,
+        declaration: str = "[NewObject] Text createTextNode(DOMString data);",
+    ) -> str:
+        return f"""
+            interface Text {{}};
+            interface Element {{}};
+            interface Document {{ {declaration} }};
+        """
+
+    def assert_create_text_node_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": self.create_text_node_source(declaration)}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError, re.escape(expected)
+        ):
+            production_webidl._select_create_text_node_operation(
+                parser_results, production_webidl.DOCUMENT_CREATE_TEXT_NODE
+            )
+
+    def test_selects_exact_create_text_node_operation(self) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": self.create_text_node_source()}
+        )
+        method = production_webidl._select_create_text_node_operation(
+            parser_results, production_webidl.DOCUMENT_CREATE_TEXT_NODE
+        )
+        return_type, arguments = method.signatures()[0]
+        self.assertEqual(return_type.name, "Text")
+        self.assertEqual([argument.identifier.name for argument in arguments], ["data"])
+        self.assertEqual(set(method._extendedAttrDict), {"NewObject"})
+
+    def test_rejects_create_text_node_shape_drift(self) -> None:
+        self.assert_create_text_node_rejected(
+            "Text createTextNode(DOMString data);",
+            "must carry exactly ['NewObject']",
+        )
+        self.assert_create_text_node_rejected(
+            "[NewObject] Text? createTextNode(DOMString data);",
+            "must return non-nullable Text",
+        )
+        self.assert_create_text_node_rejected(
+            "[NewObject] Element createTextNode(DOMString data);",
+            "must return non-nullable Text",
+        )
+        self.assert_create_text_node_rejected(
+            "[NewObject] Text createTextNode(DOMString? data);",
+            "argument must be required non-nullable DOMString data",
+        )
+        self.assert_create_text_node_rejected(
+            "[NewObject] Text createTextNode(optional DOMString data);",
+            "argument must be required non-nullable DOMString data",
+        )
+        self.assert_create_text_node_rejected(
+            "[NewObject] Text createTextNode(DOMString value);",
+            "argument must be required non-nullable DOMString data",
         )
 
     def html_collection_source(

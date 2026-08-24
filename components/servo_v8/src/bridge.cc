@@ -231,6 +231,7 @@ struct ServoV8DomCell final : public v8::Object::Wrappable {
 enum class ServoV8HostKind : uint8_t {
   kElement = SERVO_V8_INTERFACE_ELEMENT,
   kDocumentFragment = SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT,
+  kText = SERVO_V8_INTERFACE_TEXT,
   kNodeList,
   kHTMLCollection,
 };
@@ -351,6 +352,9 @@ struct ServoV8RealmState {
   v8::Global<v8::Object> element_prototype;
   v8::Global<v8::ObjectTemplate> document_fragment_template;
   v8::Global<v8::Object> document_fragment_prototype;
+  v8::Global<v8::ObjectTemplate> text_template;
+  v8::Global<v8::Object> text_prototype;
+  v8::Global<v8::Object> character_data_prototype;
   v8::Global<v8::Object> node_prototype;
   v8::Global<v8::ObjectTemplate> node_list_template;
   v8::Global<v8::Object> node_list_prototype;
@@ -1087,7 +1091,8 @@ v8::Local<v8::Object> WrapperForHTMLCollectionValue(
 
 bool IsNodeInterfaceKind(uint8_t kind) {
   return kind == SERVO_V8_INTERFACE_ELEMENT ||
-         kind == SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT;
+         kind == SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT ||
+         kind == SERVO_V8_INTERFACE_TEXT;
 }
 
 bool IsValidElementInterfaceValue(const ServoV8InterfaceValue& value) {
@@ -1309,20 +1314,40 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
   }
 
   v8::Local<v8::Object> wrapper;
-  const bool is_element = kind == ServoV8HostKind::kElement;
-  if ((is_element && (realm->element_template.IsEmpty() ||
-                      realm->element_prototype.IsEmpty())) ||
-      (!is_element && (realm->document_fragment_template.IsEmpty() ||
-                       realm->document_fragment_prototype.IsEmpty()))) {
-    DropUnownedElementHost(runtime, value.native, drop);
-    return v8::Local<v8::Object>();
+  v8::Local<v8::ObjectTemplate> instance_template;
+  v8::Local<v8::Object> prototype;
+  switch (kind) {
+    case ServoV8HostKind::kElement:
+      if (realm->element_template.IsEmpty() ||
+          realm->element_prototype.IsEmpty()) {
+        DropUnownedElementHost(runtime, value.native, drop);
+        return v8::Local<v8::Object>();
+      }
+      instance_template = realm->element_template.Get(isolate);
+      prototype = realm->element_prototype.Get(isolate);
+      break;
+    case ServoV8HostKind::kDocumentFragment:
+      if (realm->document_fragment_template.IsEmpty() ||
+          realm->document_fragment_prototype.IsEmpty()) {
+        DropUnownedElementHost(runtime, value.native, drop);
+        return v8::Local<v8::Object>();
+      }
+      instance_template = realm->document_fragment_template.Get(isolate);
+      prototype = realm->document_fragment_prototype.Get(isolate);
+      break;
+    case ServoV8HostKind::kText:
+      if (realm->text_template.IsEmpty() || realm->text_prototype.IsEmpty() ||
+          realm->character_data_prototype.IsEmpty()) {
+        DropUnownedElementHost(runtime, value.native, drop);
+        return v8::Local<v8::Object>();
+      }
+      instance_template = realm->text_template.Get(isolate);
+      prototype = realm->text_prototype.Get(isolate);
+      break;
+    default:
+      DropUnownedElementHost(runtime, value.native, drop);
+      return v8::Local<v8::Object>();
   }
-  v8::Local<v8::ObjectTemplate> instance_template =
-      is_element ? realm->element_template.Get(isolate)
-                 : realm->document_fragment_template.Get(isolate);
-  v8::Local<v8::Object> prototype =
-      is_element ? realm->element_prototype.Get(isolate)
-                 : realm->document_fragment_prototype.Get(isolate);
   if (!instance_template
            ->NewInstance(context)
            .ToLocal(&wrapper)) {
@@ -4362,6 +4387,9 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->element_prototype.Reset();
   realm->document_fragment_template.Reset();
   realm->document_fragment_prototype.Reset();
+  realm->text_template.Reset();
+  realm->text_prototype.Reset();
+  realm->character_data_prototype.Reset();
   realm->node_prototype.Reset();
   realm->node_list_template.Reset();
   realm->node_list_prototype.Reset();
@@ -4681,18 +4709,42 @@ extern "C" int32_t servo_v8_realm_create(
   document_fragment_constructor->SetClassName(V8String(isolate, "DocumentFragment"));
   v8::Local<v8::ObjectTemplate> document_fragment_instance =
       document_fragment_constructor->InstanceTemplate();
+  // Text and CharacterData are likewise materialized only by Document's
+  // factory method. Their dedicated prototypes preserve WebIDL's inheritance
+  // without accidentally conferring the Element brand.
+  v8::Local<v8::FunctionTemplate> text_constructor =
+      v8::FunctionTemplate::New(isolate);
+  text_constructor->SetClassName(V8String(isolate, "Text"));
+  v8::Local<v8::ObjectTemplate> text_instance =
+      text_constructor->InstanceTemplate();
   v8::Local<v8::Object> node_prototype = v8::Object::New(isolate);
   v8::Local<v8::Object> element_prototype = v8::Object::New(isolate);
   v8::Local<v8::Object> document_fragment_prototype = v8::Object::New(isolate);
+  v8::Local<v8::Object> character_data_prototype = v8::Object::New(isolate);
+  v8::Local<v8::Object> text_prototype = v8::Object::New(isolate);
   if (!InstallNodeListInterface(realm.get(), context, global) ||
       !InstallHTMLCollectionInterface(realm.get(), context, global) ||
       !InstallNodePrototype(realm.get(), context, node_prototype) ||
       !InstallElementPrototype(realm.get(), context, element_prototype) ||
       !element_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
       !document_fragment_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
+      !character_data_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
+      !text_prototype->SetPrototype(context, character_data_prototype).FromMaybe(false) ||
       !document_fragment_prototype
            ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
                                V8String(isolate, "DocumentFragment"),
+                               static_cast<v8::PropertyAttribute>(
+                                   v8::ReadOnly | v8::DontEnum))
+           .FromMaybe(false) ||
+      !character_data_prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "CharacterData"),
+                               static_cast<v8::PropertyAttribute>(
+                                   v8::ReadOnly | v8::DontEnum))
+           .FromMaybe(false) ||
+      !text_prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "Text"),
                                static_cast<v8::PropertyAttribute>(
                                    v8::ReadOnly | v8::DontEnum))
            .FromMaybe(false) ||
@@ -4716,6 +4768,9 @@ extern "C" int32_t servo_v8_realm_create(
   realm->element_prototype.Reset(isolate, element_prototype);
   realm->document_fragment_template.Reset(isolate, document_fragment_instance);
   realm->document_fragment_prototype.Reset(isolate, document_fragment_prototype);
+  realm->text_template.Reset(isolate, text_instance);
+  realm->text_prototype.Reset(isolate, text_prototype);
+  realm->character_data_prototype.Reset(isolate, character_data_prototype);
   realm->node_prototype.Reset(isolate, node_prototype);
   realm->context.Reset(isolate, context);
   realm->document.Reset(isolate, document);

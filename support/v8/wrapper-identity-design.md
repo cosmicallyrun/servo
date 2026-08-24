@@ -273,6 +273,16 @@ listeners beyond this Element/DocumentFragment slice remain separate problems:
 a V8 function held by a Servo event target reverses the edge direction this
 design depends on and must be reasoned about again from scratch.
 
+ABI v43 adds Text as a third dynamic Node kind. `Document.createTextNode`
+constructs a fresh Text-kind host rooted as `Trusted<Node>` and uses the same
+allocation-address cache key plus mandatory cached-kind check as Element and
+DocumentFragment. Text can therefore be supplied to Fragment and Element
+Node mutations without changing the installed Rust `T`; a returned Text also
+converges on its existing wrapper cache entry. The current Text facade is
+intentionally limited to inherited Node state and mutations. Exposing
+CharacterData/Text-specific APIs would require separate proof of their exact
+Web IDL conversion, UTF-16 indexing, and mutation-observer semantics.
+
 ## The constraint this design depends on
 
 No object in the SpiderMonkey heap may ever hold a V8 handle, a cppgc pointer,

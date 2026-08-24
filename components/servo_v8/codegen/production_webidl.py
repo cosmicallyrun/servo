@@ -65,6 +65,7 @@ DOCUMENT_QUERY_SELECTOR = "Document.querySelector"
 DOCUMENT_QUERY_SELECTOR_ALL = "Document.querySelectorAll"
 DOCUMENT_CREATE_ELEMENT = "Document.createElement"
 DOCUMENT_CREATE_DOCUMENT_FRAGMENT = "Document.createDocumentFragment"
+DOCUMENT_CREATE_TEXT_NODE = "Document.createTextNode"
 WINDOW_OR_WORKER_SET_TIMEOUT = "WindowOrWorkerGlobalScope.setTimeout"
 WINDOW_OR_WORKER_CLEAR_TIMEOUT = "WindowOrWorkerGlobalScope.clearTimeout"
 WINDOW_OR_WORKER_SET_INTERVAL = "WindowOrWorkerGlobalScope.setInterval"
@@ -138,6 +139,7 @@ NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE = (
 )
 CREATE_ELEMENT = "CEReactions NewObject Throws createElement"
 CREATE_DOCUMENT_FRAGMENT = "NewObject createDocumentFragment"
+CREATE_TEXT_NODE = "NewObject DOMString createTextNode"
 
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
@@ -171,6 +173,7 @@ NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE_EXTENDED_ATTRIBUTES = frozenset(
     {"NewObject", "Throws"}
 )
 CREATE_DOCUMENT_FRAGMENT_EXTENDED_ATTRIBUTES = frozenset({"NewObject"})
+CREATE_TEXT_NODE_EXTENDED_ATTRIBUTES = frozenset({"NewObject"})
 SAMEOBJECT_READONLY_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"SameObject"})
 
 # An enum crosses the ABI as its string value, so the generated glue is only
@@ -298,6 +301,7 @@ DOCUMENT_HOST: tuple[DocumentHostMember, ...] = (
     DocumentHostMember(
         DOCUMENT_CREATE_DOCUMENT_FRAGMENT, CREATE_DOCUMENT_FRAGMENT, "DocumentFragment"
     ),
+    DocumentHostMember(DOCUMENT_CREATE_TEXT_NODE, CREATE_TEXT_NODE, "Text"),
 )
 
 # These operations are installed by a separate per-realm timer host rather
@@ -2289,6 +2293,12 @@ def _select_document_host_member(
         return _select_create_document_fragment_operation(
             parser_results, member.qualified_name
         )
+    if member.shape == CREATE_TEXT_NODE:
+        if member.expected_interface != "Text":
+            raise WebIDLSelectionError(
+                f"create-text-node shape for {member.qualified_name} must return Text"
+            )
+        return _select_create_text_node_operation(parser_results, member.qualified_name)
     if member.shape == READONLY_ENUM:
         if member.expected_interface is not None:
             raise WebIDLSelectionError(
@@ -2578,6 +2588,83 @@ def _select_create_document_fragment_operation(
     if arguments:
         raise WebIDLSelectionError(
             f"`{qualified_name}` must take zero arguments, found {len(arguments)}"
+        )
+    return member
+
+
+def _select_create_text_node_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str,
+) -> WebIDL.IDLMethod:
+    """Pin the exact one-argument Document.createTextNode operation."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface {interface_name}, found {len(interfaces)}"
+        )
+    members = [
+        member for member in interfaces[0].members if member.identifier.name == member_name
+    ]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member {qualified_name}, found {len(members)}"
+        )
+    member = members[0]
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(
+            f"{qualified_name} must be an ordinary instance operation"
+        )
+    actual_attributes = set(member._extendedAttrDict)
+    expected_attributes = {"NewObject"}
+    if actual_attributes != expected_attributes:
+        raise WebIDLSelectionError(
+            f"{qualified_name} must carry exactly {sorted(expected_attributes)}, "
+            f"got {sorted(actual_attributes)}"
+        )
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"{qualified_name} must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if (
+        return_type.nullable()
+        or not return_type.isInterface()
+        or return_type.name != "Text"
+    ):
+        raise WebIDLSelectionError(
+            f"{qualified_name} must return non-nullable Text, "
+            f"got {return_type.prettyName()}"
+        )
+    if len(arguments) != 1:
+        raise WebIDLSelectionError(
+            f"{qualified_name} must take exactly one argument, found {len(arguments)}"
+        )
+    argument = arguments[0]
+    if (
+        argument.identifier.name != "data"
+        or argument.optional
+        or argument.variadic
+        or argument.defaultValue is not None
+        or argument.type.nullable()
+        or not argument.type.isDOMString()
+    ):
+        raise WebIDLSelectionError(
+            f"{qualified_name} argument must be required non-nullable DOMString data"
+        )
+    argument_attributes = set(argument._extendedAttrDict) | set(
+        argument.type._extendedAttrDict
+    )
+    if argument_attributes:
+        raise WebIDLSelectionError(
+            f"{qualified_name} argument data carries extended attributes that are "
+            "not implemented: " + ", ".join(sorted(argument_attributes))
         )
     return member
 

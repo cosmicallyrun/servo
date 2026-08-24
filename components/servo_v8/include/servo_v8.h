@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 42u
+#define SERVO_V8_ABI_VERSION 43u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -87,6 +87,7 @@ typedef struct ServoV8InterfaceValue {
 #define SERVO_V8_INTERFACE_NULL 0u
 #define SERVO_V8_INTERFACE_ELEMENT 1u
 #define SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT 2u
+#define SERVO_V8_INTERFACE_TEXT 3u
 
 /* Generated typed WebIDL vtables contain only POD values and native pointers. */
 #include "servo_v8_generated.h"

@@ -69,6 +69,7 @@ proofs=(
   # the unmarked follow-up script emits the PASS marker and checks the DOM.
   "authoritative_create_element_proof.html:rendered:0:1"
   "authoritative_document_fragment_proof.html:rendered:0:0"
+  "authoritative_create_text_node_proof.html:rendered:0:0"
   # bgColor is set by the SpiderMonkey error handler, not by V8.
   "authoritative_job_error_proof.html:(0, 255, 0):0:0"
 )
@@ -126,6 +127,9 @@ PY
         ;;
       authoritative_document_fragment_proof.html)
         marker="RESULT documentFragment v42 PASS text=Hello"
+        ;;
+      authoritative_create_text_node_proof.html)
+        marker="RESULT createTextNode v43 PASS text=Hello"
         ;;
       *) marker="" ;;
     esac

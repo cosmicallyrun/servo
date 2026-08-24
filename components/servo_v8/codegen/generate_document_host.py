@@ -2752,6 +2752,188 @@ def _create_document_fragment_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_rust_member_name(member.attribute)}"]
 
 
+def _create_text_node_argument(member: Member) -> WebIDL.IDLArgument:
+    _, arguments = member.attribute.signatures()[0]
+    return arguments[0]
+
+
+def _create_text_node_header_slots(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    argument = _rust_member_name(_create_text_node_argument(member))
+    return [
+        f"  uint8_t (*{name})(void* native, void* host_context,",
+        f"{C_SIGNATURE_INDENT}const uint8_t* {argument},",
+        f"{C_SIGNATURE_INDENT}size_t {argument}_length,",
+        f"{C_SIGNATURE_INDENT}ServoV8InterfaceValue* output);",
+    ]
+
+
+def _create_text_node_rust_trait_members(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        "    /// Creates a Text node using the ephemeral host context.",
+        f"    unsafe fn {name}(",
+        "        &self,",
+        "        host_context: *mut c_void,",
+        "        data: &str,",
+        "    ) -> Option<InterfaceHandle>;",
+    ]
+
+
+def _create_text_node_rust_vtable_fields(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"    pub {name}: Option<",
+        "        unsafe extern \"C\" fn(",
+        "            *mut c_void,",
+        "            *mut c_void,",
+        "            *const u8,",
+        "            usize,",
+        "            *mut RawInterfaceValue,",
+        "        ) -> u8,",
+        "    >,",
+    ]
+
+
+def _create_text_node_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{name}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    host_context: *mut c_void,",
+            "    data: *const u8,",
+            "    data_length: usize,",
+            "    output: *mut RawInterfaceValue,",
+            ") -> u8 {",
+            "    if native.is_null() || host_context.is_null() || output.is_null() ||",
+            "        (data.is_null() && data_length != 0)",
+            "    {",
+            "        return 0;",
+            "    }",
+            "    let data_bytes = if data_length == 0 {",
+            "        &[]",
+            "    } else {",
+            "        // SAFETY: The ABI contract lends this byte range for the callback.",
+            "        unsafe { std::slice::from_raw_parts(data, data_length) }",
+            "    };",
+            "    let Ok(data) = std::str::from_utf8(data_bytes) else {",
+            "        return 0;",
+            "    };",
+            "    // SAFETY: The vtable contract supplies a live Box<T> and lends the",
+            "    // non-null host context only for this callback.",
+            "    let handle = unsafe {",
+            f"        (&*native.cast::<T>()).{name}(host_context, data)",
+            "    };",
+            "    let succeeded = handle.is_some();",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe {",
+            "        *output = match handle {",
+            "            Some(handle) => RawInterfaceValue {",
+            "                kind: handle.kind,",
+            "                key: handle.key,",
+            "                native: handle.native,",
+            "            },",
+            "            None => raw_null_interface_value(),",
+            "        };",
+            "    }",
+            "    u8::from(succeeded)",
+            "}",
+        ],
+    )
+
+
+def _create_text_node_rust_vtable_init(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [f"            {name}: Some(document_host_{name}::<T>),"]
+
+
+def _create_text_node_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    callback = _cpp_member_name(member.attribute)
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostCall{callback}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{name}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->text_template.IsEmpty() ||",
+            "      realm->text_prototype.IsEmpty() ||",
+            "      realm->character_data_prototype.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "Text host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  if (info.Length() < 1) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} requires one argument");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            "  v8::Local<v8::String> data_value;",
+            "  if (!info[0]->ToString(context).ToLocal(&data_value)) return;",
+            "  v8::String::Utf8Value data_utf8(isolate, data_value);",
+            "  if (!*data_utf8 && data_utf8.length() != 0) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} argument conversion failed");',
+            "    return;",
+            "  }",
+            "  if (!state->active_host_context) {",
+            '    ThrowTypeError(isolate, "Document mutation requires a live host context");',
+            "    return;",
+            "  }",
+            "  ServoV8InterfaceValue value{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{name}(",
+            "        state->native, state->active_host_context,",
+            "        reinterpret_cast<const uint8_t*>(*data_utf8),",
+            "        static_cast<size_t>(data_utf8.length()), &value) != 0;",
+            "  }",
+            "  auto fail = [&](const char* message) {",
+            "    DropUnownedElementHost(state->runtime, value.native,",
+            "                             state->runtime->element_host_vtable.drop);",
+            "    value.native = nullptr;",
+            "    ThrowTypeError(isolate, message);",
+            "  };",
+            "  if (!succeeded) {",
+            f'    fail("{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            "  if (value.kind != SERVO_V8_INTERFACE_TEXT ||",
+            "      !value.key || !value.native) {",
+            f'    fail("invalid {qualified_name} interface result");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Object> wrapper =",
+            "      WrapperForInterfaceValue(realm, isolate, context, value);",
+            "  value.native = nullptr;",
+            "  if (wrapper.IsEmpty()) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} wrapper could not be created");',
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(wrapper);",
+            "}",
+        ],
+    )
+
+
+def _create_text_node_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_rust_member_name(member.attribute)}"]
+
+
 # The owned UTF-8 transfer is shared by every DOMString member: one C type, one
 # Rust type, one Rust owner drop, and one C++ scope guard, emitted once.
 _OWNED_UTF8_C_TYPE: Block = [
@@ -3021,6 +3203,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(),
         cpp_bodies=_create_document_fragment_cpp_bodies,
         cpp_vtable_terms=_create_document_fragment_cpp_vtable_terms,
+    ),
+    production_webidl.CREATE_TEXT_NODE: ShapeEmitter(
+        header_type_blocks=(),
+        header_slots=_create_text_node_header_slots,
+        rust_type_blocks=(),
+        rust_trait_members=_create_text_node_rust_trait_members,
+        rust_vtable_fields=_create_text_node_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_create_text_node_rust_thunks,
+        rust_vtable_init=_create_text_node_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_create_text_node_cpp_bodies,
+        cpp_vtable_terms=_create_text_node_cpp_vtable_terms,
     ),
 }
 

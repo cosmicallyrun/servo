@@ -154,6 +154,8 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::characterdata::text::Text;
 use crate::dom::csp::{CspReporting, GlobalCspReporting, Violation};
 use crate::dom::customelementregistry::{
     CallbackReaction, CustomElementDefinition, CustomElementReactionStack,
@@ -252,6 +254,7 @@ struct V8DocumentHiddenStats {
 enum V8NodeInterfaceKind {
     Element,
     DocumentFragment,
+    Text,
 }
 
 /// A host for one Servo Node that V8 has been handed.
@@ -542,6 +545,8 @@ fn v8_node_interface_handle(node: &Node) -> Option<servo_v8::InterfaceHandle> {
         V8NodeInterfaceKind::Element
     } else if node.is::<DocumentFragment>() {
         V8NodeInterfaceKind::DocumentFragment
+    } else if node.is::<Text>() {
+        V8NodeInterfaceKind::Text
     } else {
         return None;
     };
@@ -564,6 +569,10 @@ fn v8_node_interface_handle(node: &Node) -> Option<servo_v8::InterfaceHandle> {
                     host,
                 ))
             },
+            V8NodeInterfaceKind::Text => Some(servo_v8::InterfaceHandle::text(
+                (node as *const Node).cast::<c_void>(),
+                host,
+            )),
         }
     }
 }
@@ -1509,6 +1518,35 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             return None;
         }
         v8_node_interface_handle(fragment.upcast::<Node>())
+    }
+
+    unsafe fn create_text_node(
+        &self,
+        host_context: *mut c_void,
+        data: &str,
+    ) -> Option<servo_v8::InterfaceHandle> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative V8 entry lends this live owner-thread
+        // SpiderMonkey context only for the synchronous production DOM call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return None;
+        }
+
+        // Text reflection requires this ephemeral SpiderMonkey context, but
+        // the exact DocumentMethods operation has no script or reaction path.
+        let text = self
+            .document
+            .root()
+            .CreateTextNode(cx, DOMString::from(data));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return None;
+        }
+        v8_node_interface_handle(text.upcast::<Node>())
     }
 
     unsafe fn query_selector(

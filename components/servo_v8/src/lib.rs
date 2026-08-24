@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 42;
+const ABI_VERSION: u32 = 43;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -155,10 +155,12 @@ pub struct RawInterfaceValue {
 pub const INTERFACE_NULL: u8 = 0;
 pub const INTERFACE_ELEMENT: u8 = 1;
 pub const INTERFACE_DOCUMENT_FRAGMENT: u8 = 2;
+pub const INTERFACE_TEXT: u8 = 3;
 // Named aliases keep generated ABI code self-describing.
 pub const INTERFACE_KIND_NULL: u8 = INTERFACE_NULL;
 pub const INTERFACE_KIND_ELEMENT: u8 = INTERFACE_ELEMENT;
 pub const INTERFACE_KIND_DOCUMENT_FRAGMENT: u8 = INTERFACE_DOCUMENT_FRAGMENT;
+pub const INTERFACE_KIND_TEXT: u8 = INTERFACE_TEXT;
 
 /// One Servo DOM object being handed to script.
 ///
@@ -209,6 +211,20 @@ impl InterfaceHandle {
     ) -> Self {
         Self {
             kind: INTERFACE_DOCUMENT_FRAGMENT,
+            key: dom_object,
+            native: Box::into_raw(Box::new(host)).cast::<c_void>(),
+        }
+    }
+
+    /// Boxes a host as a `Text` Node.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`Self::new`] apply. Text shares the one
+    /// concrete installed host type and drop vtable with every exposed Node.
+    pub unsafe fn text<T: ElementHostBinding>(dom_object: *const c_void, host: T) -> Self {
+        Self {
+            kind: INTERFACE_TEXT,
             key: dom_object,
             native: Box::into_raw(Box::new(host)).cast::<c_void>(),
         }
@@ -3946,7 +3962,11 @@ mod tests {
         }
 
         fn node_type(&self) -> u16 {
-            u16::from(self.tag_name == "#document-fragment") * 10 + 1
+            match self.tag_name.as_str() {
+                "#document-fragment" => 11,
+                "#text" => 3,
+                _ => 1,
+            }
         }
 
         fn node_name(&self) -> String {
@@ -3965,7 +3985,9 @@ mod tests {
             assert!(!host_context.is_null());
             let value = value.unwrap_or_default();
             *self.state.text_content.borrow_mut() = Some(value.to_owned());
-            self.state.has_child_nodes.set(!value.is_empty());
+            self.state
+                .has_child_nodes
+                .set(self.tag_name != "#text" && !value.is_empty());
             for child in self.state.element_children.borrow().iter() {
                 child.state.is_connected.set(false);
             }
@@ -3975,6 +3997,9 @@ mod tests {
 
         fn parent_element(&self) -> Option<InterfaceHandle> {
             let parent = self.parent_element.as_ref()?;
+            if matches!(parent.tag_name.as_str(), "#document-fragment" | "#text") {
+                return None;
+            }
             let parent_children = self.parent_children.as_ref()?;
             if !parent_children
                 .borrow()
@@ -4448,10 +4473,10 @@ mod tests {
                     drops: Rc::clone(&self.drops),
                     drop_reentry: self.drop_reentry.clone(),
                 };
-                if self.tag_name == "#document-fragment" {
-                    InterfaceHandle::document_fragment(self.identity, host)
-                } else {
-                    InterfaceHandle::new(self.identity, host)
+                match self.tag_name.as_str() {
+                    "#document-fragment" => InterfaceHandle::document_fragment(self.identity, host),
+                    "#text" => InterfaceHandle::text(self.identity, host),
+                    _ => InterfaceHandle::new(self.identity, host),
                 }
             }
         }
@@ -4894,6 +4919,40 @@ mod tests {
                     ElementHostProbe {
                         local_name: "#document-fragment".to_owned(),
                         tag_name: "#document-fragment".to_owned(),
+                        identity: key,
+                        state,
+                        _owned_identity: Some(identity),
+                        parent_children: None,
+                        parent_state: None,
+                        parent_element: None,
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        unsafe fn create_text_node(
+            &self,
+            host_context: *mut c_void,
+            data: &str,
+        ) -> Option<InterfaceHandle> {
+            if host_context.is_null() {
+                return None;
+            }
+            let identity = Rc::new(0_u8);
+            let key = Rc::as_ptr(&identity).cast::<c_void>();
+            let state = ElementProbeState::with_attributes(&[]);
+            *state.text_content.borrow_mut() = Some(data.to_owned());
+            state.is_connected.set(false);
+            // SAFETY: see `create_document_fragment`; the returned host owns
+            // its cache identity and shares the runtime's one concrete vtable.
+            Some(unsafe {
+                InterfaceHandle::text(
+                    key,
+                    ElementHostProbe {
+                        local_name: "#text".to_owned(),
+                        tag_name: "#text".to_owned(),
                         identity: key,
                         state,
                         _owned_identity: Some(identity),
@@ -9166,6 +9225,7 @@ mod tests {
         let query_all_callback = vtable.query_selector_all.unwrap();
         let create_callback = vtable.create_element.unwrap();
         let create_fragment_callback = vtable.create_document_fragment.unwrap();
+        let create_text_callback = vtable.create_text_node.unwrap();
         let mut host_context = 0_u8;
         let host_context = (&mut host_context as *mut u8).cast::<c_void>();
         let mut output = RawInterfaceValue {
@@ -9469,6 +9529,50 @@ mod tests {
             assert!(!fragment_output.key.is_null());
             assert!(!fragment_output.native.is_null());
             element_host_drop::<ElementHostProbe>(fragment_output.native);
+
+            let mut text_output = raw_null_interface_value();
+            assert_eq!(
+                create_text_callback(
+                    std::ptr::null_mut(),
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    &mut text_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_text_callback(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut text_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_text_callback(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut text_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_text_callback(native, host_context, std::ptr::null(), 1, &mut text_output,),
+                0,
+            );
+            assert_eq!(
+                create_text_callback(native, host_context, std::ptr::null(), 0, &mut text_output,),
+                1,
+            );
+            assert_eq!(text_output.kind, INTERFACE_TEXT);
+            assert!(!text_output.key.is_null());
+            assert!(!text_output.native.is_null());
+            element_host_drop::<ElementHostProbe>(text_output.native);
             vtable.drop.unwrap()(native);
         }
         assert_eq!(&*calls.borrow(), &[""]);
@@ -9752,6 +9856,145 @@ mod tests {
                 )
                 .unwrap(),
             "fragment mutation without the ephemeral host context must be rejected"
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(
+            node_drops.get(),
+            5,
+            "four wrappers plus the appendChild cache-hit host must drop exactly once"
+        );
+    }
+
+    #[test]
+    fn text_nodes_keep_character_data_node_brand_and_mutation_identity() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const documentPrototype = Object.getPrototypeOf(document);
+              const descriptor = Object.getOwnPropertyDescriptor(
+                documentPrototype, 'createTextNode');
+              let wrongDocumentBrand = false;
+              try { descriptor.value.call({}, 'x'); }
+              catch (error) { wrongDocumentBrand = error instanceof TypeError; }
+              let conversions = 0;
+              const text = document.createTextNode({ toString() {
+                conversions++; return 'first';
+              }});
+              const second = document.createTextNode('second');
+              const fragment = document.createDocumentFragment();
+              const element = document.createElement('span');
+              const elementPrototype = Object.getPrototypeOf(element);
+              const textPrototype = Object.getPrototypeOf(text);
+              const characterDataPrototype = Object.getPrototypeOf(textPrototype);
+              const nodePrototype = Object.getPrototypeOf(characterDataPrototype);
+              const textTag = Object.getOwnPropertyDescriptor(
+                textPrototype, Symbol.toStringTag);
+              const characterDataTag = Object.getOwnPropertyDescriptor(
+                characterDataPrototype, Symbol.toStringTag);
+              let wrongElementBrand = false;
+              try { elementPrototype.getAttribute.call(text, 'id'); }
+              catch (error) { wrongElementBrand = error instanceof TypeError; }
+              const appended = fragment.appendChild(text) === text;
+              text.textContent = 'updated';
+              globalThis.textForNoContext = text;
+              globalThis.textNodeDiagnostics = {
+                descriptor: !!descriptor && descriptor.value.name === 'createTextNode' &&
+                  descriptor.value.length === 1 && descriptor.writable &&
+                  descriptor.enumerable && descriptor.configurable,
+                wrongDocumentBrand,
+                noGlobalConstructors: typeof Text === 'undefined' &&
+                  typeof CharacterData === 'undefined',
+                conversion: conversions === 1,
+                freshIdentity: text !== second,
+                prototypeChain: Object.getPrototypeOf(textPrototype) ===
+                  characterDataPrototype && Object.getPrototypeOf(characterDataPrototype) ===
+                  nodePrototype && characterDataPrototype !== elementPrototype,
+                nodeSurface: text.nodeType === 3 && text.nodeName === '#text' &&
+                  text.textContent === 'updated' && text.parentElement === null &&
+                  !text.isConnected && !text.hasChildNodes(),
+                tags: Object.prototype.toString.call(text) === '[object Text]' &&
+                  !!textTag && textTag.value === 'Text' && !textTag.writable &&
+                  !textTag.enumerable && textTag.configurable && !!characterDataTag &&
+                  characterDataTag.value === 'CharacterData' && !characterDataTag.writable &&
+                  !characterDataTag.enumerable && characterDataTag.configurable,
+                wrongElementBrand,
+                appended,
+              };
+              globalThis.textNodeBridgeProof = Object.values(textNodeDiagnostics).every(Boolean);
+            })();"#,
+            "document-create-text-node.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: the token remains live for the synchronous host callback.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        for check in [
+            "descriptor",
+            "wrongDocumentBrand",
+            "noGlobalConstructors",
+            "conversion",
+            "freshIdentity",
+            "prototypeChain",
+            "nodeSurface",
+            "tags",
+            "wrongElementBrand",
+            "appended",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(realm, &format!("textNodeDiagnostics.{check}"))
+                    .unwrap(),
+                "Text bridge check failed: {check}"
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { document.createTextNode('x'); } \
+                     catch (error) { return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap(),
+            "Text creation without the ephemeral host context must be rejected"
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { textForNoContext.textContent = 'x'; } \
+                     catch (error) { return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap(),
+            "Text mutation without the ephemeral host context must be rejected"
         );
 
         runtime.destroy_realm(realm).unwrap();
