@@ -173,7 +173,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "v8::String::Utf8Value utf8(isolate, value);",
             "state->vtable.set_bg_color(",
             "state->vtable.get_ready_state(state->native, &value)",
-            "value.is_null > 1",
+            "value.kind > SERVO_V8_INTERFACE_ELEMENT",
             "Document.getElementById requires one argument",
             "Document.getElementsByTagName requires one argument",
             "Document.getElementsByTagNameNS requires two arguments",
@@ -262,6 +262,39 @@ class DocumentHostGenerationTests(unittest.TestCase):
         )[1].split(".ToLocal", 1)[0]
 
         self.assertIn("v8::Local<v8::Data>(), 1,", install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", install)
+
+    def test_generates_create_document_fragment_abi_and_cleanup(self) -> None:
+        header = self.outputs[generate_document_host.HEADER_NAME]
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        self.assertIn(
+            "uint8_t (*create_document_fragment)(void* native, void* host_context,",
+            header,
+        )
+        self.assertIn("unsafe fn create_document_fragment(", rust)
+        self.assertIn(
+            'unsafe extern "C" fn document_host_create_document_fragment',
+            rust,
+        )
+        callback = cpp.split("void DocumentHostCallCreateDocumentFragment(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        for fragment in (
+            "state->active_host_context",
+            "document_fragment_template.IsEmpty()",
+            "document_fragment_prototype.IsEmpty()",
+            "DropUnownedElementHost(state->runtime, value.native",
+            "value.kind != SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT",
+            "WrapperForInterfaceValue(realm, isolate, context, value)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, callback)
+        self.assertNotIn("info.Length()", callback)
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallCreateDocumentFragment,", 1
+        )[1].split(".ToLocal", 1)[0]
+        self.assertIn("v8::Local<v8::Data>(), 0,", install)
         self.assertIn("v8::SideEffectType::kHasSideEffect", install)
 
     def test_marks_only_pure_selector_operations_as_side_effect_free(self) -> None:
@@ -420,6 +453,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
                     production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
                     production_webidl.CREATE_ELEMENT,
+                    production_webidl.CREATE_DOCUMENT_FRAGMENT,
                 }
                 if member.shape not in operation_shapes:
                     slot = f"get_{slot}"
@@ -440,6 +474,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
                     production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
                     production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
                     production_webidl.CREATE_ELEMENT,
+                    production_webidl.CREATE_DOCUMENT_FRAGMENT,
                 }:
                     self.assertIn(f"DocumentHostCall{callback}", output)
                     self.assertIn(f"{local}_method, v8::None", output)

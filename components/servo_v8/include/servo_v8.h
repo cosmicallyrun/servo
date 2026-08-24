@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 41u
+#define SERVO_V8_ABI_VERSION 42u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -78,10 +78,15 @@ typedef void (*ServoV8DropCallback)(void* native);
  * creates a new wrapper, and drops it through the vtable's drop callback when
  * an existing wrapper is found, so the transfer stays transactional. */
 typedef struct ServoV8InterfaceValue {
-  uint8_t is_null;
+  /* Stable dynamic interface discriminator.  Null has no payload. */
+  uint8_t kind;
   const void* key;
   void* native;
 } ServoV8InterfaceValue;
+
+#define SERVO_V8_INTERFACE_NULL 0u
+#define SERVO_V8_INTERFACE_ELEMENT 1u
+#define SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT 2u
 
 /* Generated typed WebIDL vtables contain only POD values and native pointers. */
 #include "servo_v8_generated.h"

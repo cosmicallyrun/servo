@@ -162,6 +162,8 @@ use crate::dom::document::focus::FocusableArea;
 use crate::dom::document::{
     Document, DocumentSource, HasBrowsingContext, IsHTMLDocument, RenderingUpdateReason,
 };
+#[cfg(feature = "v8-shadow")]
+use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
 #[cfg(feature = "v8-shadow")]
@@ -244,15 +246,37 @@ struct V8DocumentHiddenStats {
     url_getter_calls: Cell<u64>,
 }
 
-/// A host for one Servo `Element` that V8 has been handed.
+/// The V8-visible Node kinds backed by the one installed Rust host type.
+#[cfg(feature = "v8-shadow")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V8NodeInterfaceKind {
+    Element,
+    DocumentFragment,
+}
+
+/// A host for one Servo Node that V8 has been handed.
 ///
-/// The `Trusted<Element>` is the single cross-heap edge: it keeps the element
-/// alive while script can still reach the wrapper, and it is released when the
+/// The `Trusted<Node>` is the single cross-heap edge: it keeps the Node alive
+/// while script can still reach the wrapper, and it is released when the
 /// wrapper's cppgc cell is collected. Nothing in the SpiderMonkey heap points
 /// back at V8, so this edge cannot close a cycle.
 #[cfg(feature = "v8-shadow")]
-struct V8ElementHost {
-    element: Trusted<Element>,
+struct V8NodeHost {
+    node: Trusted<Node>,
+    kind: V8NodeInterfaceKind,
+}
+
+#[cfg(feature = "v8-shadow")]
+impl V8NodeHost {
+    /// Element-only callbacks are dispatched by C++ only after its `kElement`
+    /// brand check. Keep a checked Rust downcast as the second, non-unsafe
+    /// half of that invariant so a future bridge regression cannot become a
+    /// type-erased Rust cast.
+    fn element(&self) -> Option<DomRoot<Element>> {
+        (self.kind == V8NodeInterfaceKind::Element)
+            .then(|| DomRoot::downcast::<Element>(self.node.root()))
+            .flatten()
+    }
 }
 
 /// One static querySelectorAll snapshot. Each Trusted root is independent of
@@ -357,7 +381,7 @@ impl V8HTMLCollectionHost {
 #[expect(unsafe_code)]
 // SAFETY: The host and its Trusted root stay on the originating script
 // thread. Every operation synchronously traverses the owner's current tree,
-// and every returned item uses the installed V8ElementHost type.
+// and every returned item uses the installed V8NodeHost type.
 unsafe impl servo_v8::HTMLCollectionHostBinding for V8HTMLCollectionHost {
     fn length(&self) -> u32 {
         self.elements().len().min(u32::MAX as usize) as u32
@@ -489,7 +513,7 @@ fn v8_tag_ns_collection_handle(
 #[expect(unsafe_code)]
 // SAFETY: The host and its Trusted roots stay on the originating script
 // thread. Neither the accessors nor Drop enter V8 or pump an event loop, and
-// every item returns the runtime's installed V8ElementHost type.
+// every item returns the runtime's installed V8NodeHost type.
 unsafe impl servo_v8::NodeListHostBinding for V8StaticNodeListHost {
     fn length(&self) -> u32 {
         self.elements.len().min(u32::MAX as usize) as u32
@@ -513,15 +537,47 @@ fn v8_node_list_handle(elements: Vec<DomRoot<Element>>) -> servo_v8::NodeListHan
 }
 
 #[cfg(feature = "v8-shadow")]
+fn v8_node_interface_handle(node: &Node) -> Option<servo_v8::InterfaceHandle> {
+    let kind = if node.is::<Element>() {
+        V8NodeInterfaceKind::Element
+    } else if node.is::<DocumentFragment>() {
+        V8NodeInterfaceKind::DocumentFragment
+    } else {
+        return None;
+    };
+    // SAFETY: The cache key is the address of the exact Node allocation that
+    // the freshly boxed host roots. Its dynamic kind distinguishes interfaces
+    // while the Trusted root prevents address reuse for the wrapper's lifetime.
+    unsafe {
+        let host = V8NodeHost {
+            node: Trusted::new(node),
+            kind,
+        };
+        match kind {
+            V8NodeInterfaceKind::Element => Some(servo_v8::InterfaceHandle::new(
+                (node as *const Node).cast::<c_void>(),
+                host,
+            )),
+            V8NodeInterfaceKind::DocumentFragment => {
+                Some(servo_v8::InterfaceHandle::document_fragment(
+                    (node as *const Node).cast::<c_void>(),
+                    host,
+                ))
+            },
+        }
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
 fn v8_element_interface_handle(element: &Element) -> servo_v8::InterfaceHandle {
-    // SAFETY: The cache key is the address of the same Element allocation that
-    // the freshly boxed host roots. The Trusted root prevents address reuse for
-    // the complete lifetime of any wrapper cell that owns this host.
+    // SAFETY: `element` is statically an Element and the one concrete V8 host
+    // type is installed before any interface handle is constructed.
     unsafe {
         servo_v8::InterfaceHandle::new(
-            (element as *const Element).cast::<c_void>(),
-            V8ElementHost {
-                element: Trusted::new(element),
+            (element.upcast::<Node>() as *const Node).cast::<c_void>(),
+            V8NodeHost {
+                node: Trusted::new(element.upcast()),
+                kind: V8NodeInterfaceKind::Element,
             },
         )
     }
@@ -537,7 +593,7 @@ fn v8_element_interface_handle(element: &Element) -> servo_v8::InterfaceHandle {
 fn v8_node_mutation_result(
     cx: &mut JSContext,
     result: Result<DomRoot<Node>, Error>,
-    returned: &Element,
+    returned: &Node,
 ) -> servo_v8::NodeMutationResult {
     // A production mutation currently has no SpiderMonkey-throwing branch,
     // but preserve the host boundary if one is added. Do this before creating
@@ -548,12 +604,13 @@ fn v8_node_mutation_result(
     }
 
     match result {
-        Ok(_) => servo_v8::NodeMutationResult::Returned(v8_element_interface_handle(returned)),
+        Ok(_) => v8_node_interface_handle(returned)
+            .map(servo_v8::NodeMutationResult::Returned)
+            .unwrap_or(servo_v8::NodeMutationResult::HostFailure),
         Err(Error::HierarchyRequest(message)) => servo_v8::NodeMutationResult::DomException {
             kind: servo_v8::NodeMutationException::HierarchyRequest,
-            message: message.unwrap_or_else(|| {
-                "The operation would yield an incorrect node tree.".to_owned()
-            }),
+            message: message
+                .unwrap_or_else(|| "The operation would yield an incorrect node tree.".to_owned()),
         },
         Err(Error::NotFound(message)) => servo_v8::NodeMutationResult::DomException {
             kind: servo_v8::NodeMutationException::NotFound,
@@ -571,17 +628,23 @@ fn v8_node_mutation_result(
 // SAFETY: This host stays on its element's originating script thread, roots
 // the element only for the duration of a synchronous read, and its Drop only
 // releases a Trusted handle -- it never re-enters V8 or pumps an event loop.
-unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
+unsafe impl servo_v8::ElementHostBinding for V8NodeHost {
     fn local_name(&self) -> String {
-        self.element.root().LocalName().into()
+        self.element()
+            .map(|element| element.LocalName().into())
+            .unwrap_or_default()
     }
 
     fn tag_name(&self) -> String {
-        self.element.root().TagName().into()
+        self.element()
+            .map(|element| element.TagName().into())
+            .unwrap_or_default()
     }
 
     fn id(&self) -> String {
-        self.element.root().Id().into()
+        self.element()
+            .map(|element| element.Id().into())
+            .unwrap_or_default()
     }
 
     unsafe fn set_id(&self, host_context: *mut c_void, value: &str) -> bool {
@@ -594,13 +657,18 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // Do not push and pop a CEReactions queue here: that could invoke a
         // SpiderMonkey callback beneath a V8 accessor and the sidecar borrow.
         // Servo's outer or backup queue runs the reaction after V8 unwinds.
-        self.element.root().SetId(cx, DOMString::from(value));
+        let Some(element) = self.element() else {
+            return false;
+        };
+        element.SetId(cx, DOMString::from(value));
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         !unsafe { JS_IsExceptionPending(cx) }
     }
 
     fn class_name(&self) -> String {
-        self.element.root().ClassName().into()
+        self.element()
+            .map(|element| element.ClassName().into())
+            .unwrap_or_default()
     }
 
     unsafe fn set_class_name(&self, host_context: *mut c_void, value: &str) -> bool {
@@ -611,22 +679,29 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
         // CEReactions deliberately stay on Servo's outer or backup queue; see
         // `set_id` above for why they must not run under this V8 callback.
-        self.element.root().SetClassName(cx, DOMString::from(value));
+        let Some(element) = self.element() else {
+            return false;
+        };
+        element.SetClassName(cx, DOMString::from(value));
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         !unsafe { JS_IsExceptionPending(cx) }
     }
 
     fn has_attributes(&self) -> bool {
-        self.element.root().HasAttributes()
+        self.element()
+            .is_some_and(|element| element.HasAttributes())
     }
 
     fn get_attribute_names(&self) -> Vec<String> {
-        self.element
-            .root()
-            .GetAttributeNames()
-            .into_iter()
-            .map(Into::into)
-            .collect()
+        self.element()
+            .map(|element| {
+                element
+                    .GetAttributeNames()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     unsafe fn get_attribute(
@@ -639,9 +714,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative entry lends its live owner-thread context.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let value = self
-            .element
-            .root()
+        let Some(element) = self.element() else {
+            return Err(());
+        };
+        let value = element
             .GetAttribute(cx, DOMString::from(name))
             .map(Into::into);
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
@@ -658,7 +734,8 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative entry lends its live owner-thread context.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let value = self.element.root().HasAttribute(cx, DOMString::from(name));
+        let element = self.element()?;
+        let value = element.HasAttribute(cx, DOMString::from(name));
         // SAFETY: cx is the live owner-thread SpiderMonkey context.
         (!unsafe { JS_IsExceptionPending(cx) }).then_some(value)
     }
@@ -674,9 +751,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative entry lends its live owner-thread context.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let value = self
-            .element
-            .root()
+        let Some(element) = self.element() else {
+            return Err(());
+        };
+        let value = element
             .GetAttributeNS(
                 cx,
                 namespace.map(DOMString::from),
@@ -702,7 +780,8 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative entry lends its live owner-thread context.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let value = self.element.root().HasAttributeNS(
+        let element = self.element()?;
+        let value = element.HasAttributeNS(
             cx,
             namespace.map(DOMString::from),
             DOMString::from(local_name),
@@ -726,10 +805,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // Do not create or pop a CEReactions queue here. Attribute changes
         // enqueue through Servo's existing outer or backup queue, which is
         // deliberately drained only after this V8 callback has unwound.
-        let result = self
-            .element
-            .root()
-            .ToggleAttribute(cx, DOMString::from(name), force);
+        let Some(element) = self.element() else {
+            return servo_v8::ToggleAttributeResult::HostFailure;
+        };
+        let result = element.ToggleAttribute(cx, DOMString::from(name), force);
         // Servo's Fallible result must cross the bridge as typed data, never
         // as a pending SpiderMonkey DOMException while V8 owns this frame.
         if unsafe { JS_IsExceptionPending(cx) } {
@@ -761,9 +840,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
         // As with toggleAttribute, leave CEReactions on Servo's outer or
         // backup queue rather than invoking a SpiderMonkey callback under V8.
-        self.element
-            .root()
-            .RemoveAttribute(cx, DOMString::from(name));
+        let Some(element) = self.element() else {
+            return false;
+        };
+        element.RemoveAttribute(cx, DOMString::from(name));
         // RemoveAttribute has no declared error result. Still protect the V8
         // caller from any unexpected pending SpiderMonkey exception.
         if unsafe { JS_IsExceptionPending(cx) } {
@@ -787,7 +867,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
         // As with removeAttribute, leave CEReactions on Servo's outer or
         // backup queue rather than invoking a SpiderMonkey callback under V8.
-        self.element.root().RemoveAttributeNS(
+        let Some(element) = self.element() else {
+            return false;
+        };
+        element.RemoveAttributeNS(
             cx,
             namespace.map(DOMString::from),
             DOMString::from(local_name),
@@ -802,13 +885,13 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
     }
 
     fn get_elements_by_class_name(&self, class_names: &str) -> servo_v8::HTMLCollectionHandle {
-        let element = self.element.root();
-        v8_class_collection_handle(element.upcast::<Node>(), class_names)
+        let node = self.node.root();
+        v8_class_collection_handle(&node, class_names)
     }
 
     fn get_elements_by_tag_name(&self, qualified_name: &str) -> servo_v8::HTMLCollectionHandle {
-        let element = self.element.root();
-        v8_tag_collection_handle(element.upcast::<Node>(), qualified_name)
+        let node = self.node.root();
+        v8_tag_collection_handle(&node, qualified_name)
     }
 
     fn get_elements_by_tag_name_ns(
@@ -816,41 +899,39 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         namespace: Option<&str>,
         local_name: &str,
     ) -> servo_v8::HTMLCollectionHandle {
-        let element = self.element.root();
-        v8_tag_ns_collection_handle(element.upcast::<Node>(), namespace, local_name)
+        let node = self.node.root();
+        v8_tag_ns_collection_handle(&node, namespace, local_name)
     }
 
     fn node_type(&self) -> u16 {
-        self.element.root().upcast::<Node>().NodeType()
+        self.node.root().NodeType()
     }
 
     fn node_name(&self) -> String {
-        self.element.root().upcast::<Node>().NodeName().into()
+        self.node.root().NodeName().into()
     }
 
     fn parent_element(&self) -> Option<servo_v8::InterfaceHandle> {
-        let parent = self.element.root().upcast::<Node>().GetParentElement()?;
+        let parent = self.node.root().GetParentElement()?;
         Some(v8_element_interface_handle(&parent))
     }
 
     fn namespace_uri(&self) -> Option<String> {
-        self.element.root().GetNamespaceURI().map(Into::into)
+        self.element()
+            .and_then(|element| element.GetNamespaceURI().map(Into::into))
     }
 
     fn prefix(&self) -> Option<String> {
-        self.element.root().GetPrefix().map(Into::into)
+        self.element()
+            .and_then(|element| element.GetPrefix().map(Into::into))
     }
 
     fn is_connected(&self) -> bool {
-        self.element.root().upcast::<Node>().IsConnected()
+        self.node.root().IsConnected()
     }
 
     fn text_content(&self) -> Option<String> {
-        self.element
-            .root()
-            .upcast::<Node>()
-            .GetTextContent()
-            .map(Into::into)
+        self.node.root().GetTextContent().map(Into::into)
     }
 
     unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool {
@@ -859,12 +940,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative entry lends its live owner-thread context.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let element = self.element.root();
-        let result = element
-            .upcast::<Node>()
-            .SetTextContent(cx, value.map(DOMString::from));
+        let node = self.node.root();
+        let result = node.SetTextContent(cx, value.map(DOMString::from));
         if let Err(error) = result {
-            throw_dom_exception(cx, &element.global(), error);
+            throw_dom_exception(cx, &node.global(), error);
             return false;
         }
         // `[CEReactions]` deliberately remains on Servo's outer or backup
@@ -875,7 +954,7 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
     }
 
     fn has_child_nodes(&self) -> bool {
-        self.element.root().upcast::<Node>().HasChildNodes()
+        self.node.root().HasChildNodes()
     }
 
     unsafe fn remove(&self, host_context: *mut c_void) -> bool {
@@ -885,7 +964,9 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // SAFETY: The authoritative entry lends its live owner-thread context
         // only for this synchronous production DOM mutation.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let element = self.element.root();
+        let Some(element) = self.element() else {
+            return false;
+        };
         // This is ChildNode's production remove algorithm. As with id,
         // className, and textContent above, CEReactions deliberately remain
         // on Servo's outer or backup queue until V8 has unwound.
@@ -900,31 +981,33 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
     }
 
     fn children(&self) -> servo_v8::HTMLCollectionHandle {
-        let element = self.element.root();
-        v8_children_collection_handle(element.upcast::<Node>())
+        let node = self.node.root();
+        v8_children_collection_handle(&node)
     }
 
     fn first_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
-        let child = self.element.root().GetFirstElementChild()?;
+        let child = self.element()?.GetFirstElementChild()?;
         Some(v8_element_interface_handle(&child))
     }
 
     fn last_element_child(&self) -> Option<servo_v8::InterfaceHandle> {
-        let child = self.element.root().GetLastElementChild()?;
+        let child = self.element()?.GetLastElementChild()?;
         Some(v8_element_interface_handle(&child))
     }
 
     fn child_element_count(&self) -> u32 {
-        self.element.root().ChildElementCount()
+        self.element()
+            .map(|element| element.ChildElementCount())
+            .unwrap_or_default()
     }
 
     fn previous_element_sibling(&self) -> Option<servo_v8::InterfaceHandle> {
-        let sibling = self.element.root().GetPreviousElementSibling()?;
+        let sibling = self.element()?.GetPreviousElementSibling()?;
         Some(v8_element_interface_handle(&sibling))
     }
 
     fn next_element_sibling(&self) -> Option<servo_v8::InterfaceHandle> {
-        let sibling = self.element.root().GetNextElementSibling()?;
+        let sibling = self.element()?.GetNextElementSibling()?;
         Some(v8_element_interface_handle(&sibling))
     }
 
@@ -939,10 +1022,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // SAFETY: The authoritative entry lends its live owner-thread context
         // only for this synchronous call.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let result = self
-            .element
-            .root()
-            .QuerySelector(cx, DOMString::from(selectors));
+        let Some(element) = self.element() else {
+            return servo_v8::SelectorElementResult::HostFailure;
+        };
+        let result = element.QuerySelector(cx, DOMString::from(selectors));
         // The current scope-match path never sets a SpiderMonkey exception,
         // but future error branches must not poison the context while V8 owns
         // page execution. Surface an internal V8-side failure and clear it.
@@ -972,7 +1055,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // SAFETY: The authoritative entry lends its live owner-thread context
         // only for this synchronous selector call.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let result = self.element.root().Closest(DOMString::from(selectors));
+        let Some(element) = self.element() else {
+            return servo_v8::SelectorElementResult::HostFailure;
+        };
+        let result = element.Closest(DOMString::from(selectors));
         if unsafe { JS_IsExceptionPending(cx) } {
             unsafe { JS_ClearPendingException(cx) };
             return servo_v8::SelectorElementResult::HostFailure;
@@ -998,7 +1084,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // lent for this synchronous call and is used only to audit exception
         // state after Servo's production selector parser returns.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let result = self.element.root().Matches(DOMString::from(selectors));
+        let Some(element) = self.element() else {
+            return servo_v8::SelectorBooleanResult::HostFailure;
+        };
+        let result = element.Matches(DOMString::from(selectors));
         if unsafe { JS_IsExceptionPending(cx) } {
             unsafe { JS_ClearPendingException(cx) };
             return servo_v8::SelectorBooleanResult::HostFailure;
@@ -1021,10 +1110,10 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // SAFETY: See matches(); the alias is independently routed through
         // Servo's production WebIDL method so signature drift stays visible.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let result = self
-            .element
-            .root()
-            .WebkitMatchesSelector(DOMString::from(selectors));
+        let Some(element) = self.element() else {
+            return servo_v8::SelectorBooleanResult::HostFailure;
+        };
+        let result = element.WebkitMatchesSelector(DOMString::from(selectors));
         if unsafe { JS_IsExceptionPending(cx) } {
             unsafe { JS_ClearPendingException(cx) };
             return servo_v8::SelectorBooleanResult::HostFailure;
@@ -1047,19 +1136,18 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
         // SAFETY: The authoritative entry lends its live owner-thread context
         // only for this synchronous scope-match call.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let element = self.element.root();
-        let result = element.upcast::<Node>().query_selector_all_elements(
-            cx.no_gc(),
-            DOMString::from(selectors),
-        );
+        let Some(element) = self.element() else {
+            return servo_v8::SelectorNodeListResult::HostFailure;
+        };
+        let result = element
+            .upcast::<Node>()
+            .query_selector_all_elements(cx.no_gc(), DOMString::from(selectors));
         if unsafe { JS_IsExceptionPending(cx) } {
             unsafe { JS_ClearPendingException(cx) };
             return servo_v8::SelectorNodeListResult::HostFailure;
         }
         match result {
-            Ok(elements) => {
-                servo_v8::SelectorNodeListResult::Match(v8_node_list_handle(elements))
-            },
+            Ok(elements) => servo_v8::SelectorNodeListResult::Match(v8_node_list_handle(elements)),
             Err(Error::Syntax(_)) => servo_v8::SelectorNodeListResult::SyntaxError,
             Err(_) => servo_v8::SelectorNodeListResult::HostFailure,
         }
@@ -1069,11 +1157,11 @@ unsafe impl servo_v8::ElementHostBinding for V8ElementHost {
 #[cfg(feature = "v8-shadow")]
 #[expect(unsafe_code)]
 // SAFETY: The bridge brand-checks the receiver and every argument as a live
-// V8ElementHost and lends them only for this callback. Each Trusted<Element>
-// is rooted before invoking Servo's production Node algorithm. No borrowed
-// host or JSContext escapes, and CE reactions stay on Servo's outer or backup
-// queue until V8 has unwound.
-unsafe impl servo_v8::NodeHostBinding for V8ElementHost {
+// V8NodeHost and lends them only for this callback. Each Trusted<Node> is
+// rooted before invoking Servo's production Node algorithm. No borrowed host
+// or JSContext escapes, and CE reactions stay on Servo's outer or backup queue
+// until V8 has unwound.
+unsafe impl servo_v8::NodeHostBinding for V8NodeHost {
     unsafe fn insert_before(
         &self,
         host_context: *mut c_void,
@@ -1085,14 +1173,10 @@ unsafe impl servo_v8::NodeHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative V8 entry lends this context synchronously.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let parent = self.element.root();
-        let node = node.element.root();
-        let child = child.map(|child| child.element.root());
-        let result = parent.upcast::<Node>().InsertBefore(
-            cx,
-            node.upcast::<Node>(),
-            child.as_deref().map(|child| child.upcast()),
-        );
+        let parent = self.node.root();
+        let node = node.node.root();
+        let child = child.map(|child| child.node.root());
+        let result = parent.InsertBefore(cx, &node, child.as_deref());
         v8_node_mutation_result(cx, result, &node)
     }
 
@@ -1106,9 +1190,9 @@ unsafe impl servo_v8::NodeHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative V8 entry lends this context synchronously.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let parent = self.element.root();
-        let node = node.element.root();
-        let result = parent.upcast::<Node>().AppendChild(cx, node.upcast::<Node>());
+        let parent = self.node.root();
+        let node = node.node.root();
+        let result = parent.AppendChild(cx, &node);
         v8_node_mutation_result(cx, result, &node)
     }
 
@@ -1123,14 +1207,10 @@ unsafe impl servo_v8::NodeHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative V8 entry lends this context synchronously.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let parent = self.element.root();
-        let node = node.element.root();
-        let child = child.element.root();
-        let result = parent.upcast::<Node>().ReplaceChild(
-            cx,
-            node.upcast::<Node>(),
-            child.upcast::<Node>(),
-        );
+        let parent = self.node.root();
+        let node = node.node.root();
+        let child = child.node.root();
+        let result = parent.ReplaceChild(cx, &node, &child);
         v8_node_mutation_result(cx, result, &child)
     }
 
@@ -1144,11 +1224,9 @@ unsafe impl servo_v8::NodeHostBinding for V8ElementHost {
         }
         // SAFETY: The authoritative V8 entry lends this context synchronously.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
-        let parent = self.element.root();
-        let child = child.element.root();
-        let result = parent
-            .upcast::<Node>()
-            .RemoveChild(cx, child.upcast::<Node>());
+        let parent = self.node.root();
+        let child = child.node.root();
+        let result = parent.RemoveChild(cx, &child);
         v8_node_mutation_result(cx, result, &child)
     }
 }
@@ -1407,6 +1485,32 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         }
     }
 
+    unsafe fn create_document_fragment(
+        &self,
+        host_context: *mut c_void,
+    ) -> Option<servo_v8::InterfaceHandle> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative V8 entry lends this live owner-thread
+        // SpiderMonkey context only for the synchronous production DOM call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return None;
+        }
+
+        // This exact DocumentMethods operation allocates the production
+        // DocumentFragment. It has no custom-element reaction or script-entry
+        // path, and this host callback neither enters V8 nor pumps a queue.
+        let fragment = self.document.root().CreateDocumentFragment(cx);
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return None;
+        }
+        v8_node_interface_handle(fragment.upcast::<Node>())
+    }
+
     unsafe fn query_selector(
         &self,
         host_context: *mut c_void,
@@ -1447,18 +1551,15 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
         // context only for this synchronous scope-match call.
         let cx = unsafe { &mut *host_context.cast::<JSContext>() };
         let document = self.document.root();
-        let result = document.upcast::<Node>().query_selector_all_elements(
-            cx.no_gc(),
-            DOMString::from(selectors),
-        );
+        let result = document
+            .upcast::<Node>()
+            .query_selector_all_elements(cx.no_gc(), DOMString::from(selectors));
         if unsafe { JS_IsExceptionPending(cx) } {
             unsafe { JS_ClearPendingException(cx) };
             return servo_v8::SelectorNodeListResult::HostFailure;
         }
         match result {
-            Ok(elements) => {
-                servo_v8::SelectorNodeListResult::Match(v8_node_list_handle(elements))
-            },
+            Ok(elements) => servo_v8::SelectorNodeListResult::Match(v8_node_list_handle(elements)),
             Err(Error::Syntax(_)) => servo_v8::SelectorNodeListResult::SyntaxError,
             Err(_) => servo_v8::SelectorNodeListResult::HostFailure,
         }
@@ -3150,15 +3251,13 @@ impl ScriptThread {
                 *v8_interrupt.lock().unwrap() = Some(runtime.interrupt_handle());
                 // Type-level and installed once per runtime, before any realm
                 // can hand an Element to script.
-                if let Err(error) = runtime.install_element_host::<V8ElementHost>() {
+                if let Err(error) = runtime.install_element_host::<V8NodeHost>() {
                     panic!("V8 Element host installation failed: {error}");
                 }
                 if let Err(error) = runtime.install_node_list_host::<V8StaticNodeListHost>() {
                     panic!("V8 NodeList host installation failed: {error}");
                 }
-                if let Err(error) =
-                    runtime.install_html_collection_host::<V8HTMLCollectionHost>()
-                {
+                if let Err(error) = runtime.install_html_collection_host::<V8HTMLCollectionHost>() {
                     panic!("V8 HTMLCollection host installation failed: {error}");
                 }
                 Some(V8ShadowState {

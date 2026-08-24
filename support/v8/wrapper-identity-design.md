@@ -251,13 +251,27 @@ typed POD plus one owned UTF-8 message; C++ releases the message on every
 success, failure, and malformed-result path and constructs the exception in
 the calling V8 realm.
 
-This first mutation slice intentionally accepts only Element-backed Nodes,
-because they are the only Node wrappers the experimental realm exposes.
-Document, DocumentFragment, Text, and Comment wrappers require a dynamic Node
-host kind and a unified identity cache. Node creation and event listeners are
-also separate problems: a V8 function held by a Servo event target reverses
-the edge direction this design depends on and must be reasoned about again
-from scratch.
+ABI v42 extends that slice to DocumentFragment through one concrete generic
+Node host. It owns `Trusted<Node>` and stores an explicit dynamic interface
+kind (`Element` or `DocumentFragment`). The wrapper cache key is the rooted
+Node allocation address, and every hit must also match the kind stored in its
+cell; a mismatch is malformed and the speculative host is dropped. The key no
+longer depends on a per-interface Rust host type. This means every mixed Node
+mutation argument has the exact same installed Rust `T` and therefore cannot
+be cast through a wrong monomorphized vtable. C++ checks an Element receiver's
+`kElement` brand before dispatching Element-only callbacks; Rust then performs
+a checked downcast, never an unchecked cast. Common Node callbacks use the
+rooted Node directly.
+
+`Document.createDocumentFragment` creates a fresh boxed
+DocumentFragment-kind host for each Servo allocation. A cache hit still drops
+the speculative host and returns the pre-existing wrapper, while separate
+allocations necessarily remain separate wrappers. When a fragment is appended
+to an Element, Servo's production algorithm splices its children, returns the
+fragment's existing wrapper, and leaves it empty. Node creation and event
+listeners beyond this Element/DocumentFragment slice remain separate problems:
+a V8 function held by a Servo event target reverses the edge direction this
+design depends on and must be reasoned about again from scratch.
 
 ## The constraint this design depends on
 

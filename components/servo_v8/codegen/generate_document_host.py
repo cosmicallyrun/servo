@@ -1054,12 +1054,12 @@ def _readonly_nullable_interface_rust_thunks(member: Member) -> tuple[Block, ...
             "    unsafe {",
             "        *output = match handle {",
             "            Some(handle) => RawInterfaceValue {",
-            "                is_null: 0,",
+            "                kind: handle.kind,",
             "                key: handle.key,",
             "                native: handle.native,",
             "            },",
             "            None => RawInterfaceValue {",
-            "                is_null: 1,",
+            "                kind: INTERFACE_NULL,",
             "                key: std::ptr::null(),",
             "                native: std::ptr::null_mut(),",
             "            },",
@@ -1116,16 +1116,18 @@ def _readonly_nullable_interface_cpp_bodies(member: Member) -> tuple[Block, ...]
             "    return;",
             "  }",
             "  const bool malformed =",
-            "      value.is_null > 1 ||",
-            "      (value.is_null != 0 && (value.key || value.native)) ||",
-            "      (value.is_null == 0 && (!value.key || !value.native));",
+            "      value.kind > SERVO_V8_INTERFACE_ELEMENT ||",
+            "      (value.kind == SERVO_V8_INTERFACE_NULL && (value.key || value.native)) ||",
+            "      (value.kind != SERVO_V8_INTERFACE_NULL &&",
+            "       value.kind != SERVO_V8_INTERFACE_ELEMENT) ||",
+            "      (value.kind == SERVO_V8_INTERFACE_ELEMENT && (!value.key || !value.native));",
             "  if (malformed) {",
             "    DropUnownedElementHost(state->runtime, value.native,",
             "                           state->runtime->element_host_vtable.drop);",
             f'    ThrowTypeError(isolate, "invalid {qualified_name} interface result");',
             "    return;",
             "  }",
-            "  if (value.is_null != 0) {",
+            "  if (value.kind == SERVO_V8_INTERFACE_NULL) {",
             "    info.GetReturnValue().SetNull();",
             "    return;",
             "  }",
@@ -1761,12 +1763,12 @@ def _pure_domstring_to_nullable_interface_rust_thunks(
             "    unsafe {",
             "        *output = match handle {",
             "            Some(handle) => RawInterfaceValue {",
-            "                is_null: 0,",
+            "                kind: handle.kind,",
             "                key: handle.key,",
             "                native: handle.native,",
             "            },",
             "            None => RawInterfaceValue {",
-            "                is_null: 1,",
+            "                kind: INTERFACE_NULL,",
             "                key: std::ptr::null(),",
             "                native: std::ptr::null_mut(),",
             "            },",
@@ -1850,16 +1852,18 @@ def _pure_domstring_to_nullable_interface_cpp_bodies(
             "    return;",
             "  }",
             "  const bool malformed =",
-            "      value.is_null > 1 ||",
-            "      (value.is_null != 0 && (value.key || value.native)) ||",
-            "      (value.is_null == 0 && (!value.key || !value.native));",
+            "      value.kind > SERVO_V8_INTERFACE_ELEMENT ||",
+            "      (value.kind == SERVO_V8_INTERFACE_NULL && (value.key || value.native)) ||",
+            "      (value.kind != SERVO_V8_INTERFACE_NULL &&",
+            "       value.kind != SERVO_V8_INTERFACE_ELEMENT) ||",
+            "      (value.kind == SERVO_V8_INTERFACE_ELEMENT && (!value.key || !value.native));",
             "  if (malformed) {",
             "    DropUnownedElementHost(state->runtime, value.native,",
             "                           state->runtime->element_host_vtable.drop);",
             f'    ThrowTypeError(isolate, "invalid {qualified_name} interface result");',
             "    return;",
             "  }",
-            "  if (value.is_null != 0) {",
+            "  if (value.kind == SERVO_V8_INTERFACE_NULL) {",
             "    info.GetReturnValue().SetNull();",
             "    return;",
             "  }",
@@ -2323,7 +2327,7 @@ _CREATE_ELEMENT_RUST_TYPES: Block = [
     "            status: DOCUMENT_CREATE_ELEMENT_CREATED,",
     "            exception_message: raw_empty_owned_utf8(),",
     "            value: RawInterfaceValue {",
-    "                is_null: 0,",
+    "                kind: handle.kind,",
     "                key: handle.key,",
     "                native: handle.native,",
     "            },",
@@ -2544,11 +2548,13 @@ def _create_element_cpp_bodies(member: Member) -> tuple[Block, ...]:
             "    return;",
             "  }",
             "  const bool valid_created =",
-            "      outcome.value.is_null == 0 && outcome.value.key && outcome.value.native &&",
+            "      outcome.value.kind == SERVO_V8_INTERFACE_ELEMENT &&",
+            "      outcome.value.key && outcome.value.native &&",
             "      outcome.status == SERVO_V8_DOCUMENT_CREATE_ELEMENT_CREATED &&",
             "      IsCanonicalEmptyOwnedUtf8(outcome.exception_message);",
             "  const bool canonical_null_value =",
-            "      outcome.value.is_null == 1 && !outcome.value.key && !outcome.value.native;",
+            "      outcome.value.kind == SERVO_V8_INTERFACE_NULL &&",
+            "      !outcome.value.key && !outcome.value.native;",
             "  const bool valid_invalid_character =",
             "      outcome.status == SERVO_V8_DOCUMENT_CREATE_ELEMENT_INVALID_CHARACTER &&",
             "      canonical_null_value && outcome.exception_message.data &&",
@@ -2598,6 +2604,151 @@ def _create_element_cpp_bodies(member: Member) -> tuple[Block, ...]:
 
 
 def _create_element_cpp_vtable_terms(member: Member) -> list[str]:
+    return [f"vtable.{_rust_member_name(member.attribute)}"]
+
+
+def _create_document_fragment_header_slots(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"  uint8_t (*{name})(void* native, void* host_context,",
+        f"{C_SIGNATURE_INDENT}ServoV8InterfaceValue* output);",
+    ]
+
+
+def _create_document_fragment_rust_trait_members(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        "    /// Creates a DocumentFragment using the ephemeral host context.",
+        f"    unsafe fn {name}(",
+        "        &self,",
+        "        host_context: *mut c_void,",
+        "    ) -> Option<InterfaceHandle>;",
+    ]
+
+
+def _create_document_fragment_rust_vtable_fields(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [
+        f"    pub {name}: Option<",
+        "        unsafe extern \"C\" fn(",
+        "            *mut c_void,",
+        "            *mut c_void,",
+        "            *mut RawInterfaceValue,",
+        "        ) -> u8,",
+        "    >,",
+    ]
+
+
+def _create_document_fragment_rust_thunks(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    return (
+        [
+            f'unsafe extern "C" fn document_host_{name}<T: DocumentHostBinding>(',
+            "    native: *mut c_void,",
+            "    host_context: *mut c_void,",
+            "    output: *mut RawInterfaceValue,",
+            ") -> u8 {",
+            "    if native.is_null() || host_context.is_null() || output.is_null() {",
+            "        return 0;",
+            "    }",
+            "    // SAFETY: The vtable contract supplies a live Box<T> and lends the",
+            "    // non-null host context only for this callback.",
+            "    let handle = unsafe {",
+            f"        (&*native.cast::<T>()).{name}(host_context)",
+            "    };",
+            "    let succeeded = handle.is_some();",
+            "    // SAFETY: output is non-null and points to caller-owned writable storage.",
+            "    unsafe {",
+            "        *output = match handle {",
+            "            Some(handle) => RawInterfaceValue {",
+            "                kind: handle.kind,",
+            "                key: handle.key,",
+            "                native: handle.native,",
+            "            },",
+            "            None => raw_null_interface_value(),",
+            "        };",
+            "    }",
+            "    u8::from(succeeded)",
+            "}",
+        ],
+    )
+
+
+def _create_document_fragment_rust_vtable_init(member: Member) -> Block:
+    name = _rust_member_name(member.attribute)
+    return [f"            {name}: Some(document_host_{name}::<T>),"]
+
+
+def _create_document_fragment_cpp_bodies(member: Member) -> tuple[Block, ...]:
+    name = _rust_member_name(member.attribute)
+    callback = _cpp_member_name(member.attribute)
+    qualified_name = member.qualified_name
+    return (
+        [
+            f"void DocumentHostCall{callback}(",
+            "    const v8::FunctionCallbackInfo<v8::Value>& info) {",
+            "  v8::Isolate* isolate = info.GetIsolate();",
+            "  auto* state = UnwrapDocumentHostState(info);",
+            f"  if (!state || !state->native || !state->vtable.{name}) {{",
+            '    ThrowTypeError(isolate, "invalid Document host state");',
+            "    return;",
+            "  }",
+            "  auto* realm = static_cast<ServoV8RealmState*>(",
+            "      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(",
+            "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
+            "  if (!realm || realm->runtime != state->runtime ||",
+            "      !realm->runtime->element_host_installed ||",
+            "      realm->element_template.IsEmpty() ||",
+            "      realm->document_fragment_template.IsEmpty() ||",
+            "      realm->document_fragment_prototype.IsEmpty()) {",
+            '    ThrowTypeError(isolate, "Element host is not installed in this realm");',
+            "    return;",
+            "  }",
+            "  if (!state->active_host_context) {",
+            '    ThrowTypeError(isolate, "Document mutation requires a live host context");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Context> context = isolate->GetCurrentContext();",
+            "  ServoV8InterfaceValue value{};",
+            "  bool succeeded = false;",
+            "  {",
+            "    if (state->runtime->rust_callback_depth != 0) {",
+            '      ThrowTypeError(isolate, "re-entrant Document host callback");',
+            "      return;",
+            "    }",
+            "    RustCallbackScope callback_scope(state->runtime);",
+            f"    succeeded = state->vtable.{name}(",
+            "        state->native, state->active_host_context, &value) != 0;",
+            "  }",
+            "  auto fail = [&](const char* message) {",
+            "    DropUnownedElementHost(state->runtime, value.native,",
+            "                             state->runtime->element_host_vtable.drop);",
+            "    value.native = nullptr;",
+            "    ThrowTypeError(isolate, message);",
+            "  };",
+            "  if (!succeeded) {",
+            f'    fail("{qualified_name} host callback failed");',
+            "    return;",
+            "  }",
+            "  if (value.kind != SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT ||",
+            "      !value.key || !value.native) {",
+            f'    fail("invalid {qualified_name} interface result");',
+            "    return;",
+            "  }",
+            "  v8::Local<v8::Object> wrapper =",
+            "      WrapperForInterfaceValue(realm, isolate, context, value);",
+            "  value.native = nullptr;",
+            "  if (wrapper.IsEmpty()) {",
+            f'    ThrowTypeError(isolate, "{qualified_name} wrapper could not be created");',
+            "    return;",
+            "  }",
+            "  info.GetReturnValue().Set(wrapper);",
+            "}",
+        ],
+    )
+
+
+def _create_document_fragment_cpp_vtable_terms(member: Member) -> list[str]:
     return [f"vtable.{_rust_member_name(member.attribute)}"]
 
 
@@ -2857,6 +3008,19 @@ SHAPE_EMITTERS = {
         cpp_body_blocks=(_OWNED_UTF8_CPP_SCOPE,),
         cpp_bodies=_create_element_cpp_bodies,
         cpp_vtable_terms=_create_element_cpp_vtable_terms,
+    ),
+    production_webidl.CREATE_DOCUMENT_FRAGMENT: ShapeEmitter(
+        header_type_blocks=(),
+        header_slots=_create_document_fragment_header_slots,
+        rust_type_blocks=(),
+        rust_trait_members=_create_document_fragment_rust_trait_members,
+        rust_vtable_fields=_create_document_fragment_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_create_document_fragment_rust_thunks,
+        rust_vtable_init=_create_document_fragment_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_create_document_fragment_cpp_bodies,
+        cpp_vtable_terms=_create_document_fragment_cpp_vtable_terms,
     ),
 }
 

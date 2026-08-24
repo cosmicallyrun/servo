@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 41;
+const ABI_VERSION: u32 = 42;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -147,10 +147,18 @@ pub type DropCallback = unsafe extern "C" fn(*mut c_void);
 
 #[repr(C)]
 pub struct RawInterfaceValue {
-    pub is_null: u8,
+    pub kind: u8,
     pub key: *const c_void,
     pub native: *mut c_void,
 }
+
+pub const INTERFACE_NULL: u8 = 0;
+pub const INTERFACE_ELEMENT: u8 = 1;
+pub const INTERFACE_DOCUMENT_FRAGMENT: u8 = 2;
+// Named aliases keep generated ABI code self-describing.
+pub const INTERFACE_KIND_NULL: u8 = INTERFACE_NULL;
+pub const INTERFACE_KIND_ELEMENT: u8 = INTERFACE_ELEMENT;
+pub const INTERFACE_KIND_DOCUMENT_FRAGMENT: u8 = INTERFACE_DOCUMENT_FRAGMENT;
 
 /// One Servo DOM object being handed to script.
 ///
@@ -163,6 +171,8 @@ pub struct RawInterfaceValue {
 /// a new wrapper, and drops it through the vtable when an existing wrapper is
 /// found, so ownership never straddles the two outcomes.
 pub struct InterfaceHandle {
+    /// The dynamic Node interface represented by `native`.
+    pub kind: u8,
     pub key: *const c_void,
     pub native: *mut c_void,
 }
@@ -178,8 +188,27 @@ impl InterfaceHandle {
     /// long as the host lives. Passing a different type or an address the host
     /// does not root would make the type-erased vtable cast invalid or let the
     /// cache outlive its object.
-    pub unsafe fn new<T: NodeHostBinding>(dom_object: *const c_void, host: T) -> Self {
+    pub unsafe fn new<T: ElementHostBinding>(dom_object: *const c_void, host: T) -> Self {
         Self {
+            kind: INTERFACE_ELEMENT,
+            key: dom_object,
+            native: Box::into_raw(Box::new(host)).cast::<c_void>(),
+        }
+    }
+
+    /// Boxes a host as a `DocumentFragment` Node.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`Self::new`] apply. The installed concrete
+    /// host type is shared by Elements and DocumentFragments, so the bridge's
+    /// one drop vtable remains type-safe for both discriminants.
+    pub unsafe fn document_fragment<T: ElementHostBinding>(
+        dom_object: *const c_void,
+        host: T,
+    ) -> Self {
+        Self {
+            kind: INTERFACE_DOCUMENT_FRAGMENT,
             key: dom_object,
             native: Box::into_raw(Box::new(host)).cast::<c_void>(),
         }
@@ -244,7 +273,7 @@ pub enum NodeMutationException {
     NotFound,
 }
 
-/// The complete native result space for an Element-backed Node mutation.
+/// The complete native result space for a mutation on any installed Node kind.
 pub enum NodeMutationResult {
     Returned(InterfaceHandle),
     DomException {
@@ -368,15 +397,17 @@ pub struct NodeListHostVTable {
     pub drop: Option<DropCallback>,
 }
 
-/// A host for one Servo `Element` reachable from V8.
+/// The one concrete host type used by every V8-visible Node kind.
 ///
 /// # Safety
 ///
 /// Implementations must stay on the owning script thread, must not unwind,
 /// and must root the DOM object they read for the duration of the call. The
 /// implementation is dropped from a cppgc destructor during a V8 collection,
-/// so its `Drop` must not re-enter V8 or pump an event loop.
-pub unsafe trait ElementHostBinding: Sized + 'static {
+/// so its `Drop` must not re-enter V8 or pump an event loop. C++ brand-checks
+/// Element-only members before invoking them; implementations must still fail
+/// safely if their concrete host represents a non-Element Node.
+pub unsafe trait ElementHostBinding: NodeHostBinding + Sized + 'static {
     fn local_name(&self) -> String;
     fn tag_name(&self) -> String;
     fn namespace_uri(&self) -> Option<String>;
@@ -458,12 +489,10 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
     ) -> SelectorNodeListResult;
 }
 
-/// Node's structural mutation surface for the runtime's installed Element
-/// host type.
-///
-/// This initial Node ABI deliberately accepts only Element-backed wrappers,
-/// which are the only Node wrappers currently exposed by the experimental V8
-/// realm. Inputs are borrowed synchronously: implementations must not retain
+/// Node's structural mutation surface for the runtime's installed concrete
+/// host type. It is intentionally independent from Element so one concrete
+/// host may represent both Element and DocumentFragment wrappers. Inputs are
+/// borrowed synchronously: implementations must not retain
 /// them. Implementations must call Servo's production Node algorithms, keep
 /// custom-element reactions deferred until the V8 callback unwinds, and turn
 /// DOM failures into [`NodeMutationResult`] without leaving a SpiderMonkey
@@ -475,7 +504,7 @@ pub unsafe trait ElementHostBinding: Sized + 'static {
 /// installed through [`Runtime::install_element_host`]. `host_context` is the
 /// owner-thread context and is valid only for the duration of the call. No
 /// method may unwind, enter V8, or pump an event loop.
-pub unsafe trait NodeHostBinding: ElementHostBinding {
+pub unsafe trait NodeHostBinding: Sized + 'static {
     unsafe fn insert_before(
         &self,
         host_context: *mut c_void,
@@ -1061,16 +1090,8 @@ unsafe fn element_host_write_interface_value(
     // SAFETY: output is non-null and points to caller-owned writable storage.
     unsafe {
         *output = match handle {
-            Some(handle) => RawInterfaceValue {
-                is_null: 0,
-                key: handle.key,
-                native: handle.native,
-            },
-            None => RawInterfaceValue {
-                is_null: 1,
-                key: std::ptr::null(),
-                native: std::ptr::null_mut(),
-            },
+            Some(handle) => raw_interface_value(handle),
+            None => raw_null_interface_value(),
         }
     };
     1
@@ -1083,16 +1104,8 @@ fn raw_selector_element_outcome(result: SelectorElementResult) -> RawSelectorEle
         SelectorElementResult::HostFailure => (SELECTOR_HOST_FAILURE, None),
     };
     let value = match handle {
-        Some(handle) => RawInterfaceValue {
-            is_null: 0,
-            key: handle.key,
-            native: handle.native,
-        },
-        None => RawInterfaceValue {
-            is_null: 1,
-            key: std::ptr::null(),
-            native: std::ptr::null_mut(),
-        },
+        Some(handle) => raw_interface_value(handle),
+        None => raw_null_interface_value(),
     };
     RawSelectorElementOutcome { status, value }
 }
@@ -1133,9 +1146,19 @@ fn raw_selector_node_list_outcome(result: SelectorNodeListResult) -> RawSelector
 
 fn raw_null_interface_value() -> RawInterfaceValue {
     RawInterfaceValue {
-        is_null: 1,
+        kind: INTERFACE_NULL,
         key: std::ptr::null(),
         native: std::ptr::null_mut(),
+    }
+}
+
+/// Converts an owned host transfer into the ABI spelling without erasing its
+/// dynamic Node kind.
+pub fn raw_interface_value(handle: InterfaceHandle) -> RawInterfaceValue {
+    RawInterfaceValue {
+        kind: handle.kind,
+        key: handle.key,
+        native: handle.native,
     }
 }
 
@@ -1164,11 +1187,7 @@ fn raw_node_mutation_outcome(result: NodeMutationResult) -> RawNodeMutationOutco
             status: NODE_MUTATION_RETURNED,
             exception_kind: NODE_MUTATION_EXCEPTION_NONE,
             exception_message: raw_empty_owned_utf8(),
-            value: RawInterfaceValue {
-                is_null: 0,
-                key: handle.key,
-                native: handle.native,
-            },
+            value: raw_interface_value(handle),
         },
         NodeMutationResult::DomException { kind, message } => RawNodeMutationOutcome {
             status: NODE_MUTATION_DOM_EXCEPTION,
@@ -2168,7 +2187,7 @@ fn html_collection_host_vtable<T: HTMLCollectionHostBinding>() -> HTMLCollection
     }
 }
 
-fn element_host_vtable<T: NodeHostBinding>() -> ElementHostVTable {
+fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
     ElementHostVTable {
         get_local_name: Some(element_host_get_local_name::<T>),
         get_tag_name: Some(element_host_get_tag_name::<T>),
@@ -2846,7 +2865,7 @@ impl Runtime {
     ///
     /// The vtable is type-level; the hosts it describes are per DOM object and
     /// are handed over one at a time by an interface-typed getter.
-    pub fn install_element_host<T: NodeHostBinding>(&mut self) -> Result<(), Error> {
+    pub fn install_element_host<T: ElementHostBinding>(&mut self) -> Result<(), Error> {
         let vtable = element_host_vtable::<T>();
         let mut storage = [0; ERROR_CAPACITY];
         let mut error = error_buffer(&mut storage);
@@ -3927,7 +3946,7 @@ mod tests {
         }
 
         fn node_type(&self) -> u16 {
-            1
+            u16::from(self.tag_name == "#document-fragment") * 10 + 1
         }
 
         fn node_name(&self) -> String {
@@ -4414,23 +4433,26 @@ mod tests {
 
         fn interface_handle(&self) -> InterfaceHandle {
             // SAFETY: identity names the same stand-in DOM allocation rooted
-            // by this cloned probe host for the lifetime of the wrapper.
+            // by this cloned probe host for the lifetime of the wrapper. The
+            // interface discriminant follows the probe's dynamic Node kind.
             unsafe {
-                InterfaceHandle::new(
-                    self.identity,
-                    ElementHostProbe {
-                        local_name: self.local_name.clone(),
-                        tag_name: self.tag_name.clone(),
-                        identity: self.identity,
-                        state: Rc::clone(&self.state),
-                        _owned_identity: self._owned_identity.clone(),
-                        parent_children: self.parent_children.clone(),
-                        parent_state: self.parent_state.clone(),
-                        parent_element: self.parent_element.clone(),
-                        drops: Rc::clone(&self.drops),
-                        drop_reentry: self.drop_reentry.clone(),
-                    },
-                )
+                let host = ElementHostProbe {
+                    local_name: self.local_name.clone(),
+                    tag_name: self.tag_name.clone(),
+                    identity: self.identity,
+                    state: Rc::clone(&self.state),
+                    _owned_identity: self._owned_identity.clone(),
+                    parent_children: self.parent_children.clone(),
+                    parent_state: self.parent_state.clone(),
+                    parent_element: self.parent_element.clone(),
+                    drops: Rc::clone(&self.drops),
+                    drop_reentry: self.drop_reentry.clone(),
+                };
+                if self.tag_name == "#document-fragment" {
+                    InterfaceHandle::document_fragment(self.identity, host)
+                } else {
+                    InterfaceHandle::new(self.identity, host)
+                }
             }
         }
 
@@ -4839,6 +4861,39 @@ mod tests {
                     ElementHostProbe {
                         tag_name: local_name.to_ascii_uppercase(),
                         local_name,
+                        identity: key,
+                        state,
+                        _owned_identity: Some(identity),
+                        parent_children: None,
+                        parent_state: None,
+                        parent_element: None,
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        unsafe fn create_document_fragment(
+            &self,
+            host_context: *mut c_void,
+        ) -> Option<InterfaceHandle> {
+            if host_context.is_null() {
+                return None;
+            }
+            let identity = Rc::new(0_u8);
+            let key = Rc::as_ptr(&identity).cast::<c_void>();
+            let state = ElementProbeState::with_attributes(&[]);
+            state.is_connected.set(false);
+            // SAFETY: this probe uses the same installed concrete host type
+            // for Elements and fragments; the distinct ABI kind controls the
+            // JavaScript brand while the host owns the stable key.
+            Some(unsafe {
+                InterfaceHandle::document_fragment(
+                    key,
+                    ElementHostProbe {
+                        local_name: "#document-fragment".to_owned(),
+                        tag_name: "#document-fragment".to_owned(),
                         identity: key,
                         state,
                         _owned_identity: Some(identity),
@@ -5266,17 +5321,9 @@ mod tests {
             // synchronous callback.
             let handle = unsafe { host.get_element_by_id(host_context, "target") }
                 .expect("the adversarial probe always has its target");
-            RawInterfaceValue {
-                is_null: 0,
-                key: handle.key,
-                native: handle.native,
-            }
+            raw_interface_value(handle)
         };
-        let null_value = || RawInterfaceValue {
-            is_null: 1,
-            key: std::ptr::null(),
-            native: std::ptr::null_mut(),
-        };
+        let null_value = raw_null_interface_value;
         let outcome = match selectors {
             "host-failure" => raw_selector_element_outcome(SelectorElementResult::HostFailure),
             "invalid-status" => RawSelectorElementOutcome {
@@ -5289,7 +5336,7 @@ mod tests {
             },
             "null-with-value" => {
                 let mut value = target_value();
-                value.is_null = 1;
+                value.kind = INTERFACE_NULL;
                 RawSelectorElementOutcome {
                     status: SELECTOR_RETURNED,
                     value,
@@ -5306,7 +5353,7 @@ mod tests {
             "key-without-native" => RawSelectorElementOutcome {
                 status: SELECTOR_RETURNED,
                 value: RawInterfaceValue {
-                    is_null: 0,
+                    kind: INTERFACE_ELEMENT,
                     key: (&*host.id_element_identity as *const u8).cast(),
                     native: std::ptr::null_mut(),
                 },
@@ -9118,10 +9165,11 @@ mod tests {
         let query_callback = vtable.query_selector.unwrap();
         let query_all_callback = vtable.query_selector_all.unwrap();
         let create_callback = vtable.create_element.unwrap();
+        let create_fragment_callback = vtable.create_document_fragment.unwrap();
         let mut host_context = 0_u8;
         let host_context = (&mut host_context as *mut u8).cast::<c_void>();
         let mut output = RawInterfaceValue {
-            is_null: 0,
+            kind: INTERFACE_ELEMENT,
             key: std::ptr::null(),
             native: std::ptr::null_mut(),
         };
@@ -9170,12 +9218,12 @@ mod tests {
                 callback(native, host_context, std::ptr::null(), 0, &mut output,),
                 1,
             );
-            assert_eq!(output.is_null, 1);
+            assert_eq!(output.kind, INTERFACE_NULL);
 
             let mut query_output = RawSelectorElementOutcome {
                 status: u32::MAX,
                 value: RawInterfaceValue {
-                    is_null: 0,
+                    kind: INTERFACE_ELEMENT,
                     key: std::ptr::null(),
                     native: std::ptr::null_mut(),
                 },
@@ -9226,13 +9274,13 @@ mod tests {
                 1,
             );
             assert_eq!(query_output.status, SELECTOR_RETURNED);
-            assert_eq!(query_output.value.is_null, 1);
+            assert_eq!(query_output.value.kind, INTERFACE_NULL);
             assert_eq!(
                 query_callback(native, host_context, std::ptr::null(), 0, &mut query_output,),
                 1,
             );
             assert_eq!(query_output.status, SELECTOR_SYNTAX_ERROR);
-            assert_eq!(query_output.value.is_null, 1);
+            assert_eq!(query_output.value.kind, INTERFACE_NULL);
 
             let mut query_all_output = RawSelectorNodeListOutcome {
                 status: u32::MAX,
@@ -9397,8 +9445,30 @@ mod tests {
                 1,
             );
             assert_eq!(create_output.status, DOCUMENT_CREATE_ELEMENT_CREATED);
-            assert_eq!(create_output.value.is_null, 0);
+            assert_eq!(create_output.value.kind, INTERFACE_ELEMENT);
             element_host_drop::<ElementHostProbe>(create_output.value.native);
+
+            let mut fragment_output = raw_null_interface_value();
+            assert_eq!(
+                create_fragment_callback(std::ptr::null_mut(), host_context, &mut fragment_output),
+                0,
+            );
+            assert_eq!(
+                create_fragment_callback(native, std::ptr::null_mut(), &mut fragment_output),
+                0,
+            );
+            assert_eq!(
+                create_fragment_callback(native, host_context, std::ptr::null_mut()),
+                0,
+            );
+            assert_eq!(
+                create_fragment_callback(native, host_context, &mut fragment_output),
+                1,
+            );
+            assert_eq!(fragment_output.kind, INTERFACE_DOCUMENT_FRAGMENT);
+            assert!(!fragment_output.key.is_null());
+            assert!(!fragment_output.native.is_null());
+            element_host_drop::<ElementHostProbe>(fragment_output.native);
             vtable.drop.unwrap()(native);
         }
         assert_eq!(&*calls.borrow(), &[""]);
@@ -9536,6 +9606,161 @@ mod tests {
         runtime.destroy_realm(realm).unwrap();
         assert_eq!(document_drops.get(), 1);
         assert!(element_drops.get() >= 6);
+    }
+
+    #[test]
+    fn document_fragments_keep_node_brand_identity_and_host_ownership() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const documentPrototype = Object.getPrototypeOf(document);
+              const descriptor = Object.getOwnPropertyDescriptor(
+                documentPrototype, 'createDocumentFragment');
+              let wrongDocumentBrand = false;
+              try { descriptor.value.call({}); }
+              catch (error) { wrongDocumentBrand = error instanceof TypeError; }
+
+              const fragment = document.createDocumentFragment();
+              const distinct = document.createDocumentFragment();
+              const ignoredArguments = document.createDocumentFragment('ignored', 42);
+              const child = document.createElement('span');
+              const elementPrototype = Object.getPrototypeOf(child);
+              const fragmentPrototype = Object.getPrototypeOf(fragment);
+              const nodePrototype = Object.getPrototypeOf(fragmentPrototype);
+              const toStringTag = Object.getOwnPropertyDescriptor(
+                fragmentPrototype, Symbol.toStringTag);
+
+              let wrongElementBrand = false;
+              try { elementPrototype.getAttribute.call(fragment, 'id'); }
+              catch (error) { wrongElementBrand = error instanceof TypeError; }
+
+              const appended = nodePrototype.appendChild.call(fragment, child) === child &&
+                fragment.hasChildNodes();
+              let hierarchy = false;
+              try { fragment.appendChild(fragment); }
+              catch (error) {
+                hierarchy = error instanceof DOMException &&
+                  error.name === 'HierarchyRequestError' && error.code === 3;
+              }
+
+              globalThis.fragmentForNoContext = fragment;
+              globalThis.fragmentChildForNoContext = child;
+              globalThis.documentFragmentDiagnostics = {
+                descriptor: !!descriptor &&
+                  descriptor.value.name === 'createDocumentFragment' &&
+                  descriptor.value.length === 0 && descriptor.writable &&
+                  descriptor.enumerable && descriptor.configurable,
+                wrongDocumentBrand,
+                noGlobalConstructor: typeof DocumentFragment === 'undefined',
+                freshIdentity: fragment !== distinct && fragment !== ignoredArguments,
+                fragmentPrototypeIdentity:
+                  Object.getPrototypeOf(distinct) === fragmentPrototype &&
+                  Object.getPrototypeOf(ignoredArguments) === fragmentPrototype,
+                prototypeChain:
+                  Object.getPrototypeOf(elementPrototype) === nodePrototype &&
+                  fragmentPrototype !== elementPrototype,
+                nodeType: fragment.nodeType === 11,
+                nodeName: fragment.nodeName === '#document-fragment',
+                parentElement: fragment.parentElement === null,
+                isConnected: !fragment.isConnected,
+                toStringTag: Object.prototype.toString.call(fragment) ===
+                  '[object DocumentFragment]' && !!toStringTag &&
+                  toStringTag.value === 'DocumentFragment' &&
+                  !toStringTag.writable && !toStringTag.enumerable &&
+                  toStringTag.configurable,
+                wrongElementBrand,
+                appended,
+                hierarchy,
+              };
+              globalThis.documentFragmentBridgeProof = Object.values(
+                documentFragmentDiagnostics).every(Boolean);
+            })();"#,
+            "document-create-document-fragment.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: The opaque token remains live for this synchronous entry and
+        // the probe validates but never retains or dereferences it.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        for check in [
+            "descriptor",
+            "wrongDocumentBrand",
+            "noGlobalConstructor",
+            "freshIdentity",
+            "fragmentPrototypeIdentity",
+            "prototypeChain",
+            "nodeType",
+            "nodeName",
+            "parentElement",
+            "isConnected",
+            "toStringTag",
+            "wrongElementBrand",
+            "appended",
+            "hierarchy",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(realm, &format!("documentFragmentDiagnostics.{check}"))
+                    .unwrap(),
+                "DocumentFragment bridge check failed: {check}"
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { document.createDocumentFragment(); } \
+                     catch (error) { return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap(),
+            "creation without the ephemeral host context must be rejected"
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { fragmentForNoContext.appendChild( \
+                     fragmentChildForNoContext); } catch (error) { \
+                     return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap(),
+            "fragment mutation without the ephemeral host context must be rejected"
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(
+            node_drops.get(),
+            5,
+            "four wrappers plus the appendChild cache-hit host must drop exactly once"
+        );
     }
 
     #[test]
@@ -10062,7 +10287,7 @@ mod tests {
         let mut element_output = RawSelectorElementOutcome {
             status: u32::MAX,
             value: RawInterfaceValue {
-                is_null: 0,
+                kind: INTERFACE_ELEMENT,
                 key: std::ptr::null(),
                 native: std::ptr::null_mut(),
             },
@@ -10072,7 +10297,7 @@ mod tests {
             value: u8::MAX,
         };
         let mut sibling_output = RawInterfaceValue {
-            is_null: 0,
+            kind: INTERFACE_ELEMENT,
             key: std::ptr::null(),
             native: std::ptr::null_mut(),
         };
@@ -10152,21 +10377,21 @@ mod tests {
             assert_eq!(previous(std::ptr::null_mut(), &mut sibling_output), 0);
             assert_eq!(previous(native, std::ptr::null_mut()), 0);
             assert_eq!(previous(native, &mut sibling_output), 1);
-            assert_eq!(sibling_output.is_null, 1);
+            assert_eq!(sibling_output.kind, INTERFACE_NULL);
             assert!(sibling_output.key.is_null());
             assert!(sibling_output.native.is_null());
-            sibling_output.is_null = 0;
+            sibling_output.kind = INTERFACE_ELEMENT;
             assert_eq!(next(std::ptr::null_mut(), &mut sibling_output), 0);
             assert_eq!(next(native, std::ptr::null_mut()), 0);
             assert_eq!(next(native, &mut sibling_output), 1);
-            assert_eq!(sibling_output.is_null, 1);
+            assert_eq!(sibling_output.kind, INTERFACE_NULL);
             assert!(sibling_output.key.is_null());
             assert!(sibling_output.native.is_null());
-            sibling_output.is_null = 0;
+            sibling_output.kind = INTERFACE_ELEMENT;
             assert_eq!(parent_element(std::ptr::null_mut(), &mut sibling_output), 0,);
             assert_eq!(parent_element(native, std::ptr::null_mut()), 0);
             assert_eq!(parent_element(native, &mut sibling_output), 1);
-            assert_eq!(sibling_output.is_null, 1);
+            assert_eq!(sibling_output.kind, INTERFACE_NULL);
             assert!(sibling_output.key.is_null());
             assert!(sibling_output.native.is_null());
             assert_eq!(
@@ -10607,7 +10832,7 @@ mod tests {
                 1,
             );
             assert_eq!(element_output.status, SELECTOR_RETURNED);
-            assert_eq!(element_output.value.is_null, 0);
+            assert_eq!(element_output.value.kind, INTERFACE_ELEMENT);
             assert_eq!(element_output.value.key, handle.key);
             assert!(!element_output.value.native.is_null());
             element_host_drop::<ElementHostProbe>(element_output.value.native);

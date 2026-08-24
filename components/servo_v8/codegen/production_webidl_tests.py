@@ -190,6 +190,12 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
             ["DOMString", "ElementCreationOptions"],
         )
         self.assertIsNone(create_arguments[1].defaultValue.value)
+        fragment = attributes[production_webidl.DOCUMENT_CREATE_DOCUMENT_FRAGMENT]
+        fragment_return, fragment_arguments = fragment.signatures()[0]
+        self.assertEqual(fragment_return.name, "DocumentFragment")
+        self.assertFalse(fragment_return.nullable())
+        self.assertEqual(fragment_arguments, [])
+        self.assertEqual(set(fragment._extendedAttrDict), {"NewObject"})
 
     def test_pins_each_real_enum_value_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -700,6 +706,58 @@ class SyntheticSelectionTests(unittest.TestCase):
             "optional (DOMString or ElementCreationOptions) options = {});",
             "`ElementCreationOptions.is` must be optional non-nullable `DOMString is`",
             "dictionary ElementCreationOptions { DOMString? is; };",
+        )
+
+    def create_document_fragment_source(
+        self,
+        declaration: str = "[NewObject] DocumentFragment createDocumentFragment();",
+    ) -> str:
+        return f"""
+            interface DocumentFragment {{}};
+            interface Element {{}};
+            interface Document {{ {declaration} }};
+        """
+
+    def assert_create_document_fragment_rejected(
+        self, declaration: str, expected: str
+    ) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": self.create_document_fragment_source(declaration)}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError, re.escape(expected)
+        ):
+            production_webidl._select_create_document_fragment_operation(
+                parser_results, production_webidl.DOCUMENT_CREATE_DOCUMENT_FRAGMENT
+            )
+
+    def test_selects_exact_create_document_fragment_operation(self) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": self.create_document_fragment_source()}
+        )
+        method = production_webidl._select_create_document_fragment_operation(
+            parser_results, production_webidl.DOCUMENT_CREATE_DOCUMENT_FRAGMENT
+        )
+        self.assertEqual(method.identifier.name, "createDocumentFragment")
+        self.assertEqual(set(method._extendedAttrDict), {"NewObject"})
+        self.assertEqual(method.signatures()[0][1], [])
+
+    def test_rejects_create_document_fragment_shape_drift(self) -> None:
+        self.assert_create_document_fragment_rejected(
+            "DocumentFragment createDocumentFragment();",
+            "`Document.createDocumentFragment` must carry exactly ['NewObject']",
+        )
+        self.assert_create_document_fragment_rejected(
+            "[NewObject] DocumentFragment? createDocumentFragment();",
+            "must return non-nullable `DocumentFragment`",
+        )
+        self.assert_create_document_fragment_rejected(
+            "[NewObject] Element createDocumentFragment();",
+            "must return non-nullable `DocumentFragment`",
+        )
+        self.assert_create_document_fragment_rejected(
+            "[NewObject] DocumentFragment createDocumentFragment(DOMString value);",
+            "must take zero arguments",
         )
 
     def html_collection_source(

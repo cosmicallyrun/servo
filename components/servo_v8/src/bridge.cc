@@ -229,7 +229,8 @@ struct ServoV8DomCell final : public v8::Object::Wrappable {
 // Trusted<T> inside the native host. Nothing in the SpiderMonkey heap points
 // back, so no cross-heap cycle can form.
 enum class ServoV8HostKind : uint8_t {
-  kElement,
+  kElement = SERVO_V8_INTERFACE_ELEMENT,
+  kDocumentFragment = SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT,
   kNodeList,
   kHTMLCollection,
 };
@@ -348,6 +349,8 @@ struct ServoV8RealmState {
   std::vector<cppgc::WeakPersistent<ServoV8HostCell>> uncached_hosts;
   v8::Global<v8::ObjectTemplate> element_template;
   v8::Global<v8::Object> element_prototype;
+  v8::Global<v8::ObjectTemplate> document_fragment_template;
+  v8::Global<v8::Object> document_fragment_prototype;
   v8::Global<v8::Object> node_prototype;
   v8::Global<v8::ObjectTemplate> node_list_template;
   v8::Global<v8::Object> node_list_prototype;
@@ -1082,6 +1085,16 @@ v8::Local<v8::Object> WrapperForHTMLCollectionValue(
     v8::Local<v8::Context> context,
     const ServoV8HTMLCollectionValue& value);
 
+bool IsNodeInterfaceKind(uint8_t kind) {
+  return kind == SERVO_V8_INTERFACE_ELEMENT ||
+         kind == SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT;
+}
+
+bool IsValidElementInterfaceValue(const ServoV8InterfaceValue& value) {
+  return (value.kind == SERVO_V8_INTERFACE_NULL && !value.key && !value.native) ||
+         (value.kind == SERVO_V8_INTERFACE_ELEMENT && value.key && value.native);
+}
+
 // Generated Document callbacks validate owned UTF-8 outcomes before the
 // hand-written Element facade definitions later in this translation unit.
 bool IsValidUtf8(const uint8_t* data, size_t length);
@@ -1095,13 +1108,10 @@ void ReturnSelectorElementOutcome(
     v8::ReturnValue<v8::Value> return_value) {
   v8::Isolate* isolate = realm->runtime->isolate;
   const ServoV8InterfaceValue& value = outcome.value;
-  const bool malformed_value =
-      value.is_null > 1 ||
-      (value.is_null != 0 && (value.key || value.native)) ||
-      (value.is_null == 0 && (!value.key || !value.native));
+  const bool malformed_value = !IsValidElementInterfaceValue(value);
   const bool error_has_value =
       outcome.status != SERVO_V8_SELECTOR_RETURNED &&
-      (value.is_null != 1 || value.key || value.native);
+      value.kind != SERVO_V8_INTERFACE_NULL;
   if (outcome.status > SERVO_V8_SELECTOR_HOST_FAILURE ||
       malformed_value || error_has_value) {
     DropUnownedElementHost(realm->runtime, value.native,
@@ -1117,7 +1127,7 @@ void ReturnSelectorElementOutcome(
     ThrowTypeError(isolate, member_name);
     return;
   }
-  if (value.is_null != 0) {
+  if (value.kind == SERVO_V8_INTERFACE_NULL) {
     return_value.SetNull();
     return;
   }
@@ -1279,11 +1289,19 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
   ServoV8Runtime* runtime = realm->runtime;
   const ServoV8DropCallback drop = runtime->element_host_vtable.drop;
 
+  if (!IsNodeInterfaceKind(value.kind) || !value.key || !value.native) {
+    DropUnownedElementHost(runtime, value.native, drop);
+    return v8::Local<v8::Object>();
+  }
+  const ServoV8HostKind kind = static_cast<ServoV8HostKind>(value.kind);
   const auto entry = realm->wrappers.find(value.key);
   if (entry != realm->wrappers.end()) {
     if (ServoV8HostCell* cell = entry->second.Get()) {
       DropUnownedElementHost(runtime, value.native, drop);
-      return cell->wrapper(isolate);
+      // An address can only name one live DOM allocation. A kind mismatch is
+      // therefore malformed, never a cache alias across interfaces.
+      return cell->kind() == kind ? cell->wrapper(isolate)
+                                  : v8::Local<v8::Object>();
     }
     // cppgc clears the weak entry once the cell dies. The stale slot is only
     // removed here, which is also what makes a later address reuse safe.
@@ -1291,15 +1309,29 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
   }
 
   v8::Local<v8::Object> wrapper;
-  if (!realm->element_template.Get(isolate)
+  const bool is_element = kind == ServoV8HostKind::kElement;
+  if ((is_element && (realm->element_template.IsEmpty() ||
+                      realm->element_prototype.IsEmpty())) ||
+      (!is_element && (realm->document_fragment_template.IsEmpty() ||
+                       realm->document_fragment_prototype.IsEmpty()))) {
+    DropUnownedElementHost(runtime, value.native, drop);
+    return v8::Local<v8::Object>();
+  }
+  v8::Local<v8::ObjectTemplate> instance_template =
+      is_element ? realm->element_template.Get(isolate)
+                 : realm->document_fragment_template.Get(isolate);
+  v8::Local<v8::Object> prototype =
+      is_element ? realm->element_prototype.Get(isolate)
+                 : realm->document_fragment_prototype.Get(isolate);
+  if (!instance_template
            ->NewInstance(context)
            .ToLocal(&wrapper)) {
     DropUnownedElementHost(runtime, value.native, drop);
     return v8::Local<v8::Object>();
   }
-  if (realm->element_prototype.IsEmpty() || realm->node_prototype.IsEmpty() ||
+  if (realm->node_prototype.IsEmpty() ||
       !wrapper
-           ->SetPrototype(context, realm->element_prototype.Get(isolate))
+           ->SetPrototype(context, prototype)
            .FromMaybe(false)) {
     DropUnownedElementHost(runtime, value.native, drop);
     return v8::Local<v8::Object>();
@@ -1308,7 +1340,7 @@ v8::Local<v8::Object> WrapperForInterfaceValue(
   v8::CppHeap* cpp_heap = isolate->GetCppHeap();
   auto* cell = cppgc::MakeGarbageCollected<ServoV8HostCell>(
       cpp_heap->GetAllocationHandle(), runtime, value.native, drop, value.key,
-      ServoV8HostKind::kElement);
+      kind);
   // Keep the cell reachable across the Wrap call, which can allocate.
   cppgc::Persistent<ServoV8HostCell> pending(cell);
   v8::Object::Wrap<kServoHostTag>(isolate, wrapper, cell);
@@ -1370,11 +1402,8 @@ v8::Local<v8::Object> WrapperForNodeListHost(
       RustCallbackScope callback_scope(runtime);
       succeeded = vtable.item(native, index, &value) != 0;
     }
-    const bool malformed =
-        value.is_null > 1 ||
-        (value.is_null != 0 && (value.key || value.native)) ||
-        (value.is_null == 0 && (!value.key || !value.native));
-    if (!succeeded || malformed || value.is_null != 0) {
+    const bool malformed = !IsValidElementInterfaceValue(value);
+    if (!succeeded || malformed || value.kind == SERVO_V8_INTERFACE_NULL) {
       DropUnownedElementHost(runtime, value.native,
                              runtime->element_host_vtable.drop);
       cell->ReleaseHost();
@@ -1525,17 +1554,14 @@ void NodeListHostItem(const v8::FunctionCallbackInfo<v8::Value>& info) {
     succeeded = realm->runtime->node_list_host_vtable.item(
                     native, maybe_index.FromJust(), &value) != 0;
   }
-  const bool malformed =
-      value.is_null > 1 ||
-      (value.is_null != 0 && (value.key || value.native)) ||
-      (value.is_null == 0 && (!value.key || !value.native));
+  const bool malformed = !IsValidElementInterfaceValue(value);
   if (!succeeded || malformed) {
     DropUnownedElementHost(realm->runtime, value.native,
                            realm->runtime->element_host_vtable.drop);
     ThrowTypeError(isolate, "NodeList.item host callback failed");
     return;
   }
-  if (value.is_null != 0) {
+  if (value.kind == SERVO_V8_INTERFACE_NULL) {
     info.GetReturnValue().SetNull();
     return;
   }
@@ -1612,10 +1638,7 @@ bool HTMLCollectionWrapItem(ServoV8RealmState* realm,
                             bool succeeded,
                             bool* present,
                             v8::Local<v8::Object>* item) {
-  const bool malformed =
-      value->is_null > 1 ||
-      (value->is_null != 0 && (value->key || value->native)) ||
-      (value->is_null == 0 && (!value->key || !value->native));
+  const bool malformed = !IsValidElementInterfaceValue(*value);
   if (!succeeded || malformed) {
     DropUnownedElementHost(realm->runtime, value->native,
                            realm->runtime->element_host_vtable.drop);
@@ -1623,7 +1646,7 @@ bool HTMLCollectionWrapItem(ServoV8RealmState* realm,
                    "HTMLCollection item host callback failed");
     return false;
   }
-  if (value->is_null != 0) {
+  if (value->kind == SERVO_V8_INTERFACE_NULL) {
     *present = false;
     return true;
   }
@@ -1927,6 +1950,16 @@ void* UnwrapElementHostNative(const v8::FunctionCallbackInfo<v8::Value>& info) {
                                                            : nullptr;
 }
 
+void* UnwrapNodeHostNative(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Local<v8::Value> receiver = info.This();
+  if (!receiver->IsObject()) return nullptr;
+  auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(
+      info.GetIsolate(), receiver.As<v8::Object>());
+  return cell && IsNodeInterfaceKind(static_cast<uint8_t>(cell->kind()))
+             ? cell->native()
+             : nullptr;
+}
+
 bool ElementHostCallbackState(
     const v8::FunctionCallbackInfo<v8::Value>& info,
     ServoV8RealmState** realm_output,
@@ -1951,7 +1984,31 @@ bool ElementHostCallbackState(
   return true;
 }
 
-bool UnwrapElementHostArgument(
+bool NodeHostCallbackState(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ServoV8RealmState** realm_output,
+    void** native_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  auto* realm = static_cast<ServoV8RealmState*>(
+      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  void* native = UnwrapNodeHostNative(info);
+  if (!realm || realm->tearing_down || !realm->runtime ||
+      realm->runtime->isolate != isolate || realm->context.IsEmpty() ||
+      realm->context.Get(isolate) != isolate->GetCurrentContext() || !native) {
+    ThrowTypeError(isolate, "invalid Node host state");
+    return false;
+  }
+  if (realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "re-entrant Node host callback");
+    return false;
+  }
+  *realm_output = realm;
+  *native_output = native;
+  return true;
+}
+
+bool UnwrapNodeHostArgument(
     const v8::FunctionCallbackInfo<v8::Value>& info,
     int index,
     ServoV8RealmState* expected_realm,
@@ -1968,9 +2025,10 @@ bool UnwrapElementHostArgument(
           isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
   auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(isolate,
                                                                  object);
-  if (!realm || realm != expected_realm || realm->tearing_down ||
-      !cell || cell->kind() != ServoV8HostKind::kElement || !cell->native()) {
-    ThrowTypeError(isolate, "Node argument is not an Element-backed Node in this realm");
+  if (!realm || realm != expected_realm || realm->tearing_down || !cell ||
+      !IsNodeInterfaceKind(static_cast<uint8_t>(cell->kind())) ||
+      !cell->native()) {
+    ThrowTypeError(isolate, "Node argument is not a Node in this realm");
     return false;
   }
   *native_output = cell->native();
@@ -2718,17 +2776,14 @@ void ElementHostGetInterface(
     ThrowTypeError(isolate, member_name);
     return;
   }
-  const bool malformed =
-      value.is_null > 1 ||
-      (value.is_null != 0 && (value.key || value.native)) ||
-      (value.is_null == 0 && (!value.key || !value.native));
+  const bool malformed = !IsValidElementInterfaceValue(value);
   if (malformed) {
     DropUnownedElementHost(realm->runtime, value.native,
                            realm->runtime->element_host_vtable.drop);
     ThrowTypeError(isolate, "invalid Element interface result");
     return;
   }
-  if (value.is_null != 0) {
+  if (value.kind == SERVO_V8_INTERFACE_NULL) {
     info.GetReturnValue().SetNull();
     return;
   }
@@ -3032,7 +3087,11 @@ void NodeHostGetNodeType(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   ServoV8RealmState* realm = nullptr;
   void* native = nullptr;
-  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!NodeHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.get_node_type) {
+    ThrowTypeError(isolate, "Node.nodeType host callback is not installed");
+    return;
+  }
   uint16_t result = 0;
   {
     RustCallbackScope callback_scope(realm->runtime);
@@ -3045,51 +3104,86 @@ void NodeHostGetNodeType(const v8::FunctionCallbackInfo<v8::Value>& info) {
 }
 
 void NodeHostGetNodeName(const v8::FunctionCallbackInfo<v8::Value>& info) {
-  ElementHostGetString(info, &ServoV8ElementHostVTable::get_node_name,
-                       "Node.nodeName host callback failed");
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!NodeHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.get_node_name) {
+    ThrowTypeError(isolate, "Node.nodeName host callback is not installed");
+    return;
+  }
+  ServoV8OwnedUtf8 value{};
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_node_name(native, &value)) {
+      ThrowTypeError(isolate, "Node.nodeName host callback failed");
+      return;
+    }
+  }
+  DocumentHostOwnedUtf8Scope value_scope(realm->runtime, &value);
+  if (!value.data || !value.owner || !value.drop_owner ||
+      value.length > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      !IsValidUtf8(value.data, value.length)) {
+    ThrowTypeError(isolate, "invalid Node.nodeName result");
+    return;
+  }
+  v8::Local<v8::String> result;
+  if (!v8::String::NewFromUtf8(isolate,
+                               reinterpret_cast<const char*>(value.data),
+                               v8::NewStringType::kNormal,
+                               static_cast<int>(value.length)).ToLocal(&result)) return;
+  info.GetReturnValue().Set(result);
 }
 
 void NodeHostGetParentElement(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
-  ElementHostGetInterface(info,
-                          &ServoV8ElementHostVTable::get_parent_element,
-                          "Node.parentElement host callback failed");
-}
-
-using ElementBooleanGetter = uint8_t (*)(void* native, uint8_t* output);
-using ElementBooleanGetterSlot =
-    ElementBooleanGetter ServoV8ElementHostVTable::*;
-
-void ElementHostGetBoolean(const v8::FunctionCallbackInfo<v8::Value>& info,
-                           ElementBooleanGetterSlot getter_slot,
-                           const char* member_name) {
   v8::Isolate* isolate = info.GetIsolate();
   ServoV8RealmState* realm = nullptr;
   void* native = nullptr;
-  if (!ElementHostCallbackState(info, &realm, &native)) return;
-  const ElementBooleanGetter getter =
-      realm->runtime->element_host_vtable.*getter_slot;
-  uint8_t result = 0;
-  {
-    RustCallbackScope callback_scope(realm->runtime);
-    if (!getter || !getter(native, &result) || result > 1) {
-      ThrowTypeError(isolate, member_name);
-      return;
-    }
+  if (!NodeHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.get_parent_element) {
+    ThrowTypeError(isolate, "Node.parentElement host callback is not installed");
+    return;
   }
-  info.GetReturnValue().Set(result != 0);
+  ServoV8InterfaceValue value{};
+  bool succeeded = false;
+  { RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.get_parent_element(native, &value); }
+  if (!succeeded || !IsValidElementInterfaceValue(value)) {
+    DropUnownedElementHost(realm->runtime, value.native,
+                           realm->runtime->element_host_vtable.drop);
+    ThrowTypeError(isolate, "Node.parentElement host callback failed");
+    return;
+  }
+  if (value.kind == SERVO_V8_INTERFACE_NULL) { info.GetReturnValue().SetNull(); return; }
+  v8::Local<v8::Object> wrapper = WrapperForInterfaceValue(
+      realm, isolate, isolate->GetCurrentContext(), value);
+  if (wrapper.IsEmpty()) { ThrowTypeError(isolate, "Node parent wrapper could not be created"); return; }
+  info.GetReturnValue().Set(wrapper);
 }
 
 void NodeHostGetIsConnected(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
-  ElementHostGetBoolean(info, &ServoV8ElementHostVTable::get_is_connected,
-                        "Node.isConnected host callback failed");
+  v8::Isolate* isolate = info.GetIsolate(); ServoV8RealmState* realm = nullptr; void* native = nullptr;
+  if (!NodeHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.get_is_connected) {
+    ThrowTypeError(isolate, "Node.isConnected host callback is not installed"); return; }
+  uint8_t value = 0; { RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_is_connected(native, &value) || value > 1) {
+      ThrowTypeError(isolate, "Node.isConnected host callback failed"); return; } }
+  info.GetReturnValue().Set(value != 0);
 }
 
 void NodeHostHasChildNodes(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
-  ElementHostGetBoolean(info, &ServoV8ElementHostVTable::has_child_nodes,
-                        "Node.hasChildNodes host callback failed");
+  v8::Isolate* isolate = info.GetIsolate(); ServoV8RealmState* realm = nullptr; void* native = nullptr;
+  if (!NodeHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.has_child_nodes) {
+    ThrowTypeError(isolate, "Node.hasChildNodes host callback is not installed"); return; }
+  uint8_t value = 0; { RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.has_child_nodes(native, &value) || value > 1) {
+      ThrowTypeError(isolate, "Node.hasChildNodes host callback failed"); return; } }
+  info.GetReturnValue().Set(value != 0);
 }
 
 void ReturnNodeMutationOutcome(
@@ -3116,9 +3210,9 @@ void ReturnNodeMutationOutcome(
 
   const ServoV8InterfaceValue& value = outcome->value;
   const bool valid_returned_value =
-      value.is_null == 0 && value.key && value.native;
+      IsNodeInterfaceKind(value.kind) && value.key && value.native;
   const bool canonical_null_value =
-      value.is_null == 1 && !value.key && !value.native;
+      value.kind == SERVO_V8_INTERFACE_NULL && !value.key && !value.native;
   const bool is_exception =
       outcome->status == SERVO_V8_NODE_MUTATION_DOM_EXCEPTION;
   const bool valid_exception_kind =
@@ -3190,7 +3284,7 @@ bool NodeMutationCallbackState(
     void** native_output) {
   v8::Isolate* isolate = info.GetIsolate();
   // WebIDL checks the receiver brand before inspecting arguments.
-  if (!ElementHostCallbackState(info, realm_output, native_output)) return false;
+  if (!NodeHostCallbackState(info, realm_output, native_output)) return false;
   if (info.Length() < required_arguments) {
     ThrowTypeError(isolate, member_name);
     return false;
@@ -3211,11 +3305,11 @@ void NodeHostInsertBefore(
     return;
   }
   void* node_native = nullptr;
-  if (!UnwrapElementHostArgument(info, 0, realm, &node_native)) return;
+  if (!UnwrapNodeHostArgument(info, 0, realm, &node_native)) return;
   uint8_t child_is_null = info[1]->IsNull() ? 1 : 0;
   void* child_native = nullptr;
   if (!child_is_null &&
-      !UnwrapElementHostArgument(info, 1, realm, &child_native)) {
+      !UnwrapNodeHostArgument(info, 1, realm, &child_native)) {
     return;
   }
   ServoV8NodeMutationOutcome outcome{};
@@ -3241,7 +3335,7 @@ void NodeHostAppendChild(
     return;
   }
   void* node_native = nullptr;
-  if (!UnwrapElementHostArgument(info, 0, realm, &node_native)) return;
+  if (!UnwrapNodeHostArgument(info, 0, realm, &node_native)) return;
   ServoV8NodeMutationOutcome outcome{};
   bool succeeded = false;
   {
@@ -3266,8 +3360,8 @@ void NodeHostReplaceChild(
   }
   void* node_native = nullptr;
   void* child_native = nullptr;
-  if (!UnwrapElementHostArgument(info, 0, realm, &node_native) ||
-      !UnwrapElementHostArgument(info, 1, realm, &child_native)) {
+  if (!UnwrapNodeHostArgument(info, 0, realm, &node_native) ||
+      !UnwrapNodeHostArgument(info, 1, realm, &child_native)) {
     return;
   }
   ServoV8NodeMutationOutcome outcome{};
@@ -3293,7 +3387,7 @@ void NodeHostRemoveChild(
     return;
   }
   void* child_native = nullptr;
-  if (!UnwrapElementHostArgument(info, 0, realm, &child_native)) return;
+  if (!UnwrapNodeHostArgument(info, 0, realm, &child_native)) return;
   ServoV8NodeMutationOutcome outcome{};
   bool succeeded = false;
   {
@@ -3349,9 +3443,18 @@ void ElementHostGetPrefix(const v8::FunctionCallbackInfo<v8::Value>& info) {
 
 void NodeHostGetTextContent(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
-  ElementHostGetOptionalString(
-      info, &ServoV8ElementHostVTable::get_text_content,
-      "Node.textContent host callback failed", "invalid Node.textContent result");
+  ServoV8RealmState* realm = nullptr; void* native = nullptr;
+  if (!NodeHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.get_text_content) {
+    ThrowTypeError(info.GetIsolate(), "Node.textContent host callback is not installed");
+    return;
+  }
+  ServoV8OptionalOwnedUtf8 result{}; bool succeeded = false;
+  { RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.get_text_content(native, &result); }
+  ElementHostSetOptionalStringResult(info, realm, &result, succeeded,
+                                     "Node.textContent host callback failed",
+                                     "invalid Node.textContent result");
 }
 
 void NodeHostSetTextContent(
@@ -3360,7 +3463,7 @@ void NodeHostSetTextContent(
   ServoV8RealmState* realm = nullptr;
   void* native = nullptr;
   // Brand-check before nullable DOMString conversion.
-  if (!ElementHostCallbackState(info, &realm, &native)) return;
+  if (!NodeHostCallbackState(info, &realm, &native)) return;
   if (!realm->document_host.active_host_context ||
       !realm->runtime->element_host_vtable.set_text_content) {
     ThrowTypeError(isolate, "Node.textContent mutation requires a live host context");
@@ -4257,6 +4360,8 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->uncached_hosts.clear();
   realm->element_template.Reset();
   realm->element_prototype.Reset();
+  realm->document_fragment_template.Reset();
+  realm->document_fragment_prototype.Reset();
   realm->node_prototype.Reset();
   realm->node_list_template.Reset();
   realm->node_list_prototype.Reset();
@@ -4569,13 +4674,28 @@ extern "C" int32_t servo_v8_realm_create(
   element_constructor->SetClassName(V8String(isolate, "Element"));
   v8::Local<v8::ObjectTemplate> element_instance =
       element_constructor->InstanceTemplate();
+  // DocumentFragment deliberately has no global constructor in this
+  // milestone. It is only materialized by Document.createDocumentFragment.
+  v8::Local<v8::FunctionTemplate> document_fragment_constructor =
+      v8::FunctionTemplate::New(isolate);
+  document_fragment_constructor->SetClassName(V8String(isolate, "DocumentFragment"));
+  v8::Local<v8::ObjectTemplate> document_fragment_instance =
+      document_fragment_constructor->InstanceTemplate();
   v8::Local<v8::Object> node_prototype = v8::Object::New(isolate);
   v8::Local<v8::Object> element_prototype = v8::Object::New(isolate);
+  v8::Local<v8::Object> document_fragment_prototype = v8::Object::New(isolate);
   if (!InstallNodeListInterface(realm.get(), context, global) ||
       !InstallHTMLCollectionInterface(realm.get(), context, global) ||
       !InstallNodePrototype(realm.get(), context, node_prototype) ||
       !InstallElementPrototype(realm.get(), context, element_prototype) ||
       !element_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
+      !document_fragment_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
+      !document_fragment_prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "DocumentFragment"),
+                               static_cast<v8::PropertyAttribute>(
+                                   v8::ReadOnly | v8::DontEnum))
+           .FromMaybe(false) ||
       !document->SetPrototype(context, document_prototype).FromMaybe(false) ||
       !global
            ->DefineOwnProperty(context, V8String(isolate, "window"), global,
@@ -4594,6 +4714,8 @@ extern "C" int32_t servo_v8_realm_create(
 
   realm->element_template.Reset(isolate, element_instance);
   realm->element_prototype.Reset(isolate, element_prototype);
+  realm->document_fragment_template.Reset(isolate, document_fragment_instance);
+  realm->document_fragment_prototype.Reset(isolate, document_fragment_prototype);
   realm->node_prototype.Reset(isolate, node_prototype);
   realm->context.Reset(isolate, context);
   realm->document.Reset(isolate, document);

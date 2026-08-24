@@ -68,6 +68,7 @@ proofs=(
   # This proof intentionally renders text, so its screenshot is non-uniform;
   # the unmarked follow-up script emits the PASS marker and checks the DOM.
   "authoritative_create_element_proof.html:rendered:0:1"
+  "authoritative_document_fragment_proof.html:rendered:0:0"
   # bgColor is set by the SpiderMonkey error handler, not by V8.
   "authoritative_job_error_proof.html:(0, 255, 0):0:0"
 )
@@ -119,8 +120,17 @@ PY
        [[ "$actual_rgb" == unreadable:* ]]; then
       rgb_ok=0
     fi
-    if ! grep -Fq "RESULT createElement v39 PASS constructors=0/0 text=Hello" "$log"; then
-      echo "        missing createElement screenshot proof marker"
+    case "$page" in
+      authoritative_create_element_proof.html)
+        marker="RESULT createElement v39 PASS constructors=0/0 text=Hello"
+        ;;
+      authoritative_document_fragment_proof.html)
+        marker="RESULT documentFragment v42 PASS text=Hello"
+        ;;
+      *) marker="" ;;
+    esac
+    if [ -n "$marker" ] && ! grep -Fq "$marker" "$log"; then
+      echo "        missing screenshot proof marker: $marker"
       extra_ok=0
     fi
   elif [ "$actual_rgb" != "$expected_rgb" ]; then
