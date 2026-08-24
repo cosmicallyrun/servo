@@ -352,6 +352,21 @@ semantics have an explicit ABI. `authoritative_create_text_node_proof.html`
 pins receiver-before-conversion behavior, Text identity and brands, fragment
 splicing and Element insertion, and SpiderMonkey visibility of `Hello`.
 
+ABI v44 adds `Document.createComment`. Comments use the same generic
+`Trusted<Node>` host with a Comment kind, preserving one installed Rust type
+and dynamic allocation-plus-kind wrapper identity across Element,
+DocumentFragment, Text, and Comment. The generated operation uses the live
+ephemeral context only for Servo's exact
+`DocumentMethods::CreateComment(cx, DOMString)`, clearing an unexpected pending
+SpiderMonkey exception before returning a freshly boxed Comment-kind host. It
+cannot enter V8 or pump custom-element reactions. The selected facade exposes
+only inherited Node behavior through Comment's dedicated
+Comment → CharacterData → Node prototype chain; `data`, `wholeText`, and other
+CharacterData-specific APIs remain explicitly out of scope. The v44 proof
+pins this chain and its toString tags, conversion ordering, Element-brand
+rejection, generic fragment/Element mutation identity, and a SpiderMonkey
+observation of the Comment and Text sibling nodes.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script
@@ -619,6 +634,7 @@ The proof suite uses that same counting argument:
 | `authoritative_create_element_proof.html` | Document.createElement preserves descriptor/brand/conversion order, dictionary/string union behavior, HTML normalization, fresh wrappers, fail-closed matching custom elements, and a rendered Hello screenshot |
 | `authoritative_document_fragment_proof.html` | Document.createDocumentFragment preserves its exact Document method surface and dynamic Node identity; fragment insertion splices production children, preserves the returned fragment wrapper, maps mutation errors in V8, and is visible to SpiderMonkey |
 | `authoritative_create_text_node_proof.html` | Document.createTextNode preserves receiver/argument conversion ordering and fresh Text wrappers; generic Node fragment/Element insertion preserves identity and the final Text is visible to SpiderMonkey |
+| `authoritative_create_comment_proof.html` | Document.createComment preserves receiver/argument conversion ordering, Comment/CharacterData/Node inheritance and tags, generic insertion identity, and SpiderMonkey visibility of a Comment plus Text sibling |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -642,7 +658,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 43 and remains experimental. The original
+The current exported C ABI is version 44 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

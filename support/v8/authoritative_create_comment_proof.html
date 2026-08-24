@@ -1,0 +1,136 @@
+<!doctype html>
+<!--
+Browser proof for ABI v44's Document.createComment() and Comment-kind generic
+Node host. It pins Web IDL conversion/receiver ordering, the Comment to
+CharacterData to Node prototype chain, generic fragment/Element mutations,
+and a SpiderMonkey observation of the final production tree.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Comment creation proof</title>
+    <style>
+      body { color: #101010; font: 48px/1.2 sans-serif; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const documentPrototype = Object.getPrototypeOf(document);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        documentPrototype, "createComment",
+      );
+      if (
+        Object.hasOwn(document, "createComment") || !descriptor ||
+        typeof descriptor.value !== "function" ||
+        descriptor.value.name !== "createComment" || descriptor.value.length !== 1 ||
+        !descriptor.writable || !descriptor.enumerable || !descriptor.configurable
+      ) {
+        throw new Error("bad Document createComment descriptor");
+      }
+
+      let brandConversionTouched = false;
+      let wrongDocumentBrand = false;
+      try {
+        descriptor.value.call({}, {
+          toString() {
+            brandConversionTouched = true;
+            return "wrong";
+          },
+        });
+      } catch (error) {
+        wrongDocumentBrand = error instanceof TypeError;
+      }
+      if (!wrongDocumentBrand || brandConversionTouched) {
+        throw new Error("createComment did not brand-check before conversion");
+      }
+      let missing = false;
+      try { descriptor.value.call(document); } catch (error) {
+        missing = error instanceof TypeError;
+      }
+      let symbol = false;
+      try { document.createComment(Symbol("comment")); } catch (error) {
+        symbol = error instanceof TypeError;
+      }
+      const thrown = new Error("createComment conversion");
+      let throwingToString = false;
+      try {
+        document.createComment({ toString() { throw thrown; } });
+      } catch (error) {
+        throwingToString = error === thrown;
+      }
+      const surplus = document.createComment("surplus", "ignored");
+      if (!missing || !symbol || !throwingToString || surplus.textContent !== "surplus") {
+        throw new Error("createComment Web IDL conversion is wrong");
+      }
+
+      const comment = document.createComment("comment-data");
+      const distinct = document.createComment("comment-data");
+      const text = document.createTextNode("Hello");
+      const fragment = document.createDocumentFragment();
+      const target = document.querySelector("#visible-target");
+      const elementPrototype = Object.getPrototypeOf(target);
+      const commentPrototype = Object.getPrototypeOf(comment);
+      const characterDataPrototype = Object.getPrototypeOf(commentPrototype);
+      const nodePrototype = Object.getPrototypeOf(characterDataPrototype);
+      const appendChildDescriptor = Object.getOwnPropertyDescriptor(
+        nodePrototype, "appendChild",
+      );
+      if (
+        comment === distinct || comment.nodeType !== 8 ||
+        comment.nodeName !== "#comment" || comment.textContent !== "comment-data" ||
+        comment.parentElement !== null || comment.isConnected ||
+        typeof Comment !== "undefined" || typeof CharacterData !== "undefined" ||
+        typeof Text !== "undefined" ||
+        Object.getPrototypeOf(distinct) !== commentPrototype ||
+        Object.getPrototypeOf(Object.getPrototypeOf(target)) !== nodePrototype ||
+        Object.prototype.toString.call(comment) !== "[object Comment]" ||
+        commentPrototype[Symbol.toStringTag] !== "Comment" ||
+        characterDataPrototype[Symbol.toStringTag] !== "CharacterData" ||
+        !appendChildDescriptor || appendChildDescriptor.value !== nodePrototype.appendChild ||
+        appendChildDescriptor.value.name !== "appendChild" ||
+        appendChildDescriptor.value.length !== 1 ||
+        !appendChildDescriptor.writable || !appendChildDescriptor.enumerable ||
+        !appendChildDescriptor.configurable
+      ) {
+        throw new Error("Comment has the wrong CharacterData/Node surface or identity");
+      }
+      let wrongElementBrand = false;
+      try { elementPrototype.getAttribute.call(comment, "id"); } catch (error) {
+        wrongElementBrand = error instanceof TypeError;
+      }
+      if (!wrongElementBrand) {
+        throw new Error("Comment accidentally passed the Element brand");
+      }
+
+      if (
+        nodePrototype.appendChild.call(fragment, comment) !== comment ||
+        fragment.appendChild(text) !== text || !fragment.hasChildNodes() ||
+        target.appendChild(fragment) !== fragment || fragment.hasChildNodes() ||
+        comment.parentElement !== target || text.parentElement !== target ||
+        !comment.isConnected || !text.isConnected ||
+        target.appendChild(surplus) !== surplus || surplus.parentElement !== target ||
+        target.textContent !== "Hello"
+      ) {
+        throw new Error("Comment/Text fragment and Element insertion lost identity");
+      }
+      document.documentElement.id = "v44-comment-pass";
+    </script>
+    <script>
+      // SpiderMonkey sees the V8-created Comment and its Text sibling in the
+      // one production Servo DOM tree before it supplies the final pass signal.
+      const target = document.getElementById("visible-target");
+      if (
+        document.documentElement.id === "v44-comment-pass" && target &&
+        target.textContent === "Hello" && target.childNodes.length === 3 &&
+        target.childNodes[0].nodeType === 8 &&
+        target.childNodes[0].nodeValue === "comment-data" &&
+        target.childNodes[1].nodeType === 3 && target.childNodes[1].nodeValue === "Hello" &&
+        target.childNodes[2].nodeType === 8 && target.childNodes[2].nodeValue === "surplus"
+      ) {
+        document.bgColor = "lime";
+        console.log("RESULT createComment v44 PASS text=Hello");
+      }
+    </script>
+  </body>
+</html>

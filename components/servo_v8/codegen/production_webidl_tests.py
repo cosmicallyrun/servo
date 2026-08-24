@@ -204,6 +204,12 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         self.assertEqual([argument.identifier.name for argument in text_arguments], ["data"])
         self.assertTrue(text_arguments[0].type.isDOMString())
         self.assertFalse(text_arguments[0].optional)
+        comment = attributes[production_webidl.DOCUMENT_CREATE_COMMENT]
+        comment_return, comment_arguments = comment.signatures()[0]
+        self.assertEqual(comment_return.name, "Comment")
+        self.assertFalse(comment_return.nullable())
+        self.assertEqual(set(comment._extendedAttrDict), {"NewObject"})
+        self.assertEqual([argument.identifier.name for argument in comment_arguments], ["data"])
 
     def test_pins_each_real_enum_value_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -824,6 +830,58 @@ class SyntheticSelectionTests(unittest.TestCase):
         )
         self.assert_create_text_node_rejected(
             "[NewObject] Text createTextNode(DOMString value);",
+            "argument must be required non-nullable DOMString data",
+        )
+
+    def create_comment_source(
+        self,
+        declaration: str = "[NewObject] Comment createComment(DOMString data);",
+    ) -> str:
+        return f"""
+            interface Comment {{}};
+            interface CharacterData {{}};
+            interface Document {{ {declaration} }};
+        """
+
+    def assert_create_comment_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {"Document.webidl": self.create_comment_source(declaration)}
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError, re.escape(expected)
+        ):
+            production_webidl._select_create_comment_operation(
+                parser_results, production_webidl.DOCUMENT_CREATE_COMMENT
+            )
+
+    def test_selects_exact_create_comment_operation(self) -> None:
+        parser_results = self.parse({"Document.webidl": self.create_comment_source()})
+        method = production_webidl._select_create_comment_operation(
+            parser_results, production_webidl.DOCUMENT_CREATE_COMMENT
+        )
+        return_type, arguments = method.signatures()[0]
+        self.assertEqual(return_type.name, "Comment")
+        self.assertEqual([argument.identifier.name for argument in arguments], ["data"])
+
+    def test_rejects_create_comment_shape_drift(self) -> None:
+        self.assert_create_comment_rejected(
+            "Comment createComment(DOMString data);",
+            "must carry exactly ['NewObject']",
+        )
+        self.assert_create_comment_rejected(
+            "[NewObject] Comment? createComment(DOMString data);",
+            "must return non-nullable Comment",
+        )
+        self.assert_create_comment_rejected(
+            "[NewObject] Comment createComment(DOMString? data);",
+            "argument must be required non-nullable DOMString data",
+        )
+        self.assert_create_comment_rejected(
+            "[NewObject] Comment createComment(optional DOMString data);",
+            "argument must be required non-nullable DOMString data",
+        )
+        self.assert_create_comment_rejected(
+            "[NewObject] Comment createComment(DOMString value);",
             "argument must be required non-nullable DOMString data",
         )
 

@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 43;
+const ABI_VERSION: u32 = 44;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -156,11 +156,13 @@ pub const INTERFACE_NULL: u8 = 0;
 pub const INTERFACE_ELEMENT: u8 = 1;
 pub const INTERFACE_DOCUMENT_FRAGMENT: u8 = 2;
 pub const INTERFACE_TEXT: u8 = 3;
+pub const INTERFACE_COMMENT: u8 = 4;
 // Named aliases keep generated ABI code self-describing.
 pub const INTERFACE_KIND_NULL: u8 = INTERFACE_NULL;
 pub const INTERFACE_KIND_ELEMENT: u8 = INTERFACE_ELEMENT;
 pub const INTERFACE_KIND_DOCUMENT_FRAGMENT: u8 = INTERFACE_DOCUMENT_FRAGMENT;
 pub const INTERFACE_KIND_TEXT: u8 = INTERFACE_TEXT;
+pub const INTERFACE_KIND_COMMENT: u8 = INTERFACE_COMMENT;
 
 /// One Servo DOM object being handed to script.
 ///
@@ -225,6 +227,20 @@ impl InterfaceHandle {
     pub unsafe fn text<T: ElementHostBinding>(dom_object: *const c_void, host: T) -> Self {
         Self {
             kind: INTERFACE_TEXT,
+            key: dom_object,
+            native: Box::into_raw(Box::new(host)).cast::<c_void>(),
+        }
+    }
+
+    /// Boxes a host as a `Comment` Node.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`Self::new`] apply. Comment shares the
+    /// runtime's one concrete host type and drop vtable with all exposed Nodes.
+    pub unsafe fn comment<T: ElementHostBinding>(dom_object: *const c_void, host: T) -> Self {
+        Self {
+            kind: INTERFACE_COMMENT,
             key: dom_object,
             native: Box::into_raw(Box::new(host)).cast::<c_void>(),
         }
@@ -3965,6 +3981,7 @@ mod tests {
             match self.tag_name.as_str() {
                 "#document-fragment" => 11,
                 "#text" => 3,
+                "#comment" => 8,
                 _ => 1,
             }
         }
@@ -3987,7 +4004,7 @@ mod tests {
             *self.state.text_content.borrow_mut() = Some(value.to_owned());
             self.state
                 .has_child_nodes
-                .set(self.tag_name != "#text" && !value.is_empty());
+                .set(!matches!(self.tag_name.as_str(), "#text" | "#comment") && !value.is_empty());
             for child in self.state.element_children.borrow().iter() {
                 child.state.is_connected.set(false);
             }
@@ -3997,7 +4014,10 @@ mod tests {
 
         fn parent_element(&self) -> Option<InterfaceHandle> {
             let parent = self.parent_element.as_ref()?;
-            if matches!(parent.tag_name.as_str(), "#document-fragment" | "#text") {
+            if matches!(
+                parent.tag_name.as_str(),
+                "#document-fragment" | "#text" | "#comment"
+            ) {
                 return None;
             }
             let parent_children = self.parent_children.as_ref()?;
@@ -4476,6 +4496,7 @@ mod tests {
                 match self.tag_name.as_str() {
                     "#document-fragment" => InterfaceHandle::document_fragment(self.identity, host),
                     "#text" => InterfaceHandle::text(self.identity, host),
+                    "#comment" => InterfaceHandle::comment(self.identity, host),
                     _ => InterfaceHandle::new(self.identity, host),
                 }
             }
@@ -4953,6 +4974,40 @@ mod tests {
                     ElementHostProbe {
                         local_name: "#text".to_owned(),
                         tag_name: "#text".to_owned(),
+                        identity: key,
+                        state,
+                        _owned_identity: Some(identity),
+                        parent_children: None,
+                        parent_state: None,
+                        parent_element: None,
+                        drops: Rc::clone(&self.element_drops),
+                        drop_reentry: self.element_drop_reentry.clone(),
+                    },
+                )
+            })
+        }
+
+        unsafe fn create_comment(
+            &self,
+            host_context: *mut c_void,
+            data: &str,
+        ) -> Option<InterfaceHandle> {
+            if host_context.is_null() {
+                return None;
+            }
+            let identity = Rc::new(0_u8);
+            let key = Rc::as_ptr(&identity).cast::<c_void>();
+            let state = ElementProbeState::with_attributes(&[]);
+            *state.text_content.borrow_mut() = Some(data.to_owned());
+            state.is_connected.set(false);
+            // SAFETY: like Text, Comment uses the one installed concrete host
+            // type while its explicit interface kind selects the JS wrapper.
+            Some(unsafe {
+                InterfaceHandle::comment(
+                    key,
+                    ElementHostProbe {
+                        local_name: "#comment".to_owned(),
+                        tag_name: "#comment".to_owned(),
                         identity: key,
                         state,
                         _owned_identity: Some(identity),
@@ -9226,6 +9281,7 @@ mod tests {
         let create_callback = vtable.create_element.unwrap();
         let create_fragment_callback = vtable.create_document_fragment.unwrap();
         let create_text_callback = vtable.create_text_node.unwrap();
+        let create_comment_callback = vtable.create_comment.unwrap();
         let mut host_context = 0_u8;
         let host_context = (&mut host_context as *mut u8).cast::<c_void>();
         let mut output = RawInterfaceValue {
@@ -9573,6 +9629,62 @@ mod tests {
             assert!(!text_output.key.is_null());
             assert!(!text_output.native.is_null());
             element_host_drop::<ElementHostProbe>(text_output.native);
+
+            let mut comment_output = raw_null_interface_value();
+            assert_eq!(
+                create_comment_callback(
+                    std::ptr::null_mut(),
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    &mut comment_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_comment_callback(
+                    native,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    &mut comment_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_comment_callback(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    &mut comment_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_comment_callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    1,
+                    &mut comment_output,
+                ),
+                0,
+            );
+            assert_eq!(
+                create_comment_callback(
+                    native,
+                    host_context,
+                    std::ptr::null(),
+                    0,
+                    &mut comment_output,
+                ),
+                1,
+            );
+            assert_eq!(comment_output.kind, INTERFACE_COMMENT);
+            assert!(!comment_output.key.is_null());
+            assert!(!comment_output.native.is_null());
+            element_host_drop::<ElementHostProbe>(comment_output.native);
             vtable.drop.unwrap()(native);
         }
         assert_eq!(&*calls.borrow(), &[""]);
@@ -10003,6 +10115,148 @@ mod tests {
             node_drops.get(),
             5,
             "four wrappers plus the appendChild cache-hit host must drop exactly once"
+        );
+    }
+
+    #[test]
+    fn comment_nodes_keep_character_data_node_brand_and_mutation_identity() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const documentPrototype = Object.getPrototypeOf(document);
+              const descriptor = Object.getOwnPropertyDescriptor(
+                documentPrototype, 'createComment');
+              let wrongDocumentBrand = false;
+              try { descriptor.value.call({}, 'x'); }
+              catch (error) { wrongDocumentBrand = error instanceof TypeError; }
+              let conversions = 0;
+              const comment = document.createComment({ toString() {
+                conversions++; return 'first';
+              }});
+              const second = document.createComment('second');
+              const fragment = document.createDocumentFragment();
+              const element = document.createElement('span');
+              const elementPrototype = Object.getPrototypeOf(element);
+              const commentPrototype = Object.getPrototypeOf(comment);
+              const characterDataPrototype = Object.getPrototypeOf(commentPrototype);
+              const nodePrototype = Object.getPrototypeOf(characterDataPrototype);
+              const commentTag = Object.getOwnPropertyDescriptor(
+                commentPrototype, Symbol.toStringTag);
+              const characterDataTag = Object.getOwnPropertyDescriptor(
+                characterDataPrototype, Symbol.toStringTag);
+              let wrongElementBrand = false;
+              try { elementPrototype.getAttribute.call(comment, 'id'); }
+              catch (error) { wrongElementBrand = error instanceof TypeError; }
+              const initiallyDisconnected = !comment.isConnected;
+              const appended = fragment.appendChild(comment) === comment &&
+                !comment.isConnected && element.appendChild(comment) === comment &&
+                comment.isConnected;
+              comment.textContent = 'updated';
+              globalThis.commentForNoContext = comment;
+              globalThis.commentNodeDiagnostics = {
+                descriptor: !!descriptor && descriptor.value.name === 'createComment' &&
+                  descriptor.value.length === 1 && descriptor.writable &&
+                  descriptor.enumerable && descriptor.configurable,
+                wrongDocumentBrand,
+                noGlobalConstructor: typeof Comment === 'undefined',
+                conversion: conversions === 1,
+                freshIdentity: comment !== second,
+                prototypeChain: Object.getPrototypeOf(commentPrototype) ===
+                  characterDataPrototype && Object.getPrototypeOf(characterDataPrototype) ===
+                  nodePrototype && characterDataPrototype !== elementPrototype,
+                nodeSurface: comment.nodeType === 8 && comment.nodeName === '#comment' &&
+                  comment.textContent === 'updated' && !comment.hasChildNodes(),
+                initiallyDisconnected,
+                tags: Object.prototype.toString.call(comment) === '[object Comment]' &&
+                  !!commentTag && commentTag.value === 'Comment' && !commentTag.writable &&
+                  !commentTag.enumerable && commentTag.configurable && !!characterDataTag &&
+                  characterDataTag.value === 'CharacterData' && !characterDataTag.writable &&
+                  !characterDataTag.enumerable && characterDataTag.configurable,
+                wrongElementBrand,
+                appended,
+              };
+              globalThis.commentNodeBridgeProof = Object.values(commentNodeDiagnostics).every(Boolean);
+            })();"#,
+            "document-create-comment.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: the token remains live for the synchronous host callback.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        for check in [
+            "descriptor",
+            "wrongDocumentBrand",
+            "noGlobalConstructor",
+            "conversion",
+            "freshIdentity",
+            "prototypeChain",
+            "nodeSurface",
+            "initiallyDisconnected",
+            "tags",
+            "wrongElementBrand",
+            "appended",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(realm, &format!("commentNodeDiagnostics.{check}"))
+                    .unwrap(),
+                "Comment bridge check failed: {check}"
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { document.createComment('x'); } \
+                     catch (error) { return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap(),
+            "Comment creation without the ephemeral host context must be rejected"
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { try { commentForNoContext.textContent = 'x'; } \
+                     catch (error) { return error instanceof TypeError; } return false; })()",
+                )
+                .unwrap(),
+            "Comment mutation without the ephemeral host context must be rejected"
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(
+            node_drops.get(),
+            6,
+            "four wrappers plus two appendChild cache-hit hosts must drop exactly once"
         );
     }
 

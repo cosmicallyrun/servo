@@ -343,6 +343,28 @@ class DocumentHostGenerationTests(unittest.TestCase):
         self.assertIn("v8::Local<v8::Data>(), 1,", install)
         self.assertIn("v8::SideEffectType::kHasSideEffect", install)
 
+    def test_generates_create_comment_abi_and_exact_kind_cleanup(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        self.assertIn("unsafe fn create_comment(", rust)
+        callback = cpp.split("void DocumentHostCallCreateComment(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        for fragment in (
+            "comment_template.IsEmpty()",
+            "comment_prototype.IsEmpty()",
+            "character_data_prototype.IsEmpty()",
+            "value.kind != SERVO_V8_INTERFACE_COMMENT",
+            "DropUnownedElementHost(state->runtime, value.native",
+            "WrapperForInterfaceValue(realm, isolate, context, value)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, callback)
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallCreateComment,", 1
+        )[1].split(".ToLocal", 1)[0]
+        self.assertIn("v8::Local<v8::Data>(), 1,", install)
+
     def test_marks_only_pure_selector_operations_as_side_effect_free(self) -> None:
         output = self.outputs[generate_document_host.CPP_NAME]
         query_selector_install = output.split(
@@ -501,6 +523,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
                     production_webidl.CREATE_ELEMENT,
                     production_webidl.CREATE_DOCUMENT_FRAGMENT,
                     production_webidl.CREATE_TEXT_NODE,
+                    production_webidl.CREATE_COMMENT,
                 }
                 if member.shape not in operation_shapes:
                     slot = f"get_{slot}"
@@ -523,6 +546,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
                     production_webidl.CREATE_ELEMENT,
                     production_webidl.CREATE_DOCUMENT_FRAGMENT,
                     production_webidl.CREATE_TEXT_NODE,
+                    production_webidl.CREATE_COMMENT,
                 }:
                     self.assertIn(f"DocumentHostCall{callback}", output)
                     self.assertIn(f"{local}_method, v8::None", output)

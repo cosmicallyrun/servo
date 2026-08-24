@@ -155,6 +155,8 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 #[cfg(feature = "v8-shadow")]
+use crate::dom::characterdata::comment::Comment;
+#[cfg(feature = "v8-shadow")]
 use crate::dom::characterdata::text::Text;
 use crate::dom::csp::{CspReporting, GlobalCspReporting, Violation};
 use crate::dom::customelementregistry::{
@@ -255,6 +257,7 @@ enum V8NodeInterfaceKind {
     Element,
     DocumentFragment,
     Text,
+    Comment,
 }
 
 /// A host for one Servo Node that V8 has been handed.
@@ -547,6 +550,8 @@ fn v8_node_interface_handle(node: &Node) -> Option<servo_v8::InterfaceHandle> {
         V8NodeInterfaceKind::DocumentFragment
     } else if node.is::<Text>() {
         V8NodeInterfaceKind::Text
+    } else if node.is::<Comment>() {
+        V8NodeInterfaceKind::Comment
     } else {
         return None;
     };
@@ -570,6 +575,10 @@ fn v8_node_interface_handle(node: &Node) -> Option<servo_v8::InterfaceHandle> {
                 ))
             },
             V8NodeInterfaceKind::Text => Some(servo_v8::InterfaceHandle::text(
+                (node as *const Node).cast::<c_void>(),
+                host,
+            )),
+            V8NodeInterfaceKind::Comment => Some(servo_v8::InterfaceHandle::comment(
                 (node as *const Node).cast::<c_void>(),
                 host,
             )),
@@ -1547,6 +1556,36 @@ unsafe impl servo_v8::DocumentHostBinding for V8DocumentHost {
             return None;
         }
         v8_node_interface_handle(text.upcast::<Node>())
+    }
+
+    unsafe fn create_comment(
+        &self,
+        host_context: *mut c_void,
+        data: &str,
+    ) -> Option<servo_v8::InterfaceHandle> {
+        if host_context.is_null() {
+            return None;
+        }
+        // SAFETY: The authoritative V8 entry lends this live owner-thread
+        // SpiderMonkey context only for the synchronous production DOM call.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return None;
+        }
+
+        // Comment reflection requires this ephemeral SpiderMonkey context,
+        // but this exact DocumentMethods operation cannot enter V8 or trigger
+        // custom-element reactions.
+        let comment = self
+            .document
+            .root()
+            .CreateComment(cx, DOMString::from(data));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return None;
+        }
+        v8_node_interface_handle(comment.upcast::<Node>())
     }
 
     unsafe fn query_selector(

@@ -2852,6 +2852,9 @@ def _create_text_node_cpp_bodies(member: Member) -> tuple[Block, ...]:
     name = _rust_member_name(member.attribute)
     callback = _cpp_member_name(member.attribute)
     qualified_name = member.qualified_name
+    interface = member.expected_interface or "Text"
+    interface_snake = generate.snake_case(interface)
+    interface_kind = f"SERVO_V8_INTERFACE_{generate.upper_snake_case(interface)}"
     return (
         [
             f"void DocumentHostCall{callback}(",
@@ -2867,10 +2870,10 @@ def _create_text_node_cpp_bodies(member: Member) -> tuple[Block, ...]:
             "          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));",
             "  if (!realm || realm->runtime != state->runtime ||",
             "      !realm->runtime->element_host_installed ||",
-            "      realm->text_template.IsEmpty() ||",
-            "      realm->text_prototype.IsEmpty() ||",
+            f"      realm->{interface_snake}_template.IsEmpty() ||",
+            f"      realm->{interface_snake}_prototype.IsEmpty() ||",
             "      realm->character_data_prototype.IsEmpty()) {",
-            '    ThrowTypeError(isolate, "Text host is not installed in this realm");',
+            f'    ThrowTypeError(isolate, "{interface} host is not installed in this realm");',
             "    return;",
             "  }",
             "  if (info.Length() < 1) {",
@@ -2912,7 +2915,7 @@ def _create_text_node_cpp_bodies(member: Member) -> tuple[Block, ...]:
             f'    fail("{qualified_name} host callback failed");',
             "    return;",
             "  }",
-            "  if (value.kind != SERVO_V8_INTERFACE_TEXT ||",
+            f"  if (value.kind != {interface_kind} ||",
             "      !value.key || !value.native) {",
             f'    fail("invalid {qualified_name} interface result");',
             "    return;",
@@ -3205,6 +3208,19 @@ SHAPE_EMITTERS = {
         cpp_vtable_terms=_create_document_fragment_cpp_vtable_terms,
     ),
     production_webidl.CREATE_TEXT_NODE: ShapeEmitter(
+        header_type_blocks=(),
+        header_slots=_create_text_node_header_slots,
+        rust_type_blocks=(),
+        rust_trait_members=_create_text_node_rust_trait_members,
+        rust_vtable_fields=_create_text_node_rust_vtable_fields,
+        rust_thunk_blocks=(),
+        rust_thunks=_create_text_node_rust_thunks,
+        rust_vtable_init=_create_text_node_rust_vtable_init,
+        cpp_body_blocks=(),
+        cpp_bodies=_create_text_node_cpp_bodies,
+        cpp_vtable_terms=_create_text_node_cpp_vtable_terms,
+    ),
+    production_webidl.CREATE_COMMENT: ShapeEmitter(
         header_type_blocks=(),
         header_slots=_create_text_node_header_slots,
         rust_type_blocks=(),

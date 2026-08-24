@@ -283,6 +283,14 @@ intentionally limited to inherited Node state and mutations. Exposing
 CharacterData/Text-specific APIs would require separate proof of their exact
 Web IDL conversion, UTF-16 indexing, and mutation-observer semantics.
 
+ABI v44 adds Comment as a fourth dynamic Node kind. The Comment host is still
+the exact same concrete `Trusted<Node>` Rust type, and its allocation-plus-kind
+key keeps Comment wrappers distinct while allowing generic Node mutations to
+borrow Comment, Text, DocumentFragment, and Element inputs through one vtable.
+The V8 facade exposes Comment's inheritance chain down to Node but deliberately
+does not yet expose CharacterData-specific state or mutators; those require a
+separate conversion and mutation-observer proof before widening this ABI.
+
 ## The constraint this design depends on
 
 No object in the SpiderMonkey heap may ever hold a V8 handle, a cppgc pointer,
