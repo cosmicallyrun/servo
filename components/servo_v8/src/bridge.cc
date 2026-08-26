@@ -2047,6 +2047,46 @@ bool NodeHostCallbackState(
   return true;
 }
 
+bool IsCharacterDataInterfaceKind(uint8_t kind) {
+  return kind == SERVO_V8_INTERFACE_TEXT ||
+         kind == SERVO_V8_INTERFACE_COMMENT;
+}
+
+void* UnwrapCharacterDataHostNative(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Local<v8::Value> receiver = info.This();
+  if (!receiver->IsObject()) return nullptr;
+  auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(
+      info.GetIsolate(), receiver.As<v8::Object>());
+  return cell && IsCharacterDataInterfaceKind(static_cast<uint8_t>(cell->kind()))
+             ? cell->native()
+             : nullptr;
+}
+
+bool CharacterDataHostCallbackState(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ServoV8RealmState** realm_output,
+    void** native_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  auto* realm = static_cast<ServoV8RealmState*>(
+      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  void* native = UnwrapCharacterDataHostNative(info);
+  if (!realm || realm->tearing_down || !realm->runtime ||
+      realm->runtime->isolate != isolate || realm->context.IsEmpty() ||
+      realm->context.Get(isolate) != isolate->GetCurrentContext() || !native) {
+    ThrowTypeError(isolate, "invalid CharacterData host state");
+    return false;
+  }
+  if (realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "re-entrant CharacterData host callback");
+    return false;
+  }
+  *realm_output = realm;
+  *native_output = native;
+  return true;
+}
+
 bool UnwrapNodeHostArgument(
     const v8::FunctionCallbackInfo<v8::Value>& info,
     int index,
@@ -3532,6 +3572,102 @@ void NodeHostSetTextContent(
             static_cast<size_t>(utf8.length()));
 }
 
+void CharacterDataHostGetData(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!CharacterDataHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.get_data) {
+    ThrowTypeError(isolate, "CharacterData.data host callback is not installed");
+    return;
+  }
+  ServoV8OwnedUtf8 value{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded =
+        realm->runtime->element_host_vtable.get_data(native, &value) != 0;
+  }
+  DocumentHostOwnedUtf8Scope value_scope(realm->runtime, &value);
+  if (!succeeded) {
+    ThrowTypeError(isolate, "CharacterData.data host callback failed");
+    return;
+  }
+  if (!value.data || !value.owner || !value.drop_owner ||
+      value.length > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+      !IsValidUtf8(value.data, value.length)) {
+    ThrowTypeError(isolate, "invalid CharacterData.data UTF-8 result");
+    return;
+  }
+  v8::Local<v8::String> result;
+  if (!v8::String::NewFromUtf8(isolate,
+                               reinterpret_cast<const char*>(value.data),
+                               v8::NewStringType::kNormal,
+                               static_cast<int>(value.length))
+           .ToLocal(&result)) {
+    return;
+  }
+  info.GetReturnValue().Set(result);
+}
+
+void CharacterDataHostSetData(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // Brand-check before conversion.
+  if (!CharacterDataHostCallbackState(info, &realm, &native)) return;
+  if (!realm->document_host.active_host_context ||
+      !realm->runtime->element_host_vtable.set_data) {
+    ThrowTypeError(isolate, "CharacterData mutation requires a live host context");
+    return;
+  }
+
+  auto call_host = [&](const uint8_t* data, size_t length) {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.set_data(
+            native, realm->document_host.active_host_context, data, length)) {
+      ThrowTypeError(isolate, "CharacterData.data host callback failed");
+      return false;
+    }
+    return true;
+  };
+
+  if (info[0]->IsNull()) {
+    call_host(reinterpret_cast<const uint8_t*>(""), 0);
+    return;
+  }
+
+  v8::Local<v8::String> string;
+  if (!info[0]->ToString(isolate->GetCurrentContext()).ToLocal(&string)) return;
+  v8::String::Utf8Value utf8(isolate, string);
+  if (!*utf8 && utf8.length() != 0) return;
+  call_host(reinterpret_cast<const uint8_t*>(*utf8),
+            static_cast<size_t>(utf8.length()));
+}
+
+void CharacterDataHostGetLength(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!CharacterDataHostCallbackState(info, &realm, &native)) return;
+  if (!realm->runtime->element_host_vtable.get_length) {
+    ThrowTypeError(isolate, "CharacterData.length host callback is not installed");
+    return;
+  }
+  uint32_t result = 0;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    if (!realm->runtime->element_host_vtable.get_length(native, &result)) {
+      ThrowTypeError(isolate, "CharacterData.length host callback failed");
+      return;
+    }
+  }
+  info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, result));
+}
+
 bool InstallNodeListInterface(ServoV8RealmState* realm,
                               v8::Local<v8::Context> context,
                               v8::Local<v8::Object> global) {
@@ -3792,6 +3928,44 @@ bool InstallNodePrototype(ServoV8RealmState* realm,
       return false;
     }
   }
+  return true;
+}
+
+bool InstallCharacterDataPrototype(ServoV8RealmState* realm,
+                                   v8::Local<v8::Context> context,
+                                   v8::Local<v8::Object> prototype) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::Local<v8::Function> data_getter;
+  if (!v8::Function::New(context, CharacterDataHostGetData, {}, 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&data_getter)) {
+    return false;
+  }
+  data_getter->SetName(V8String(isolate, "get data"));
+
+  v8::Local<v8::Function> data_setter;
+  if (!v8::Function::New(context, CharacterDataHostSetData, {}, 1,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasSideEffect)
+           .ToLocal(&data_setter)) {
+    return false;
+  }
+  data_setter->SetName(V8String(isolate, "set data"));
+
+  v8::Local<v8::Function> length_getter;
+  if (!v8::Function::New(context, CharacterDataHostGetLength, {}, 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&length_getter)) {
+    return false;
+  }
+  length_getter->SetName(V8String(isolate, "get length"));
+
+  prototype->SetAccessorProperty(V8String(isolate, "data"), data_getter,
+                                 data_setter, v8::None);
+  prototype->SetAccessorProperty(V8String(isolate, "length"), length_getter,
+                                 v8::Local<v8::Function>(), v8::None);
   return true;
 }
 
@@ -4747,6 +4921,7 @@ extern "C" int32_t servo_v8_realm_create(
   if (!InstallNodeListInterface(realm.get(), context, global) ||
       !InstallHTMLCollectionInterface(realm.get(), context, global) ||
       !InstallNodePrototype(realm.get(), context, node_prototype) ||
+      !InstallCharacterDataPrototype(realm.get(), context, character_data_prototype) ||
       !InstallElementPrototype(realm.get(), context, element_prototype) ||
       !element_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
       !document_fragment_prototype->SetPrototype(context, node_prototype).FromMaybe(false) ||
@@ -5327,7 +5502,9 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->get_node_type || !vtable->get_node_name ||
       !vtable->get_is_connected || !vtable->get_text_content ||
       !vtable->set_text_content || !vtable->get_parent_element ||
-      !vtable->has_child_nodes || !vtable->insert_before ||
+      !vtable->has_child_nodes ||
+      !vtable->get_data || !vtable->set_data || !vtable->get_length ||
+      !vtable->insert_before ||
       !vtable->append_child || !vtable->replace_child ||
       !vtable->remove_child ||
       !vtable->get_children || !vtable->get_elements_by_tag_name ||

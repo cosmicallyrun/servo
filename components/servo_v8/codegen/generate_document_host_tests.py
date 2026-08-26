@@ -562,7 +562,11 @@ class DocumentHostGenerationTests(unittest.TestCase):
                 production_webidl,
                 "select_html_collection_interface",
                 wraps=production_webidl.select_html_collection_interface,
-            ) as html_collection_gate:
+            ) as html_collection_gate, mock.patch.object(
+                production_webidl,
+                "select_character_data_host_members",
+                wraps=production_webidl.select_character_data_host_members,
+            ) as character_data_gate:
                 with mock.patch.dict("os.environ", {}, clear=True):
                     generate_document_host.main(
                         [
@@ -576,6 +580,7 @@ class DocumentHostGenerationTests(unittest.TestCase):
             }
 
         html_collection_gate.assert_called_once()
+        character_data_gate.assert_called_once()
         self.assertEqual(written, self.outputs)
 
 

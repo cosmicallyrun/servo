@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 44;
+const ABI_VERSION: u32 = 45;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -488,6 +488,9 @@ pub unsafe trait ElementHostBinding: NodeHostBinding + Sized + 'static {
     unsafe fn set_text_content(&self, host_context: *mut c_void, value: Option<&str>) -> bool;
     fn parent_element(&self) -> Option<InterfaceHandle>;
     fn has_child_nodes(&self) -> bool;
+    fn data(&self) -> String;
+    unsafe fn set_data(&self, host_context: *mut c_void, value: &str) -> bool;
+    fn length(&self) -> u32;
     fn children(&self) -> HTMLCollectionHandle;
     fn get_elements_by_tag_name(&self, qualified_name: &str) -> HTMLCollectionHandle;
     fn get_elements_by_tag_name_ns(
@@ -685,6 +688,9 @@ pub struct ElementHostVTable {
         Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u8, *const u8, usize) -> u8>,
     pub get_parent_element: Option<unsafe extern "C" fn(*mut c_void, *mut RawInterfaceValue) -> u8>,
     pub has_child_nodes: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub get_data: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
+    pub set_data: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
+    pub get_length: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
     pub insert_before: Option<
         unsafe extern "C" fn(
             *mut c_void,
@@ -1061,6 +1067,7 @@ element_host_string_getter!(element_host_get_tag_name, tag_name);
 element_host_string_getter!(element_host_get_id, id);
 element_host_string_getter!(element_host_get_class_name, class_name);
 element_host_string_getter!(element_host_get_node_name, node_name);
+element_host_string_getter!(element_host_get_data, data);
 
 unsafe fn element_host_write_optional_owned_utf8(
     output: *mut OptionalOwnedUtf8,
@@ -1667,6 +1674,35 @@ unsafe extern "C" fn element_host_has_child_nodes<T: ElementHostBinding>(
     1
 }
 
+unsafe extern "C" fn element_host_set_data<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    unsafe { (&*native.cast::<T>()).set_data(host_context, value) as u8 }
+}
+
+unsafe extern "C" fn element_host_get_length<T: ElementHostBinding>(
+    native: *mut c_void,
+    output: *mut u32,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: Both pointers satisfy the vtable contract.
+    unsafe { *output = (&*native.cast::<T>()).length() };
+    1
+}
+
 unsafe fn element_host_write_node_mutation_outcome(
     output: *mut RawNodeMutationOutcome,
     result: NodeMutationResult,
@@ -2245,6 +2281,9 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         set_text_content: Some(element_host_set_text_content::<T>),
         get_parent_element: Some(element_host_get_parent_element::<T>),
         has_child_nodes: Some(element_host_has_child_nodes::<T>),
+        get_data: Some(element_host_get_data::<T>),
+        set_data: Some(element_host_set_data::<T>),
+        get_length: Some(element_host_get_length::<T>),
         insert_before: Some(element_host_insert_before::<T>),
         append_child: Some(element_host_append_child::<T>),
         replace_child: Some(element_host_replace_child::<T>),
@@ -3348,6 +3387,7 @@ mod tests {
     static OPTIONAL_STRING_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     static UTF8_SEQUENCE_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     static ATTRIBUTE_MUTATION_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static CHARACTER_DATA_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
         static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
@@ -4051,6 +4091,28 @@ mod tests {
 
         fn has_child_nodes(&self) -> bool {
             self.state.has_child_nodes.get()
+        }
+
+        fn data(&self) -> String {
+            if !matches!(self.tag_name.as_str(), "#text" | "#comment") {
+                return String::new();
+            }
+            self.state.text_content.borrow().clone().unwrap_or_default()
+        }
+
+        unsafe fn set_data(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            if !matches!(self.tag_name.as_str(), "#text" | "#comment")
+                || self.state.remove_fails.get()
+            {
+                return false;
+            }
+            *self.state.text_content.borrow_mut() = Some(value.to_owned());
+            true
+        }
+
+        fn length(&self) -> u32 {
+            self.data().encode_utf16().count().min(u32::MAX as usize) as u32
         }
 
         fn children(&self) -> HTMLCollectionHandle {
@@ -5667,6 +5729,70 @@ mod tests {
             owner: Box::into_raw(owner).cast(),
             drop_owner: Some(adversarial_optional_string_owner_drop),
         }
+    }
+
+    unsafe extern "C" fn adversarial_character_data_owner_drop(owner: *mut c_void) {
+        if owner.is_null() {
+            return;
+        }
+        // SAFETY: Each adversarial transfer owns exactly one Box<Vec<u8>> and
+        // the C++ owned-value scope must return it exactly once on all paths.
+        drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
+        CHARACTER_DATA_OWNER_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn adversarial_character_data_owned(bytes: Vec<u8>) -> OwnedUtf8 {
+        let owner = Box::new(bytes);
+        OwnedUtf8 {
+            data: owner.as_ptr(),
+            length: owner.len(),
+            owner: Box::into_raw(owner).cast(),
+            drop_owner: Some(adversarial_character_data_owner_drop),
+        }
+    }
+
+    unsafe extern "C" fn adversarial_character_data_get_data(
+        native: *mut c_void,
+        output: *mut OwnedUtf8,
+    ) -> u8 {
+        if native.is_null() || output.is_null() {
+            return 0;
+        }
+        // SAFETY: The custom vtable is installed for exactly this probe type.
+        let host = unsafe { &*native.cast::<ElementHostProbe>() };
+        let mode = host.data();
+        let succeeded = mode != "callback-failure-owned";
+        let value = match mode.as_str() {
+            "callback-failure-owned" => adversarial_character_data_owned(b"failure".to_vec()),
+            "missing-data-owned" => {
+                let mut value = adversarial_character_data_owned(b"missing".to_vec());
+                value.data = std::ptr::null();
+                value
+            },
+            "missing-owner" => OwnedUtf8 {
+                data: std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                length: 1,
+                owner: std::ptr::null_mut(),
+                drop_owner: None,
+            },
+            "owner-without-drop" => OwnedUtf8 {
+                data: std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                length: 1,
+                owner: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                drop_owner: None,
+            },
+            "invalid-utf8-owned" => adversarial_character_data_owned(vec![0xff]),
+            "oversized-owned" => {
+                let mut value = adversarial_character_data_owned(b"oversized".to_vec());
+                value.length = usize::MAX;
+                value
+            },
+            "valid-empty" => adversarial_character_data_owned(Vec::new()),
+            _ => adversarial_character_data_owned(mode.into_bytes()),
+        };
+        // SAFETY: output is non-null caller-owned writable storage.
+        unsafe { *output = value };
+        succeeded as u8
     }
 
     unsafe extern "C" fn adversarial_element_namespace_uri(
@@ -10258,6 +10384,306 @@ mod tests {
             6,
             "four wrappers plus two appendChild cache-hit hosts must drop exactly once"
         );
+    }
+
+    #[test]
+    fn character_data_data_and_length_preserve_webidl_conversion_and_brands() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const text = document.createTextNode('initial text');
+              const comment = document.createComment('initial comment');
+              const fragment = document.createDocumentFragment();
+              const element = document.createElement('span');
+              const textPrototype = Object.getPrototypeOf(text);
+              const commentPrototype = Object.getPrototypeOf(comment);
+              const characterDataPrototype = Object.getPrototypeOf(textPrototype);
+              const dataDescriptor = Object.getOwnPropertyDescriptor(
+                characterDataPrototype, 'data');
+              const lengthDescriptor = Object.getOwnPropertyDescriptor(
+                characterDataPrototype, 'length');
+
+              let wrongBrandConversions = 0;
+              const wrongReceivers = [{}, element, fragment];
+              const getterBrands = wrongReceivers.every(receiver => {
+                try { dataDescriptor.get.call(receiver); return false; }
+                catch (error) { return error instanceof TypeError; }
+              });
+              const lengthBrands = wrongReceivers.every(receiver => {
+                try { lengthDescriptor.get.call(receiver); return false; }
+                catch (error) { return error instanceof TypeError; }
+              });
+              const setterBrands = wrongReceivers.every(receiver => {
+                try {
+                  dataDescriptor.set.call(receiver, { toString() {
+                    wrongBrandConversions++; return 'wrong';
+                  }});
+                  return false;
+                } catch (error) { return error instanceof TypeError; }
+              });
+
+              let conversions = 0;
+              comment.data = { toString() { conversions++; return 'converted'; } };
+              const converted = comment.data === 'converted' && conversions === 1;
+              const thrown = new Error('character data conversion');
+              let preservesThrown = false;
+              try { comment.data = { toString() { throw thrown; } }; }
+              catch (error) { preservesThrown = error === thrown; }
+              let rejectsSymbol = false;
+              try { comment.data = Symbol('data'); }
+              catch (error) { rejectsSymbol = error instanceof TypeError; }
+              const unchangedAfterFailures = comment.data === 'converted';
+              comment.data = null;
+              const nullBecameEmpty = comment.data === '' && comment.length === 0;
+              comment.data = undefined;
+              const undefinedStringified = comment.data === 'undefined';
+              text.data = 'A😀';
+              const utf16Length = text.length === 3;
+              text.data = 'Hello';
+              comment.data = 'note';
+
+              globalThis.characterDataForNoContext = comment;
+              globalThis.characterDataDiagnostics = {
+                descriptors: !!dataDescriptor && !!lengthDescriptor &&
+                  dataDescriptor.get.name === 'get data' &&
+                  dataDescriptor.get.length === 0 &&
+                  dataDescriptor.set.name === 'set data' &&
+                  dataDescriptor.set.length === 1 &&
+                  dataDescriptor.enumerable && dataDescriptor.configurable &&
+                  lengthDescriptor.get.name === 'get length' &&
+                  lengthDescriptor.get.length === 0 &&
+                  lengthDescriptor.set === undefined &&
+                  lengthDescriptor.enumerable && lengthDescriptor.configurable,
+                sharedPrototype: Object.getPrototypeOf(commentPrototype) ===
+                  characterDataPrototype &&
+                  Object.getPrototypeOf(characterDataPrototype) ===
+                    Object.getPrototypeOf(Object.getPrototypeOf(element)),
+                noOwnProperties: !Object.hasOwn(text, 'data') &&
+                  !Object.hasOwn(text, 'length') && !Object.hasOwn(comment, 'data') &&
+                  !Object.hasOwn(comment, 'length'),
+                noFakeGlobal: typeof CharacterData === 'undefined',
+                getterBrands, lengthBrands, setterBrands,
+                brandBeforeConversion: wrongBrandConversions === 0,
+                converted, preservesThrown, rejectsSymbol, unchangedAfterFailures,
+                nullBecameEmpty, undefinedStringified, utf16Length,
+                finalValues: text.data === 'Hello' && text.length === 5 &&
+                  comment.data === 'note' && comment.length === 4,
+              };
+            })();"#,
+            "character-data-scalars.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: the non-null token remains live for the synchronous run.
+        let outcome = unsafe {
+            runtime.run_script_in_realm_with_host_context(
+                realm,
+                script,
+                (&mut host_context as *mut u8).cast(),
+            )
+        }
+        .unwrap();
+        assert_eq!(outcome, ScriptRunOutcome::Completed);
+        for check in [
+            "descriptors",
+            "sharedPrototype",
+            "noOwnProperties",
+            "noFakeGlobal",
+            "getterBrands",
+            "lengthBrands",
+            "setterBrands",
+            "brandBeforeConversion",
+            "converted",
+            "preservesThrown",
+            "rejectsSymbol",
+            "unchangedAfterFailures",
+            "nullBecameEmpty",
+            "undefinedStringified",
+            "utf16Length",
+            "finalValues",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(realm, &format!("characterDataDiagnostics.{check}"))
+                    .unwrap(),
+                "CharacterData bridge check failed: {check}"
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { let converted = false; try { characterDataForNoContext.data = \
+                       { toString() { converted = true; return 'x'; } }; } \
+                     catch (error) { return error instanceof TypeError && !converted && \
+                       characterDataForNoContext.data === 'note' && \
+                       characterDataForNoContext.length === 4; } return false; })()",
+                )
+                .unwrap(),
+            "CharacterData mutation without a live host context must fail closed"
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(node_drops.get(), 4);
+    }
+
+    #[test]
+    fn character_data_rejects_malformed_owned_results_and_drops_owners() {
+        CHARACTER_DATA_OWNER_DROPS.store(0, Ordering::SeqCst);
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let mut vtable = element_host_vtable::<ElementHostProbe>();
+        vtable.get_data = Some(adversarial_character_data_get_data);
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: the complete table uses the one installed probe host type.
+        assert_eq!(
+            unsafe { servo_v8_install_element_host(runtime.raw.as_ptr(), &vtable, &mut error) },
+            1,
+            "custom CharacterData vtable install failed: {:?}",
+            error_from(&storage, &error),
+        );
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const rejected = [
+                'callback-failure-owned', 'missing-data-owned', 'missing-owner',
+                'owner-without-drop', 'invalid-utf8-owned', 'oversized-owned',
+              ].every(mode => {
+                const value = document.createComment(mode);
+                try { value.data; return false; }
+                catch (error) { return error instanceof TypeError; }
+              });
+              const empty = document.createComment('valid-empty');
+              globalThis.characterDataMalformedProof =
+                rejected && empty.data === '' && empty.length === 11;
+            })();"#,
+            "character-data-malformed.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: the token stays live for all synchronous creation callbacks.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "characterDataMalformedProof")
+                .unwrap()
+        );
+        assert_eq!(CHARACTER_DATA_OWNER_DROPS.load(Ordering::SeqCst), 5);
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(node_drops.get(), 7);
+    }
+
+    #[test]
+    fn character_data_thunks_validate_abi_inputs() {
+        let drops = Rc::new(Cell::new(0));
+        let identity = Rc::new(0_u8);
+        let state = ElementProbeState::with_node(&[], "A😀", false);
+        state.is_connected.set(false);
+        let host = ElementHostProbe {
+            local_name: "#text".to_owned(),
+            tag_name: "#text".to_owned(),
+            identity: Rc::as_ptr(&identity).cast(),
+            state: Rc::clone(&state),
+            _owned_identity: Some(identity),
+            parent_children: None,
+            parent_state: None,
+            parent_element: None,
+            drops: Rc::clone(&drops),
+            drop_reentry: None,
+        };
+        let native = Box::into_raw(Box::new(host)).cast::<c_void>();
+        let vtable = element_host_vtable::<ElementHostProbe>();
+        let get_data = vtable.get_data.unwrap();
+        let set_data = vtable.set_data.unwrap();
+        let get_length = vtable.get_length.unwrap();
+        let mut owned = raw_empty_owned_utf8();
+        let mut length = 0;
+        let mut host_context = 0_u8;
+        let host_context = (&mut host_context as *mut u8).cast::<c_void>();
+        let invalid_utf8 = [0xff];
+        unsafe {
+            assert_eq!(get_data(std::ptr::null_mut(), &mut owned), 0);
+            assert_eq!(get_data(native, std::ptr::null_mut()), 0);
+            assert_eq!(get_data(native, &mut owned), 1);
+            assert_eq!(
+                std::str::from_utf8(std::slice::from_raw_parts(owned.data, owned.length)).unwrap(),
+                "A😀"
+            );
+            owned.drop_owner.unwrap()(owned.owner);
+            assert_eq!(get_length(std::ptr::null_mut(), &mut length), 0);
+            assert_eq!(get_length(native, std::ptr::null_mut()), 0);
+            assert_eq!(get_length(native, &mut length), 1);
+            assert_eq!(length, 3);
+            assert_eq!(
+                set_data(std::ptr::null_mut(), host_context, std::ptr::null(), 0),
+                0
+            );
+            assert_eq!(
+                set_data(native, std::ptr::null_mut(), std::ptr::null(), 0),
+                0
+            );
+            assert_eq!(set_data(native, host_context, std::ptr::null(), 1), 0);
+            assert_eq!(
+                set_data(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                ),
+                0
+            );
+            assert_eq!(set_data(native, host_context, std::ptr::null(), 0), 1);
+            assert_eq!(get_length(native, &mut length), 1);
+            assert_eq!(length, 0);
+            state.remove_fails.set(true);
+            assert_eq!(set_data(native, host_context, b"x".as_ptr(), 1), 0);
+            vtable.drop.unwrap()(native);
+        }
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]

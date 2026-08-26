@@ -539,6 +539,34 @@ class ProductionHTMLCollectionTests(unittest.TestCase):
                 self.assertEqual(set(member._extendedAttrDict), {"Pure"})
 
 
+class ProductionCharacterDataTests(unittest.TestCase):
+    def test_pins_the_real_character_data_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_character_data_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            list(members), list(production_webidl.CHARACTER_DATA_HOST)
+        )
+        data = members[production_webidl.CHARACTER_DATA_DATA]
+        self.assertFalse(data.readonly)
+        self.assertEqual(data.type.prettyName(), "DOMString")
+        self.assertFalse(data.type.nullable())
+        self.assertEqual(set(data._extendedAttrDict), {"Pure"})
+        self.assertEqual(
+            set(data.type._extendedAttrDict), {"LegacyNullToEmptyString"}
+        )
+
+        length = members[production_webidl.CHARACTER_DATA_LENGTH]
+        self.assertTrue(length.readonly)
+        self.assertEqual(length.type.prettyName(), "unsigned long")
+        self.assertFalse(length.type.nullable())
+        self.assertEqual(set(length._extendedAttrDict), {"Pure"})
+        self.assertEqual(set(length.type._extendedAttrDict), set())
+
+
 class ProductionNodeTests(unittest.TestCase):
     def test_pins_the_real_scalar_node_slice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -989,6 +1017,104 @@ class SyntheticSelectionTests(unittest.TestCase):
             "`HTMLCollection.namedItem` must return nullable `Element`, "
             "got `Element`",
             named_item="[Pure] getter Element namedItem(DOMString name);",
+        )
+
+    def character_data_source(
+        self,
+        *,
+        interface_attributes: str = "[Exposed=Window, Abstract]",
+        parent: str = " : Node",
+        constructor: str = "",
+        data: str = "[Pure] attribute [LegacyNullToEmptyString] DOMString data;",
+        length: str = "[Pure] readonly attribute unsigned long length;",
+        extra: str = "",
+    ) -> str:
+        return f"""
+            [Global=Window, Exposed=Window] interface Window {{}};
+            [Exposed=Window] interface Node {{}};
+            {interface_attributes}
+            interface CharacterData{parent} {{
+                {constructor}
+                {data}
+                {length}
+                {extra}
+            }};
+        """
+
+    def assert_character_data_rejected(
+        self, expected: str, **changes: str
+    ) -> None:
+        parser_results = self.parse(
+            {
+                "CharacterData.webidl": self.character_data_source(**changes),
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_character_data_interface(parser_results)
+
+    def test_rejects_character_data_interface_attribute_drift(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData` must carry exactly ['Abstract', 'Exposed'], got ['Exposed']",
+            interface_attributes="[Exposed=Window]",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData` must carry exactly `[Exposed=Window]`",
+            interface_attributes="[Exposed=*, Abstract]",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData` must inherit from `Node`",
+            parent="",
+        )
+
+    def test_rejects_constructible_character_data(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData` must not be constructible",
+            constructor="constructor();",
+        )
+
+    def test_rejects_missing_character_data_member(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData` must declare both `data` and `length` attributes",
+            data="",
+        )
+
+    def test_rejects_character_data_data_drift(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData.data` must carry exactly ['Pure'], got []",
+            data="attribute [LegacyNullToEmptyString] DOMString data;",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.data` must be writable",
+            data="[Pure] readonly attribute DOMString data;",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.data` type must carry exactly ['LegacyNullToEmptyString'], got []",
+            data="[Pure] attribute DOMString data;",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.data` must use non-nullable `DOMString`, got `DOMString?`",
+            data="[Pure] attribute DOMString? data;",
+        )
+
+    def test_rejects_character_data_length_drift(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData.length` must carry exactly ['Pure'], got []",
+            length="readonly attribute unsigned long length;",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.length` must carry exactly ['Pure'], got ['Pure', 'Throws']",
+            length="[Pure, Throws] readonly attribute unsigned long length;",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.length` must be readonly",
+            length="[Pure] attribute unsigned long length;",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.length` must use non-nullable `unsigned long`, got `unsigned short`",
+            length="[Pure] readonly attribute unsigned short length;",
         )
 
     def test_selects_attribute_from_partial_interface(self) -> None:

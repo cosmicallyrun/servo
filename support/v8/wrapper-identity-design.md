@@ -291,6 +291,18 @@ The V8 facade exposes Comment's inheritance chain down to Node but deliberately
 does not yet expose CharacterData-specific state or mutators; those require a
 separate conversion and mutation-observer proof before widening this ABI.
 
+ABI v45 exposes the first CharacterData-specific state without adding a new
+host representation or cache edge. Text- and Comment-kind wrappers share one
+CharacterData prototype whose `data` getter/setter and `length` getter dispatch
+through the existing generic `Trusted<Node>` host only after both C++ and Rust
+validate the dynamic kind. The setter completes Web IDL string conversion in
+V8 before borrowing Servo's live SpiderMonkey context for the exact synchronous
+`CharacterDataMethods::SetData` call; it cannot retain a V8 value, enter V8, or
+pump reactions. The getter transfers owned UTF-8 across the ABI and releases
+that owner on success, callback failure, and malformed-result paths. No new
+Servo-to-V8 reference is introduced, so wrapper identity and teardown remain
+governed by the same per-realm allocation-plus-kind cache.
+
 ## The constraint this design depends on
 
 No object in the SpiderMonkey heap may ever hold a V8 handle, a cppgc pointer,

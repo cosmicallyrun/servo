@@ -127,6 +127,8 @@ use crate::devtools::DevtoolsState;
 use crate::document_collection::DocumentCollection;
 use crate::document_loader::DocumentLoader;
 #[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
+#[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::ElementCreationOptions;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState,
@@ -154,6 +156,8 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::characterdata::CharacterData;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::characterdata::comment::Comment;
 #[cfg(feature = "v8-shadow")]
@@ -282,6 +286,18 @@ impl V8NodeHost {
         (self.kind == V8NodeInterfaceKind::Element)
             .then(|| DomRoot::downcast::<Element>(self.node.root()))
             .flatten()
+    }
+
+    /// CharacterData callbacks are installed only on the shared prototype of
+    /// Text and Comment. Keep the Rust downcast checked as a second guard
+    /// behind C++'s dynamic host-kind brand check.
+    fn character_data(&self) -> Option<DomRoot<CharacterData>> {
+        matches!(
+            self.kind,
+            V8NodeInterfaceKind::Text | V8NodeInterfaceKind::Comment
+        )
+        .then(|| DomRoot::downcast::<CharacterData>(self.node.root()))
+        .flatten()
     }
 }
 
@@ -973,6 +989,38 @@ unsafe impl servo_v8::ElementHostBinding for V8NodeHost {
 
     fn has_child_nodes(&self) -> bool {
         self.node.root().HasChildNodes()
+    }
+
+    fn data(&self) -> String {
+        self.character_data()
+            .map(|data| data.Data().into())
+            .unwrap_or_default()
+    }
+
+    unsafe fn set_data(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative V8 entry lends this live owner-thread
+        // SpiderMonkey context only for the synchronous production mutation.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return false;
+        }
+        let Some(data) = self.character_data() else {
+            return false;
+        };
+        data.SetData(cx, DOMString::from(value));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return false;
+        }
+        true
+    }
+
+    fn length(&self) -> u32 {
+        self.character_data().map(|data| data.Length()).unwrap_or(0)
     }
 
     unsafe fn remove(&self, host_context: *mut c_void) -> bool {

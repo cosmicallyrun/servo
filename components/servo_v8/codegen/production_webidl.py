@@ -112,6 +112,10 @@ HTML_COLLECTION_INTERFACE = "HTMLCollection"
 HTML_COLLECTION_LENGTH = "HTMLCollection.length"
 HTML_COLLECTION_ITEM = "HTMLCollection.item"
 HTML_COLLECTION_NAMED_ITEM = "HTMLCollection.namedItem"
+CHARACTER_DATA_INTERFACE = "CharacterData"
+CHARACTER_DATA_DATA = "CharacterData.data"
+CHARACTER_DATA_LENGTH = "CharacterData.length"
+CHARACTER_DATA_HOST = (CHARACTER_DATA_DATA, CHARACTER_DATA_LENGTH)
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -2832,6 +2836,111 @@ def select_html_collection_interface(
 
     parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
     return _select_html_collection_interface(parser_results)
+
+
+def _select_character_data_interface(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+) -> dict[str, WebIDL.IDLAttribute]:
+    """Pin the production CharacterData interface and its two selected attributes."""
+
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == CHARACTER_DATA_INTERFACE
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{CHARACTER_DATA_INTERFACE}`, "
+            f"found {len(interfaces)}"
+        )
+    interface = interfaces[0]
+
+    expected_interface_attributes = {"Exposed", "Abstract"}
+    actual_interface_attributes = set(interface._extendedAttrDict)
+    if actual_interface_attributes != expected_interface_attributes:
+        raise WebIDLSelectionError(
+            f"`CharacterData` must carry exactly "
+            f"{sorted(expected_interface_attributes)}, "
+            f"got {sorted(actual_interface_attributes)}"
+        )
+    if interface.getExtendedAttribute("Exposed") != ["Window"]:
+        raise WebIDLSelectionError("`CharacterData` must carry exactly `[Exposed=Window]`")
+    if interface.getExtendedAttribute("Abstract") is not True:
+        raise WebIDLSelectionError("`CharacterData` must carry `[Abstract]`")
+    if interface.isCallback():
+        raise WebIDLSelectionError("`CharacterData` must be an ordinary interface")
+    if interface.parent is None or interface.parent.identifier.name != "Node":
+        raise WebIDLSelectionError("`CharacterData` must inherit from `Node`")
+    if interface.ctor() is not None or interface.legacyFactoryFunctions:
+        raise WebIDLSelectionError("`CharacterData` must not be constructible")
+
+    members_by_name = {
+        member.identifier.name: member
+        for member in interface.members
+        if member.identifier.name in ("data", "length")
+    }
+    if set(members_by_name) != {"data", "length"}:
+        raise WebIDLSelectionError(
+            "`CharacterData` must declare both `data` and `length` attributes"
+        )
+
+    data = members_by_name["data"]
+    if not data.isAttr() or data.isStatic():
+        raise WebIDLSelectionError(f"`{CHARACTER_DATA_DATA}` must be an instance attribute")
+    if set(data._extendedAttrDict) != {"Pure"}:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_DATA}` must carry exactly ['Pure'], "
+            f"got {sorted(data._extendedAttrDict)}"
+        )
+    if data.readonly:
+        raise WebIDLSelectionError(f"`{CHARACTER_DATA_DATA}` must be writable")
+    if data.type.nullable() or not data.type.isDOMString():
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_DATA}` must use non-nullable `DOMString`, "
+            f"got `{data.type.prettyName()}`"
+        )
+    if set(data.type._extendedAttrDict) != {"LegacyNullToEmptyString"}:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_DATA}` type must carry exactly ['LegacyNullToEmptyString'], "
+            f"got {sorted(data.type._extendedAttrDict)}"
+        )
+
+    length = members_by_name["length"]
+    if not length.isAttr() or length.isStatic():
+        raise WebIDLSelectionError(f"`{CHARACTER_DATA_LENGTH}` must be an instance attribute")
+    if set(length._extendedAttrDict) != {"Pure"}:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_LENGTH}` must carry exactly ['Pure'], "
+            f"got {sorted(length._extendedAttrDict)}"
+        )
+    if not length.readonly:
+        raise WebIDLSelectionError(f"`{CHARACTER_DATA_LENGTH}` must be readonly")
+    if length.type.nullable() or length.type.tag() != WebIDL.IDLType.Tags.uint32:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_LENGTH}` must use non-nullable `unsigned long`, "
+            f"got `{length.type.prettyName()}`"
+        )
+    if length.type._extendedAttrDict:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_LENGTH}` type carries extended attributes that are not implemented: "
+            + ", ".join(sorted(length.type._extendedAttrDict))
+        )
+
+    return {
+        CHARACTER_DATA_DATA: data,
+        CHARACTER_DATA_LENGTH: length,
+    }
+
+
+def select_character_data_host_members(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> dict[str, WebIDL.IDLAttribute]:
+    """Load the production corpus and pin the supported CharacterData slice."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return _select_character_data_interface(parser_results)
 
 
 def _split_qualified_name(qualified_name: str) -> tuple[str, str]:

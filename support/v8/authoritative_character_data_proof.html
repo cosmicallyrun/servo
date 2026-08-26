@@ -1,0 +1,169 @@
+<!doctype html>
+<!--
+Browser proof for ABI v45's CharacterData.data and CharacterData.length.
+V8 validates the shared CharacterData prototype, exact Web IDL conversion and
+brand ordering, UTF-16 length, and live Comment/Text mutation. SpiderMonkey
+then independently observes the final production Servo tree.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative CharacterData proof</title>
+    <style>
+      body { color: #101010; font: 48px/1.2 sans-serif; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const comment = document.createComment("initial-comment");
+      const text = document.createTextNode("initial-text");
+      const fragment = document.createDocumentFragment();
+      const target = document.getElementById("visible-target");
+      const element = document.createElement("div");
+
+      const textPrototype = Object.getPrototypeOf(text);
+      const commentPrototype = Object.getPrototypeOf(comment);
+      const textCharacterDataPrototype = Object.getPrototypeOf(textPrototype);
+      const commentCharacterDataPrototype = Object.getPrototypeOf(commentPrototype);
+      const nodePrototype = Object.getPrototypeOf(textCharacterDataPrototype);
+      const dataDescriptor = Object.getOwnPropertyDescriptor(
+        textCharacterDataPrototype, "data",
+      );
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(
+        textCharacterDataPrototype, "length",
+      );
+
+      if (
+        textCharacterDataPrototype !== commentCharacterDataPrototype ||
+        Object.getPrototypeOf(commentCharacterDataPrototype) !== nodePrototype ||
+        Object.getPrototypeOf(Object.getPrototypeOf(target)) !== nodePrototype ||
+        textPrototype[Symbol.toStringTag] !== "Text" ||
+        commentPrototype[Symbol.toStringTag] !== "Comment" ||
+        textCharacterDataPrototype[Symbol.toStringTag] !== "CharacterData" ||
+        typeof Text !== "undefined" || typeof Comment !== "undefined" ||
+        typeof CharacterData !== "undefined" ||
+        Object.hasOwn(text, "data") || Object.hasOwn(text, "length") ||
+        Object.hasOwn(comment, "data") || Object.hasOwn(comment, "length")
+      ) {
+        throw new Error("CharacterData prototype chain or realm surface is wrong");
+      }
+      if (
+        !dataDescriptor || typeof dataDescriptor.get !== "function" ||
+        dataDescriptor.get.name !== "get data" || dataDescriptor.get.length !== 0 ||
+        typeof dataDescriptor.set !== "function" ||
+        dataDescriptor.set.name !== "set data" || dataDescriptor.set.length !== 1 ||
+        !dataDescriptor.enumerable || !dataDescriptor.configurable ||
+        !lengthDescriptor || typeof lengthDescriptor.get !== "function" ||
+        lengthDescriptor.get.name !== "get length" ||
+        lengthDescriptor.get.length !== 0 || lengthDescriptor.set !== undefined ||
+        !lengthDescriptor.enumerable || !lengthDescriptor.configurable
+      ) {
+        throw new Error("CharacterData accessor descriptors are wrong");
+      }
+
+      const wrongBrands = [{}, element, fragment];
+      for (const receiver of wrongBrands) {
+        let conversionTouched = false;
+        let setterRejected = false;
+        try {
+          dataDescriptor.set.call(receiver, {
+            toString() {
+              conversionTouched = true;
+              return "wrong";
+            },
+          });
+        } catch (error) {
+          setterRejected = error instanceof TypeError;
+        }
+        let dataGetterRejected = false;
+        try { dataDescriptor.get.call(receiver); } catch (error) {
+          dataGetterRejected = error instanceof TypeError;
+        }
+        let lengthGetterRejected = false;
+        try { lengthDescriptor.get.call(receiver); } catch (error) {
+          lengthGetterRejected = error instanceof TypeError;
+        }
+        if (
+          !setterRejected || conversionTouched ||
+          !dataGetterRejected || !lengthGetterRejected
+        ) {
+          throw new Error("CharacterData receiver brand ordering is wrong");
+        }
+      }
+
+      let conversions = 0;
+      const setterResult = dataDescriptor.set.call(text, {
+        toString() {
+          conversions++;
+          return "converted";
+        },
+      });
+      if (setterResult !== undefined || conversions !== 1 || text.data !== "converted") {
+        throw new Error("CharacterData.data did not convert exactly once");
+      }
+
+      const sentinel = new Error("CharacterData conversion sentinel");
+      let preservedSentinel = false;
+      try {
+        text.data = { toString() { throw sentinel; } };
+      } catch (error) {
+        preservedSentinel = error === sentinel;
+      }
+      let rejectedSymbol = false;
+      try { text.data = Symbol("data"); } catch (error) {
+        rejectedSymbol = error instanceof TypeError;
+      }
+      if (!preservedSentinel || !rejectedSymbol || text.data !== "converted") {
+        throw new Error("CharacterData.data conversion errors are wrong");
+      }
+
+      text.data = null;
+      if (text.data !== "" || text.length !== 0) {
+        throw new Error("LegacyNullToEmptyString conversion is wrong");
+      }
+      text.data = undefined;
+      if (text.data !== "undefined" || text.length !== 9) {
+        throw new Error("undefined DOMString conversion is wrong");
+      }
+      text.data = "A😀";
+      if (text.data !== "A😀" || text.length !== 3) {
+        throw new Error("CharacterData.length is not a UTF-16 code-unit count");
+      }
+
+      comment.data = "v45-comment";
+      text.data = "Hello";
+      if (
+        comment.data !== "v45-comment" || comment.length !== 11 ||
+        text.data !== "Hello" || text.length !== 5 ||
+        nodePrototype.appendChild.call(fragment, comment) !== comment ||
+        fragment.appendChild(text) !== text ||
+        target.appendChild(fragment) !== fragment || fragment.hasChildNodes() ||
+        comment.parentElement !== target || text.parentElement !== target ||
+        !comment.isConnected || !text.isConnected || target.textContent !== "Hello"
+      ) {
+        throw new Error("CharacterData mutation or generic Node identity failed");
+      }
+
+      document.documentElement.id = "v45-character-data-pass";
+    </script>
+    <script>
+      // SpiderMonkey independently verifies the V8 mutations in Servo's DOM.
+      const target = document.getElementById("visible-target");
+      if (
+        document.documentElement.id === "v45-character-data-pass" && target &&
+        target.childNodes.length === 2 &&
+        target.childNodes[0].nodeType === 8 &&
+        target.childNodes[0].data === "v45-comment" &&
+        target.childNodes[0].nodeValue === "v45-comment" &&
+        target.childNodes[1].nodeType === 3 &&
+        target.childNodes[1].data === "Hello" &&
+        target.childNodes[1].nodeValue === "Hello" &&
+        target.textContent === "Hello"
+      ) {
+        document.bgColor = "lime";
+        console.log("RESULT characterData v45 PASS text=Hello");
+      }
+    </script>
+  </body>
+</html>
