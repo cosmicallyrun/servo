@@ -1,0 +1,139 @@
+<!doctype html>
+<!--
+Browser proof for ABI v47's CharacterData.appendData(). V8 validates the
+production operation descriptor, receiver/argument ordering, DOMString
+conversion, and live mutation. SpiderMonkey then observes the final Comment
+and Text nodes in Servo's one production DOM tree.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative CharacterData append proof</title>
+    <style>
+      body { color: #101010; font: 48px/1.2 sans-serif; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const text = document.createTextNode("A😀");
+      const comment = document.createComment("v47-");
+      const element = document.createElement("div");
+      const fragment = document.createDocumentFragment();
+      const target = document.getElementById("visible-target");
+      const textPrototype = Object.getPrototypeOf(text);
+      const commentPrototype = Object.getPrototypeOf(comment);
+      const characterDataPrototype = Object.getPrototypeOf(textPrototype);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        characterDataPrototype, "appendData",
+      );
+      const method = descriptor && descriptor.value;
+
+      if (
+        Object.getPrototypeOf(commentPrototype) !== characterDataPrototype ||
+        Object.hasOwn(text, "appendData") || Object.hasOwn(comment, "appendData") ||
+        !descriptor || typeof method !== "function" ||
+        method.name !== "appendData" || method.length !== 1 ||
+        !descriptor.writable || !descriptor.enumerable || !descriptor.configurable ||
+        typeof CharacterData !== "undefined" || typeof Text !== "undefined" ||
+        typeof Comment !== "undefined"
+      ) {
+        throw new Error("CharacterData.appendData surface is wrong");
+      }
+
+      for (const receiver of [{}, element, fragment]) {
+        let conversionTouched = false;
+        let rejected = false;
+        try {
+          method.call(receiver, {
+            toString() {
+              conversionTouched = true;
+              return "wrong-brand";
+            },
+          });
+        } catch (error) {
+          rejected = error instanceof TypeError;
+        }
+        if (!rejected || conversionTouched) {
+          throw new Error("appendData did not brand-check before conversion");
+        }
+      }
+
+      let missing = false;
+      try { method.call(text); } catch (error) {
+        missing = error instanceof TypeError;
+      }
+      if (!missing || text.data !== "A😀") {
+        throw new Error("appendData required-argument handling is wrong");
+      }
+
+      let conversions = 0;
+      const returned = method.call(text, {
+        toString() {
+          conversions += 1;
+          return "B";
+        },
+      }, "ignored");
+      if (
+        returned !== undefined || conversions !== 1 ||
+        text.data !== "A😀B" || text.length !== 4
+      ) {
+        throw new Error("appendData conversion or mutation is wrong");
+      }
+
+      const sentinel = new Error("appendData conversion sentinel");
+      let preservesSentinel = false;
+      try {
+        method.call(text, { toString() { throw sentinel; } });
+      } catch (error) {
+        preservesSentinel = error === sentinel;
+      }
+      let symbolRejected = false;
+      try { text.appendData(Symbol("data")); } catch (error) {
+        symbolRejected = error instanceof TypeError;
+      }
+      if (!preservesSentinel || !symbolRejected || text.data !== "A😀B") {
+        throw new Error("appendData conversion failure propagation is wrong");
+      }
+
+      comment.appendData(null);
+      comment.appendData(undefined);
+      if (comment.data !== "v47-nullundefined") {
+        throw new Error("appendData did not use ordinary DOMString conversion");
+      }
+
+      comment.data = "v47-comment";
+      text.data = "Hell";
+      if (text.appendData("o") !== undefined || text.data !== "Hello") {
+        throw new Error("appendData final mutation is wrong");
+      }
+      if (
+        fragment.appendChild(comment) !== comment ||
+        fragment.appendChild(text) !== text ||
+        target.appendChild(fragment) !== fragment || fragment.hasChildNodes() ||
+        comment.parentElement !== target || text.parentElement !== target ||
+        !comment.isConnected || !text.isConnected || target.textContent !== "Hello"
+      ) {
+        throw new Error("appendData proof lost generic Node identity");
+      }
+      document.documentElement.id = "v47-character-data-append-pass";
+    </script>
+    <script>
+      // SpiderMonkey independently sees the V8-tested and mutated Servo tree.
+      const target = document.getElementById("visible-target");
+      if (
+        document.documentElement.id === "v47-character-data-append-pass" &&
+        target && target.childNodes.length === 2 &&
+        target.childNodes[0].nodeType === 8 &&
+        target.childNodes[0].data === "v47-comment" &&
+        target.childNodes[0].nodeValue === "v47-comment" &&
+        target.childNodes[1].nodeType === 3 &&
+        target.childNodes[1].data === "Hello" &&
+        target.childNodes[1].nodeValue === "Hello" && target.textContent === "Hello"
+      ) {
+        document.bgColor = "lime";
+        console.log("RESULT characterData append v47 PASS text=Hello");
+      }
+    </script>
+  </body>
+</html>

@@ -116,10 +116,12 @@ CHARACTER_DATA_INTERFACE = "CharacterData"
 CHARACTER_DATA_DATA = "CharacterData.data"
 CHARACTER_DATA_LENGTH = "CharacterData.length"
 CHARACTER_DATA_SUBSTRING_DATA = "CharacterData.substringData"
+CHARACTER_DATA_APPEND_DATA = "CharacterData.appendData"
 CHARACTER_DATA_HOST = (
     CHARACTER_DATA_DATA,
     CHARACTER_DATA_LENGTH,
     CHARACTER_DATA_SUBSTRING_DATA,
+    CHARACTER_DATA_APPEND_DATA,
 )
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
@@ -2882,11 +2884,11 @@ def _select_character_data_interface(
     members_by_name = {
         member.identifier.name: member
         for member in interface.members
-        if member.identifier.name in ("data", "length", "substringData")
+        if member.identifier.name in ("data", "length", "substringData", "appendData")
     }
-    if set(members_by_name) != {"data", "length", "substringData"}:
+    if set(members_by_name) != {"data", "length", "substringData", "appendData"}:
         raise WebIDLSelectionError(
-            "`CharacterData` must declare `data`, `length`, and `substringData`"
+            "`CharacterData` must declare `data`, `length`, `substringData`, and `appendData`"
         )
 
     data = members_by_name["data"]
@@ -2991,10 +2993,66 @@ def _select_character_data_interface(
                 + ", ".join(sorted(argument_attributes))
             )
 
+    append_data = members_by_name["appendData"]
+    if not append_data.isMethod() or append_data.isStatic() or append_data.isSpecial():
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` must be an ordinary instance operation"
+        )
+    if append_data._extendedAttrDict:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` carries extended attributes that are not "
+            "implemented: " + ", ".join(sorted(append_data._extendedAttrDict))
+        )
+    signatures = append_data.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` must have exactly one signature, "
+            f"found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if return_type.nullable() or return_type.tag() != WebIDL.IDLType.Tags.undefined:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` must return non-nullable `undefined`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if return_type._extendedAttrDict:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` return type carries extended attributes "
+            "that are not implemented: "
+            + ", ".join(sorted(return_type._extendedAttrDict))
+        )
+    if len(arguments) != 1:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` must take exactly one argument, "
+            f"found {len(arguments)}"
+        )
+    argument = arguments[0]
+    if (
+        argument.identifier.name != "data"
+        or argument.optional
+        or argument.variadic
+        or argument.defaultValue is not None
+        or argument.type.nullable()
+        or not argument.type.isDOMString()
+    ):
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` argument `data` must be required "
+            "non-nullable `DOMString data`"
+        )
+    argument_attributes = set(argument._extendedAttrDict) | set(
+        argument.type._extendedAttrDict
+    )
+    if argument_attributes:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_APPEND_DATA}` argument `data` carries extended attributes "
+            "that are not implemented: " + ", ".join(sorted(argument_attributes))
+        )
+
     return {
         CHARACTER_DATA_DATA: data,
         CHARACTER_DATA_LENGTH: length,
         CHARACTER_DATA_SUBSTRING_DATA: substring_data,
+        CHARACTER_DATA_APPEND_DATA: append_data,
     }
 
 

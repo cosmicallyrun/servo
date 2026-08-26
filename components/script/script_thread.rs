@@ -1034,6 +1034,28 @@ unsafe impl servo_v8::ElementHostBinding for V8NodeHost {
         }
     }
 
+    unsafe fn append_data(&self, host_context: *mut c_void, value: &str) -> bool {
+        if host_context.is_null() {
+            return false;
+        }
+        // SAFETY: The authoritative V8 entry lends this live owner-thread
+        // SpiderMonkey context only for the synchronous production mutation.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return false;
+        }
+        let Some(data) = self.character_data() else {
+            return false;
+        };
+        data.AppendData(cx, DOMString::from(value));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return false;
+        }
+        true
+    }
+
     unsafe fn remove(&self, host_context: *mut c_void) -> bool {
         if host_context.is_null() {
             return false;

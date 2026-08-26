@@ -578,6 +578,15 @@ class ProductionCharacterDataTests(unittest.TestCase):
             [("offset", "unsigned long"), ("count", "unsigned long")],
         )
 
+        append_data = members[production_webidl.CHARACTER_DATA_APPEND_DATA]
+        self.assertTrue(append_data.isMethod())
+        self.assertEqual(set(append_data._extendedAttrDict), set())
+        return_type, arguments = append_data.signatures()[0]
+        self.assertEqual(return_type.prettyName(), "undefined")
+        self.assertEqual(len(arguments), 1)
+        self.assertEqual(arguments[0].identifier.name, "data")
+        self.assertEqual(arguments[0].type.prettyName(), "DOMString")
+
 
 class ProductionNodeTests(unittest.TestCase):
     def test_pins_the_real_scalar_node_slice(self) -> None:
@@ -1043,6 +1052,7 @@ class SyntheticSelectionTests(unittest.TestCase):
             "[Pure, Throws] DOMString substringData(unsigned long offset, "
             "unsigned long count);"
         ),
+        append_data: str = "undefined appendData(DOMString data);",
         extra: str = "",
     ) -> str:
         return f"""
@@ -1054,6 +1064,7 @@ class SyntheticSelectionTests(unittest.TestCase):
                 {data}
                 {length}
                 {substring_data}
+                {append_data}
                 {extra}
             }};
         """
@@ -1094,7 +1105,7 @@ class SyntheticSelectionTests(unittest.TestCase):
 
     def test_rejects_missing_character_data_member(self) -> None:
         self.assert_character_data_rejected(
-            "`CharacterData` must declare `data`, `length`, and `substringData`",
+            "`CharacterData` must declare `data`, `length`, `substringData`, and `appendData`",
             data="",
         )
 
@@ -1186,6 +1197,44 @@ class SyntheticSelectionTests(unittest.TestCase):
             substring_data=(
                 "[Pure, Throws] DOMString substringData(unsigned long offset, "
                 "[Clamp] unsigned long count);"
+            ),
+        )
+
+    def test_rejects_character_data_append_data_shape_drift(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData.appendData` carries extended attributes that are not "
+            "implemented: Throws",
+            append_data="[Throws] undefined appendData(DOMString data);",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.appendData` must be an ordinary instance operation",
+            append_data="static undefined appendData(DOMString data);",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.appendData` must return non-nullable `undefined`, got `boolean`",
+            append_data="boolean appendData(DOMString data);",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.appendData` must take exactly one argument, found 0",
+            append_data="undefined appendData();",
+        )
+
+    def test_rejects_character_data_append_data_argument_drift(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData.appendData` argument `data` must be required non-nullable "
+            "`DOMString data`",
+            append_data="undefined appendData(optional DOMString data);",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.appendData` argument `data` must be required non-nullable "
+            "`DOMString data`",
+            append_data="undefined appendData(USVString data);",
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.appendData` argument `data` carries extended attributes "
+            "that are not implemented: LegacyNullToEmptyString",
+            append_data=(
+                "undefined appendData([LegacyNullToEmptyString] DOMString data);"
             ),
         )
 

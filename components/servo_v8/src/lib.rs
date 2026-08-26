@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 46;
+const ABI_VERSION: u32 = 47;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -503,6 +503,7 @@ pub unsafe trait ElementHostBinding: NodeHostBinding + Sized + 'static {
     unsafe fn set_data(&self, host_context: *mut c_void, value: &str) -> bool;
     fn length(&self) -> u32;
     fn substring_data(&self, offset: u32, count: u32) -> CharacterDataStringResult;
+    unsafe fn append_data(&self, host_context: *mut c_void, value: &str) -> bool;
     fn children(&self) -> HTMLCollectionHandle;
     fn get_elements_by_tag_name(&self, qualified_name: &str) -> HTMLCollectionHandle;
     fn get_elements_by_tag_name_ns(
@@ -716,6 +717,7 @@ pub struct ElementHostVTable {
     pub substring_data: Option<
         unsafe extern "C" fn(*mut c_void, u32, u32, *mut RawCharacterDataStringOutcome) -> u8,
     >,
+    pub append_data: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
     pub insert_before: Option<
         unsafe extern "C" fn(
             *mut c_void,
@@ -1763,6 +1765,23 @@ unsafe extern "C" fn element_host_substring_data<T: ElementHostBinding>(
     1
 }
 
+unsafe extern "C" fn element_host_append_data<T: ElementHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    value: *const u8,
+    value_length: usize,
+) -> u8 {
+    if native.is_null() || host_context.is_null() {
+        return 0;
+    }
+    // SAFETY: The ABI lends this byte range for the synchronous call.
+    let Some(value) = (unsafe { element_host_utf8(value, value_length) }) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact host and live context.
+    unsafe { (&*native.cast::<T>()).append_data(host_context, value) as u8 }
+}
+
 unsafe fn element_host_write_node_mutation_outcome(
     output: *mut RawNodeMutationOutcome,
     result: NodeMutationResult,
@@ -2345,6 +2364,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         set_data: Some(element_host_set_data::<T>),
         get_length: Some(element_host_get_length::<T>),
         substring_data: Some(element_host_substring_data::<T>),
+        append_data: Some(element_host_append_data::<T>),
         insert_before: Some(element_host_insert_before::<T>),
         append_child: Some(element_host_append_child::<T>),
         replace_child: Some(element_host_replace_child::<T>),
@@ -4220,6 +4240,21 @@ mod tests {
                 },
             }
             CharacterDataStringResult::Returned(substring)
+        }
+
+        unsafe fn append_data(&self, host_context: *mut c_void, value: &str) -> bool {
+            assert!(!host_context.is_null());
+            if !matches!(self.tag_name.as_str(), "#text" | "#comment")
+                || self.state.remove_fails.get()
+            {
+                return false;
+            }
+            self.state
+                .text_content
+                .borrow_mut()
+                .get_or_insert_with(String::new)
+                .push_str(value);
+            true
         }
 
         fn children(&self) -> HTMLCollectionHandle {
@@ -10905,6 +10940,135 @@ mod tests {
     }
 
     #[test]
+    fn character_data_append_data_preserves_domstring_conversion_and_mutation() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const text = document.createTextNode('A😀');
+              const comment = document.createComment('note');
+              const element = document.createElement('div');
+              const fragment = document.createDocumentFragment();
+              const characterDataPrototype = Object.getPrototypeOf(
+                Object.getPrototypeOf(text));
+              const descriptor = Object.getOwnPropertyDescriptor(
+                characterDataPrototype, 'appendData');
+              const method = descriptor && descriptor.value;
+
+              let wrongBrandConversions = 0;
+              const wrongBrands = [{}, element, fragment].every(receiver => {
+                try {
+                  method.call(receiver, { toString() {
+                    wrongBrandConversions++; return 'wrong';
+                  }});
+                  return false;
+                } catch (error) { return error instanceof TypeError; }
+              });
+              let missing = false;
+              try { method.call(text); }
+              catch (error) { missing = error instanceof TypeError; }
+
+              let conversions = 0;
+              const returned = method.call(text, { toString() {
+                conversions++; return 'B';
+              }}, 'ignored');
+              const sentinel = new Error('appendData conversion');
+              let preservesSentinel = false;
+              try { text.appendData({ toString() { throw sentinel; }}); }
+              catch (error) { preservesSentinel = error === sentinel; }
+              let symbolRejected = false;
+              try { text.appendData(Symbol('data')); }
+              catch (error) { symbolRejected = error instanceof TypeError; }
+
+              comment.appendData(null);
+              comment.appendData(undefined);
+              globalThis.appendDataForNoContext = comment;
+              globalThis.appendDataDiagnostics = {
+                descriptor: !Object.hasOwn(text, 'appendData') && !!descriptor &&
+                  method.name === 'appendData' && method.length === 1 &&
+                  descriptor.writable && descriptor.enumerable && descriptor.configurable,
+                sharedPrototype: Object.getPrototypeOf(Object.getPrototypeOf(comment)) ===
+                  characterDataPrototype,
+                noFakeGlobal: typeof CharacterData === 'undefined',
+                wrongBrands, brandBeforeConversion: wrongBrandConversions === 0,
+                missing, convertedOnce: returned === undefined && conversions === 1,
+                preservesSentinel, symbolRejected,
+                textMutation: text.data === 'A😀B' && text.length === 4,
+                ordinaryDomString: comment.data === 'notenullundefined' &&
+                  comment.length === 17,
+              };
+            })();"#,
+            "character-data-append.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: the non-null token remains live for synchronous mutation.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        for check in [
+            "descriptor",
+            "sharedPrototype",
+            "noFakeGlobal",
+            "wrongBrands",
+            "brandBeforeConversion",
+            "missing",
+            "convertedOnce",
+            "preservesSentinel",
+            "symbolRejected",
+            "textMutation",
+            "ordinaryDomString",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(realm, &format!("appendDataDiagnostics.{check}"))
+                    .unwrap(),
+                "CharacterData.appendData bridge check failed: {check}"
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "(() => { let converted = false; try { appendDataForNoContext.appendData(\
+                       { toString() { converted = true; return 'x'; }}); } \
+                     catch (error) { return error instanceof TypeError && !converted && \
+                       appendDataForNoContext.data === 'notenullundefined'; } return false; })()",
+                )
+                .unwrap(),
+            "CharacterData.appendData without a live host context must fail before conversion"
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(node_drops.get(), 4);
+    }
+
+    #[test]
     fn character_data_rejects_malformed_owned_results_and_drops_owners() {
         CHARACTER_DATA_OWNER_DROPS.store(0, Ordering::SeqCst);
         let mut runtime = Runtime::new(Options {
@@ -11089,6 +11253,7 @@ mod tests {
         let set_data = vtable.set_data.unwrap();
         let get_length = vtable.get_length.unwrap();
         let substring_data = vtable.substring_data.unwrap();
+        let append_data = vtable.append_data.unwrap();
         let mut owned = raw_empty_owned_utf8();
         let mut substring = RawCharacterDataStringOutcome {
             status: CHARACTER_DATA_STRING_HOST_FAILURE,
@@ -11152,8 +11317,30 @@ mod tests {
             assert_eq!(set_data(native, host_context, std::ptr::null(), 0), 1);
             assert_eq!(get_length(native, &mut length), 1);
             assert_eq!(length, 0);
+            assert_eq!(
+                append_data(std::ptr::null_mut(), host_context, std::ptr::null(), 0),
+                0
+            );
+            assert_eq!(
+                append_data(native, std::ptr::null_mut(), std::ptr::null(), 0),
+                0
+            );
+            assert_eq!(append_data(native, host_context, std::ptr::null(), 1), 0);
+            assert_eq!(
+                append_data(
+                    native,
+                    host_context,
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                ),
+                0
+            );
+            assert_eq!(append_data(native, host_context, "A😀".as_ptr(), 5), 1);
+            assert_eq!(get_length(native, &mut length), 1);
+            assert_eq!(length, 3);
             state.remove_fails.set(true);
             assert_eq!(set_data(native, host_context, b"x".as_ptr(), 1), 0);
+            assert_eq!(append_data(native, host_context, b"x".as_ptr(), 1), 0);
             assert_eq!(substring_data(native, 0, 1, &mut substring), 1);
             assert_eq!(substring.status, CHARACTER_DATA_STRING_HOST_FAILURE);
             assert!(substring.value.data.is_null());

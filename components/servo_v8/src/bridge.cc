@@ -3625,9 +3625,13 @@ void CharacterDataHostSetData(
   }
 
   auto call_host = [&](const uint8_t* data, size_t length) {
-    RustCallbackScope callback_scope(realm->runtime);
-    if (!realm->runtime->element_host_vtable.set_data(
-            native, realm->document_host.active_host_context, data, length)) {
+    bool succeeded = false;
+    {
+      RustCallbackScope callback_scope(realm->runtime);
+      succeeded = realm->runtime->element_host_vtable.set_data(
+          native, realm->document_host.active_host_context, data, length);
+    }
+    if (!succeeded) {
       ThrowTypeError(isolate, "CharacterData.data host callback failed");
       return false;
     }
@@ -3743,6 +3747,40 @@ void CharacterDataHostSubstringData(
     return;
   }
   info.GetReturnValue().Set(result);
+}
+
+void CharacterDataHostAppendData(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // Web IDL checks the receiver brand and required arity before conversion.
+  if (!CharacterDataHostCallbackState(info, &realm, &native)) return;
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, "CharacterData.appendData requires 1 argument");
+    return;
+  }
+  if (!realm->document_host.active_host_context ||
+      !realm->runtime->element_host_vtable.append_data) {
+    ThrowTypeError(isolate, "CharacterData mutation requires a live host context");
+    return;
+  }
+
+  v8::Local<v8::String> string;
+  if (!info[0]->ToString(isolate->GetCurrentContext()).ToLocal(&string)) return;
+  v8::String::Utf8Value utf8(isolate, string);
+  if (!*utf8 && utf8.length() != 0) return;
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.append_data(
+        native, realm->document_host.active_host_context,
+        reinterpret_cast<const uint8_t*>(*utf8),
+        static_cast<size_t>(utf8.length()));
+  }
+  if (!succeeded) {
+    ThrowTypeError(isolate, "CharacterData.appendData host callback failed");
+  }
 }
 
 bool InstallNodeListInterface(ServoV8RealmState* realm,
@@ -4054,6 +4092,20 @@ bool InstallCharacterDataPrototype(ServoV8RealmState* realm,
   if (!prototype
            ->DefineOwnProperty(context, V8String(isolate, "substringData"),
                                substring_data, v8::None)
+           .FromMaybe(false)) {
+    return false;
+  }
+  v8::Local<v8::Function> append_data;
+  if (!v8::Function::New(context, CharacterDataHostAppendData, {}, 1,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasSideEffect)
+           .ToLocal(&append_data)) {
+    return false;
+  }
+  append_data->SetName(V8String(isolate, "appendData"));
+  if (!prototype
+           ->DefineOwnProperty(context, V8String(isolate, "appendData"),
+                               append_data, v8::None)
            .FromMaybe(false)) {
     return false;
   }
@@ -5596,6 +5648,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->has_child_nodes ||
       !vtable->get_data || !vtable->set_data || !vtable->get_length ||
       !vtable->substring_data ||
+      !vtable->append_data ||
       !vtable->insert_before ||
       !vtable->append_child || !vtable->replace_child ||
       !vtable->remove_child ||

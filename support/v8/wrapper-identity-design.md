@@ -312,6 +312,14 @@ realm-local V8 `DOMException`. Returned ownership is consumed on every success,
 callback-failure, and malformed-result path, leaving the wrapper cache and
 teardown rules unchanged.
 
+ABI v47 adds mutating `CharacterData.appendData` without changing the generic
+host representation or wrapper cache. V8 completes required `DOMString`
+conversion before the callback; Rust then borrows the live SpiderMonkey context
+only for Servo's exact synchronous `AppendData` call. The borrow and callback
+scope end before V8 can observe the result, no V8 handle crosses into Servo,
+and no new cross-heap reference is retained. Text and Comment therefore keep
+the same allocation-plus-kind identity and teardown rules.
+
 ## The constraint this design depends on
 
 No object in the SpiderMonkey heap may ever hold a V8 handle, a cppgc pointer,
