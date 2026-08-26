@@ -1023,6 +1023,17 @@ unsafe impl servo_v8::ElementHostBinding for V8NodeHost {
         self.character_data().map(|data| data.Length()).unwrap_or(0)
     }
 
+    fn substring_data(&self, offset: u32, count: u32) -> servo_v8::CharacterDataStringResult {
+        let Some(data) = self.character_data() else {
+            return servo_v8::CharacterDataStringResult::HostFailure;
+        };
+        match data.SubstringData(offset, count) {
+            Ok(value) => servo_v8::CharacterDataStringResult::Returned(value.into()),
+            Err(Error::IndexSize(_)) => servo_v8::CharacterDataStringResult::IndexSizeError,
+            Err(_) => servo_v8::CharacterDataStringResult::HostFailure,
+        }
+    }
+
     unsafe fn remove(&self, host_context: *mut c_void) -> bool {
         if host_context.is_null() {
             return false;

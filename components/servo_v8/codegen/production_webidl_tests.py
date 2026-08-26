@@ -566,6 +566,18 @@ class ProductionCharacterDataTests(unittest.TestCase):
         self.assertEqual(set(length._extendedAttrDict), {"Pure"})
         self.assertEqual(set(length.type._extendedAttrDict), set())
 
+        substring_data = members[
+            production_webidl.CHARACTER_DATA_SUBSTRING_DATA
+        ]
+        self.assertTrue(substring_data.isMethod())
+        self.assertEqual(set(substring_data._extendedAttrDict), {"Pure", "Throws"})
+        return_type, arguments = substring_data.signatures()[0]
+        self.assertEqual(return_type.prettyName(), "DOMString")
+        self.assertEqual(
+            [(argument.identifier.name, argument.type.prettyName()) for argument in arguments],
+            [("offset", "unsigned long"), ("count", "unsigned long")],
+        )
+
 
 class ProductionNodeTests(unittest.TestCase):
     def test_pins_the_real_scalar_node_slice(self) -> None:
@@ -1027,6 +1039,10 @@ class SyntheticSelectionTests(unittest.TestCase):
         constructor: str = "",
         data: str = "[Pure] attribute [LegacyNullToEmptyString] DOMString data;",
         length: str = "[Pure] readonly attribute unsigned long length;",
+        substring_data: str = (
+            "[Pure, Throws] DOMString substringData(unsigned long offset, "
+            "unsigned long count);"
+        ),
         extra: str = "",
     ) -> str:
         return f"""
@@ -1037,6 +1053,7 @@ class SyntheticSelectionTests(unittest.TestCase):
                 {constructor}
                 {data}
                 {length}
+                {substring_data}
                 {extra}
             }};
         """
@@ -1077,7 +1094,7 @@ class SyntheticSelectionTests(unittest.TestCase):
 
     def test_rejects_missing_character_data_member(self) -> None:
         self.assert_character_data_rejected(
-            "`CharacterData` must declare both `data` and `length` attributes",
+            "`CharacterData` must declare `data`, `length`, and `substringData`",
             data="",
         )
 
@@ -1115,6 +1132,61 @@ class SyntheticSelectionTests(unittest.TestCase):
         self.assert_character_data_rejected(
             "`CharacterData.length` must use non-nullable `unsigned long`, got `unsigned short`",
             length="[Pure] readonly attribute unsigned short length;",
+        )
+
+    def test_rejects_character_data_substring_data_shape_drift(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData.substringData` must carry exactly ['Pure', 'Throws'], got ['Pure']",
+            substring_data=(
+                "[Pure] DOMString substringData(unsigned long offset, "
+                "unsigned long count);"
+            ),
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.substringData` must be an ordinary instance operation",
+            substring_data=(
+                "[Pure, Throws] static DOMString substringData(unsigned long offset, "
+                "unsigned long count);"
+            ),
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.substringData` must return non-nullable `DOMString`, got `USVString`",
+            substring_data=(
+                "[Pure, Throws] USVString substringData(unsigned long offset, "
+                "unsigned long count);"
+            ),
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.substringData` must take exactly two arguments, found 1",
+            substring_data=(
+                "[Pure, Throws] DOMString substringData(unsigned long offset);"
+            ),
+        )
+
+    def test_rejects_character_data_substring_data_argument_drift(self) -> None:
+        self.assert_character_data_rejected(
+            "`CharacterData.substringData` argument `offset` must be required non-nullable "
+            "`unsigned long offset`",
+            substring_data=(
+                "[Pure, Throws] DOMString substringData(unsigned short offset, "
+                "unsigned long count);"
+            ),
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.substringData` argument `count` must be required non-nullable "
+            "`unsigned long count`",
+            substring_data=(
+                "[Pure, Throws] DOMString substringData(unsigned long offset, "
+                "optional unsigned long count);"
+            ),
+        )
+        self.assert_character_data_rejected(
+            "`CharacterData.substringData` argument `count` carries extended attributes "
+            "that are not implemented: Clamp",
+            substring_data=(
+                "[Pure, Throws] DOMString substringData(unsigned long offset, "
+                "[Clamp] unsigned long count);"
+            ),
         )
 
     def test_selects_attribute_from_partial_interface(self) -> None:

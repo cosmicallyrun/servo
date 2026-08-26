@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 45u
+#define SERVO_V8_ABI_VERSION 46u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -99,6 +99,17 @@ typedef struct ServoV8OptionalOwnedUtf8 {
   uint8_t is_null;
   ServoV8OwnedUtf8 value;
 } ServoV8OptionalOwnedUtf8;
+
+#define SERVO_V8_CHARACTER_DATA_STRING_RETURNED 0u
+#define SERVO_V8_CHARACTER_DATA_STRING_INDEX_SIZE_ERROR 1u
+#define SERVO_V8_CHARACTER_DATA_STRING_HOST_FAILURE 2u
+
+/* A CharacterData operation either transfers one owned DOMString, reports the
+ * one DOMException in its selected WebIDL contract, or fails internally. */
+typedef struct ServoV8CharacterDataStringOutcome {
+  uint32_t status;
+  ServoV8OwnedUtf8 value;
+} ServoV8CharacterDataStringOutcome;
 
 /* One atomic snapshot of a WebIDL sequence<DOMString>. Every view borrows its
  * bytes from the single owner for the lifetime of the synchronous callback. */
@@ -225,6 +236,10 @@ typedef struct ServoV8ElementHostVTable {
                       const uint8_t* value,
                       size_t value_length);
   uint8_t (*get_length)(void* native, uint32_t* output);
+  uint8_t (*substring_data)(void* native,
+                            uint32_t offset,
+                            uint32_t count,
+                            ServoV8CharacterDataStringOutcome* output);
   uint8_t (*insert_before)(void* native,
                            void* host_context,
                            void* node_native,

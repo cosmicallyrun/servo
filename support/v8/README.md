@@ -380,6 +380,17 @@ callback-failure path. The v45 proof pins the shared prototype and descriptors,
 wrong brands, conversion/error ordering, astral length, generic Node identity,
 and SpiderMonkey visibility of the final Comment and rendered Text mutations.
 
+ABI v46 adds the exact production `CharacterData.substringData(offset, count)`
+operation to the shared Text/Comment prototype. V8 performs required-argument
+checking and ordered Web IDL `unsigned long` conversion before the Rust host
+calls Servo's exact `CharacterDataMethods::SubstringData`. Successful strings
+cross as owned UTF-8 and are released on success, callback failure, and every
+malformed outcome; Servo's `Error::IndexSize` crosses only as typed data before
+V8 creates a realm-local `IndexSizeError`. The operation is pure and needs no
+live SpiderMonkey mutation context. The v46 proof pins its descriptor, brands,
+conversion/error ordering, wrapping unsigned conversion, UTF-16 astral-split
+behavior, DOMException shape, and cross-engine visibility of the final tree.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script
@@ -649,6 +660,7 @@ The proof suite uses that same counting argument:
 | `authoritative_create_text_node_proof.html` | Document.createTextNode preserves receiver/argument conversion ordering and fresh Text wrappers; generic Node fragment/Element insertion preserves identity and the final Text is visible to SpiderMonkey |
 | `authoritative_create_comment_proof.html` | Document.createComment preserves receiver/argument conversion ordering, Comment/CharacterData/Node inheritance and tags, generic insertion identity, and SpiderMonkey visibility of a Comment plus Text sibling |
 | `authoritative_character_data_proof.html` | CharacterData.data and length preserve shared Text/Comment inheritance, brand-before-conversion ordering, LegacyNullToEmptyString and UTF-16 semantics, generic Node identity, and cross-engine visibility of live Comment/Text mutation |
+| `authoritative_character_data_substring_proof.html` | CharacterData.substringData preserves its shared prototype, required and ordered unsigned-long conversion, UTF-16 slicing, IndexSizeError shape, owned-result safety, and final cross-engine DOM visibility |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -672,7 +684,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 45 and remains experimental. The original
+The current exported C ABI is version 46 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

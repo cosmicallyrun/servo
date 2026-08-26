@@ -115,7 +115,12 @@ HTML_COLLECTION_NAMED_ITEM = "HTMLCollection.namedItem"
 CHARACTER_DATA_INTERFACE = "CharacterData"
 CHARACTER_DATA_DATA = "CharacterData.data"
 CHARACTER_DATA_LENGTH = "CharacterData.length"
-CHARACTER_DATA_HOST = (CHARACTER_DATA_DATA, CHARACTER_DATA_LENGTH)
+CHARACTER_DATA_SUBSTRING_DATA = "CharacterData.substringData"
+CHARACTER_DATA_HOST = (
+    CHARACTER_DATA_DATA,
+    CHARACTER_DATA_LENGTH,
+    CHARACTER_DATA_SUBSTRING_DATA,
+)
 
 # Member shapes the generator knows how to emit. A shape names both the WebIDL
 # form a selector accepts and the emitters that understand it, so a new member is
@@ -2840,8 +2845,8 @@ def select_html_collection_interface(
 
 def _select_character_data_interface(
     parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
-) -> dict[str, WebIDL.IDLAttribute]:
-    """Pin the production CharacterData interface and its two selected attributes."""
+) -> dict[str, WebIDL.IDLAttribute | WebIDL.IDLMethod]:
+    """Pin the production CharacterData interface and its selected scalar slice."""
 
     interfaces = [
         result
@@ -2877,11 +2882,11 @@ def _select_character_data_interface(
     members_by_name = {
         member.identifier.name: member
         for member in interface.members
-        if member.identifier.name in ("data", "length")
+        if member.identifier.name in ("data", "length", "substringData")
     }
-    if set(members_by_name) != {"data", "length"}:
+    if set(members_by_name) != {"data", "length", "substringData"}:
         raise WebIDLSelectionError(
-            "`CharacterData` must declare both `data` and `length` attributes"
+            "`CharacterData` must declare `data`, `length`, and `substringData`"
         )
 
     data = members_by_name["data"]
@@ -2926,9 +2931,70 @@ def _select_character_data_interface(
             + ", ".join(sorted(length.type._extendedAttrDict))
         )
 
+    substring_data = members_by_name["substringData"]
+    if (
+        not substring_data.isMethod()
+        or substring_data.isStatic()
+        or substring_data.isSpecial()
+    ):
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_SUBSTRING_DATA}` must be an ordinary instance operation"
+        )
+    if set(substring_data._extendedAttrDict) != {"Pure", "Throws"}:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_SUBSTRING_DATA}` must carry exactly ['Pure', 'Throws'], "
+            f"got {sorted(substring_data._extendedAttrDict)}"
+        )
+    signatures = substring_data.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_SUBSTRING_DATA}` must have exactly one signature, "
+            f"found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if return_type.nullable() or not return_type.isDOMString():
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_SUBSTRING_DATA}` must return non-nullable `DOMString`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if return_type._extendedAttrDict:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_SUBSTRING_DATA}` return type carries extended attributes "
+            "that are not implemented: "
+            + ", ".join(sorted(return_type._extendedAttrDict))
+        )
+    if len(arguments) != 2:
+        raise WebIDLSelectionError(
+            f"`{CHARACTER_DATA_SUBSTRING_DATA}` must take exactly two arguments, "
+            f"found {len(arguments)}"
+        )
+    for argument, expected_name in zip(arguments, ("offset", "count"), strict=True):
+        if (
+            argument.identifier.name != expected_name
+            or argument.optional
+            or argument.variadic
+            or argument.defaultValue is not None
+            or argument.type.nullable()
+            or argument.type.tag() != WebIDL.IDLType.Tags.uint32
+        ):
+            raise WebIDLSelectionError(
+                f"`{CHARACTER_DATA_SUBSTRING_DATA}` argument `{expected_name}` must be "
+                f"required non-nullable `unsigned long {expected_name}`"
+            )
+        argument_attributes = set(argument._extendedAttrDict) | set(
+            argument.type._extendedAttrDict
+        )
+        if argument_attributes:
+            raise WebIDLSelectionError(
+                f"`{CHARACTER_DATA_SUBSTRING_DATA}` argument `{expected_name}` carries "
+                "extended attributes that are not implemented: "
+                + ", ".join(sorted(argument_attributes))
+            )
+
     return {
         CHARACTER_DATA_DATA: data,
         CHARACTER_DATA_LENGTH: length,
+        CHARACTER_DATA_SUBSTRING_DATA: substring_data,
     }
 
 
@@ -2936,7 +3002,7 @@ def select_character_data_host_members(
     cache_dir: Path,
     environment: Mapping[str, str] | None = None,
     webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
-) -> dict[str, WebIDL.IDLAttribute]:
+) -> dict[str, WebIDL.IDLAttribute | WebIDL.IDLMethod]:
     """Load the production corpus and pin the supported CharacterData slice."""
 
     parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)

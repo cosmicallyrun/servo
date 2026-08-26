@@ -3668,6 +3668,83 @@ void CharacterDataHostGetLength(
   info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(isolate, result));
 }
 
+void CharacterDataHostSubstringData(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  // Web IDL checks the receiver brand before inspecting required arguments.
+  if (!CharacterDataHostCallbackState(info, &realm, &native)) return;
+  if (info.Length() < 2) {
+    ThrowTypeError(isolate, "CharacterData.substringData requires 2 arguments");
+    return;
+  }
+  if (!realm->runtime->element_host_vtable.substring_data) {
+    ThrowTypeError(
+        isolate, "CharacterData.substringData host callback is not installed");
+    return;
+  }
+
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Maybe<uint32_t> offset = info[0]->Uint32Value(context);
+  if (offset.IsNothing()) return;
+  v8::Maybe<uint32_t> count = info[1]->Uint32Value(context);
+  if (count.IsNothing()) return;
+
+  ServoV8CharacterDataStringOutcome outcome{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->element_host_vtable.substring_data(
+                    native, offset.FromJust(), count.FromJust(), &outcome) != 0;
+  }
+  // Own a hostile transfer even when the callback fails or returns a malformed
+  // status/value combination.
+  DocumentHostOwnedUtf8Scope value_scope(realm->runtime, &outcome.value);
+  if (!succeeded) {
+    ThrowTypeError(isolate, "CharacterData.substringData host callback failed");
+    return;
+  }
+
+  const bool returned =
+      outcome.status == SERVO_V8_CHARACTER_DATA_STRING_RETURNED;
+  const bool index_size_error =
+      outcome.status == SERVO_V8_CHARACTER_DATA_STRING_INDEX_SIZE_ERROR;
+  const bool host_failure =
+      outcome.status == SERVO_V8_CHARACTER_DATA_STRING_HOST_FAILURE;
+  const bool valid_value =
+      outcome.value.data && outcome.value.owner && outcome.value.drop_owner &&
+      outcome.value.length <=
+          static_cast<size_t>(std::numeric_limits<int>::max()) &&
+      IsValidUtf8(outcome.value.data, outcome.value.length);
+  const bool valid_shape =
+      (returned && valid_value) ||
+      ((index_size_error || host_failure) &&
+       IsCanonicalEmptyOwnedUtf8(outcome.value));
+  if (!valid_shape) {
+    ThrowTypeError(isolate, "invalid CharacterData.substringData outcome");
+    return;
+  }
+  if (host_failure) {
+    ThrowTypeError(isolate, "CharacterData.substringData host callback failed");
+    return;
+  }
+  if (index_size_error) {
+    ThrowDomException(realm, context, v8::String::Empty(isolate),
+                      V8String(isolate, "IndexSizeError"));
+    return;
+  }
+
+  v8::Local<v8::String> result;
+  if (!v8::String::NewFromUtf8(
+           isolate, reinterpret_cast<const char*>(outcome.value.data),
+           v8::NewStringType::kNormal, static_cast<int>(outcome.value.length))
+           .ToLocal(&result)) {
+    return;
+  }
+  info.GetReturnValue().Set(result);
+}
+
 bool InstallNodeListInterface(ServoV8RealmState* realm,
                               v8::Local<v8::Context> context,
                               v8::Local<v8::Object> global) {
@@ -3966,6 +4043,20 @@ bool InstallCharacterDataPrototype(ServoV8RealmState* realm,
                                  data_setter, v8::None);
   prototype->SetAccessorProperty(V8String(isolate, "length"), length_getter,
                                  v8::Local<v8::Function>(), v8::None);
+  v8::Local<v8::Function> substring_data;
+  if (!v8::Function::New(context, CharacterDataHostSubstringData, {}, 2,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&substring_data)) {
+    return false;
+  }
+  substring_data->SetName(V8String(isolate, "substringData"));
+  if (!prototype
+           ->DefineOwnProperty(context, V8String(isolate, "substringData"),
+                               substring_data, v8::None)
+           .FromMaybe(false)) {
+    return false;
+  }
   return true;
 }
 
@@ -5504,6 +5595,7 @@ extern "C" int32_t servo_v8_install_element_host(
       !vtable->set_text_content || !vtable->get_parent_element ||
       !vtable->has_child_nodes ||
       !vtable->get_data || !vtable->set_data || !vtable->get_length ||
+      !vtable->substring_data ||
       !vtable->insert_before ||
       !vtable->append_child || !vtable->replace_child ||
       !vtable->remove_child ||

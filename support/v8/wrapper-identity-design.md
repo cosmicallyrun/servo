@@ -303,6 +303,15 @@ that owner on success, callback failure, and malformed-result paths. No new
 Servo-to-V8 reference is introduced, so wrapper identity and teardown remain
 governed by the same per-realm allocation-plus-kind cache.
 
+ABI v46 adds pure `CharacterData.substringData` through that same generic host.
+It introduces no mutation context and no new cross-heap edge: V8 converts the
+two `unsigned long` inputs, Rust calls Servo's exact UTF-16-indexed operation,
+and an owned UTF-8 result returns synchronously. `IndexSizeError` crosses as a
+typed status rather than a SpiderMonkey exception object, and C++ creates the
+realm-local V8 `DOMException`. Returned ownership is consumed on every success,
+callback-failure, and malformed-result path, leaving the wrapper cache and
+teardown rules unchanged.
+
 ## The constraint this design depends on
 
 No object in the SpiderMonkey heap may ever hold a V8 handle, a cppgc pointer,

@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 45;
+const ABI_VERSION: u32 = 46;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -331,6 +331,17 @@ pub enum ToggleAttributeResult {
     HostFailure,
 }
 
+/// The complete result space for the selected CharacterData string operation.
+///
+/// `substringData` can return a DOMString, throw `IndexSizeError`, or report an
+/// internal host failure. The exception remains typed data until V8 creates a
+/// realm-local `DOMException`.
+pub enum CharacterDataStringResult {
+    Returned(String),
+    IndexSizeError,
+    HostFailure,
+}
+
 /// A static NodeList created for one querySelectorAll call.
 ///
 /// # Safety
@@ -491,6 +502,7 @@ pub unsafe trait ElementHostBinding: NodeHostBinding + Sized + 'static {
     fn data(&self) -> String;
     unsafe fn set_data(&self, host_context: *mut c_void, value: &str) -> bool;
     fn length(&self) -> u32;
+    fn substring_data(&self, offset: u32, count: u32) -> CharacterDataStringResult;
     fn children(&self) -> HTMLCollectionHandle;
     fn get_elements_by_tag_name(&self, qualified_name: &str) -> HTMLCollectionHandle;
     fn get_elements_by_tag_name_ns(
@@ -583,6 +595,16 @@ pub struct RawToggleAttributeOutcome {
     pub exception_kind: u32,
     pub exception_message: OwnedUtf8,
     pub value: u8,
+}
+
+const CHARACTER_DATA_STRING_RETURNED: u32 = 0;
+const CHARACTER_DATA_STRING_INDEX_SIZE_ERROR: u32 = 1;
+const CHARACTER_DATA_STRING_HOST_FAILURE: u32 = 2;
+
+#[repr(C)]
+pub struct RawCharacterDataStringOutcome {
+    pub status: u32,
+    pub value: OwnedUtf8,
 }
 
 #[repr(C)]
@@ -691,6 +713,9 @@ pub struct ElementHostVTable {
     pub get_data: Option<unsafe extern "C" fn(*mut c_void, *mut OwnedUtf8) -> u8>,
     pub set_data: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> u8>,
     pub get_length: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u8>,
+    pub substring_data: Option<
+        unsafe extern "C" fn(*mut c_void, u32, u32, *mut RawCharacterDataStringOutcome) -> u8,
+    >,
     pub insert_before: Option<
         unsafe extern "C" fn(
             *mut c_void,
@@ -1275,6 +1300,25 @@ fn raw_toggle_attribute_outcome(result: ToggleAttributeResult) -> RawToggleAttri
     }
 }
 
+fn raw_character_data_string_outcome(
+    result: CharacterDataStringResult,
+) -> RawCharacterDataStringOutcome {
+    match result {
+        CharacterDataStringResult::Returned(value) => RawCharacterDataStringOutcome {
+            status: CHARACTER_DATA_STRING_RETURNED,
+            value: raw_owned_utf8(value),
+        },
+        CharacterDataStringResult::IndexSizeError => RawCharacterDataStringOutcome {
+            status: CHARACTER_DATA_STRING_INDEX_SIZE_ERROR,
+            value: raw_empty_owned_utf8(),
+        },
+        CharacterDataStringResult::HostFailure => RawCharacterDataStringOutcome {
+            status: CHARACTER_DATA_STRING_HOST_FAILURE,
+            value: raw_empty_owned_utf8(),
+        },
+    }
+}
+
 unsafe extern "C" fn element_host_set_id<T: ElementHostBinding>(
     native: *mut c_void,
     host_context: *mut c_void,
@@ -1700,6 +1744,22 @@ unsafe extern "C" fn element_host_get_length<T: ElementHostBinding>(
     }
     // SAFETY: Both pointers satisfy the vtable contract.
     unsafe { *output = (&*native.cast::<T>()).length() };
+    1
+}
+
+unsafe extern "C" fn element_host_substring_data<T: ElementHostBinding>(
+    native: *mut c_void,
+    offset: u32,
+    count: u32,
+    output: *mut RawCharacterDataStringOutcome,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T> and the
+    // caller owns the writable result storage.
+    let result = unsafe { (&*native.cast::<T>()).substring_data(offset, count) };
+    unsafe { *output = raw_character_data_string_outcome(result) };
     1
 }
 
@@ -2284,6 +2344,7 @@ fn element_host_vtable<T: ElementHostBinding>() -> ElementHostVTable {
         get_data: Some(element_host_get_data::<T>),
         set_data: Some(element_host_set_data::<T>),
         get_length: Some(element_host_get_length::<T>),
+        substring_data: Some(element_host_substring_data::<T>),
         insert_before: Some(element_host_insert_before::<T>),
         append_child: Some(element_host_append_child::<T>),
         replace_child: Some(element_host_replace_child::<T>),
@@ -3388,6 +3449,7 @@ mod tests {
     static UTF8_SEQUENCE_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     static ATTRIBUTE_MUTATION_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     static CHARACTER_DATA_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static CHARACTER_DATA_SUBSTRING_OWNER_DROPS: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
         static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
@@ -4113,6 +4175,51 @@ mod tests {
 
         fn length(&self) -> u32 {
             self.data().encode_utf16().count().min(u32::MAX as usize) as u32
+        }
+
+        fn substring_data(&self, offset: u32, count: u32) -> CharacterDataStringResult {
+            if !matches!(self.tag_name.as_str(), "#text" | "#comment")
+                || self.state.remove_fails.get()
+            {
+                return CharacterDataStringResult::HostFailure;
+            }
+            fn split_at_utf16(s: &str, offset: u32) -> Result<(&str, bool, &str), ()> {
+                let mut code_units = 0;
+                for (index, character) in s.char_indices() {
+                    if code_units == offset {
+                        let (before, after) = s.split_at(index);
+                        return Ok((before, false, after));
+                    }
+                    code_units += 1;
+                    if character > '\u{FFFF}' {
+                        if code_units == offset {
+                            return Ok((&s[..index], true, &s[index + character.len_utf8()..]));
+                        }
+                        code_units += 1;
+                    }
+                }
+                (code_units == offset).then_some((s, false, "")).ok_or(())
+            }
+
+            let data = self.data();
+            let Ok((_, split_before, remaining)) = split_at_utf16(&data, offset) else {
+                return CharacterDataStringResult::IndexSizeError;
+            };
+            let mut substring = if split_before {
+                "\u{FFFD}".to_owned()
+            } else {
+                String::new()
+            };
+            match split_at_utf16(remaining, count) {
+                Err(()) => substring.push_str(remaining),
+                Ok((prefix, split_after, _)) => {
+                    substring.push_str(prefix);
+                    if split_after {
+                        substring.push('\u{FFFD}');
+                    }
+                },
+            }
+            CharacterDataStringResult::Returned(substring)
         }
 
         fn children(&self) -> HTMLCollectionHandle {
@@ -5751,6 +5858,26 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn adversarial_character_data_substring_owner_drop(owner: *mut c_void) {
+        if owner.is_null() {
+            return;
+        }
+        // SAFETY: Each adversarial substring transfer owns exactly one
+        // Box<Vec<u8>>, returned once by the C++ outcome scope.
+        drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
+        CHARACTER_DATA_SUBSTRING_OWNER_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn adversarial_character_data_substring_owned(bytes: Vec<u8>) -> OwnedUtf8 {
+        let owner = Box::new(bytes);
+        OwnedUtf8 {
+            data: owner.as_ptr(),
+            length: owner.len(),
+            owner: Box::into_raw(owner).cast(),
+            drop_owner: Some(adversarial_character_data_substring_owner_drop),
+        }
+    }
+
     unsafe extern "C" fn adversarial_character_data_get_data(
         native: *mut c_void,
         output: *mut OwnedUtf8,
@@ -5792,6 +5919,77 @@ mod tests {
         };
         // SAFETY: output is non-null caller-owned writable storage.
         unsafe { *output = value };
+        succeeded as u8
+    }
+
+    unsafe extern "C" fn adversarial_character_data_substring_data(
+        native: *mut c_void,
+        _offset: u32,
+        _count: u32,
+        output: *mut RawCharacterDataStringOutcome,
+    ) -> u8 {
+        if native.is_null() || output.is_null() {
+            return 0;
+        }
+        // SAFETY: The custom vtable is installed for exactly this probe type.
+        let host = unsafe { &*native.cast::<ElementHostProbe>() };
+        let mode = host.data();
+        let succeeded = mode != "callback-failure-owned";
+        let mut outcome = RawCharacterDataStringOutcome {
+            status: CHARACTER_DATA_STRING_RETURNED,
+            value: raw_empty_owned_utf8(),
+        };
+        match mode.as_str() {
+            "callback-failure-owned" => {
+                outcome.value = adversarial_character_data_substring_owned(b"failure".to_vec());
+            },
+            "returned-missing-data-owned" => {
+                outcome.value = adversarial_character_data_substring_owned(b"missing".to_vec());
+                outcome.value.data = std::ptr::null();
+            },
+            "returned-missing-owner" => {
+                outcome.value.data = std::ptr::NonNull::<u8>::dangling().as_ptr();
+                outcome.value.length = 1;
+            },
+            "returned-owner-without-drop" => {
+                outcome.value.data = std::ptr::NonNull::<u8>::dangling().as_ptr();
+                outcome.value.length = 1;
+                outcome.value.owner = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+            },
+            "returned-invalid-utf8-owned" => {
+                outcome.value = adversarial_character_data_substring_owned(vec![0xff]);
+            },
+            "returned-oversized-owned" => {
+                outcome.value = adversarial_character_data_substring_owned(b"oversized".to_vec());
+                outcome.value.length = usize::MAX;
+            },
+            "index-size-owned" => {
+                outcome.status = CHARACTER_DATA_STRING_INDEX_SIZE_ERROR;
+                outcome.value = adversarial_character_data_substring_owned(b"unexpected".to_vec());
+            },
+            "host-failure-owned" => {
+                outcome.status = CHARACTER_DATA_STRING_HOST_FAILURE;
+                outcome.value = adversarial_character_data_substring_owned(b"unexpected".to_vec());
+            },
+            "unknown-status-owned" => {
+                outcome.status = u32::MAX;
+                outcome.value = adversarial_character_data_substring_owned(b"unexpected".to_vec());
+            },
+            "valid-empty" => {
+                outcome.value = adversarial_character_data_substring_owned(Vec::new());
+            },
+            "index-size" => {
+                outcome.status = CHARACTER_DATA_STRING_INDEX_SIZE_ERROR;
+            },
+            "host-failure" => {
+                outcome.status = CHARACTER_DATA_STRING_HOST_FAILURE;
+            },
+            _ => {
+                outcome.value = adversarial_character_data_substring_owned(mode.into_bytes());
+            },
+        }
+        // SAFETY: output is non-null caller-owned writable storage.
+        unsafe { *output = outcome };
         succeeded as u8
     }
 
@@ -10546,6 +10744,167 @@ mod tests {
     }
 
     #[test]
+    fn character_data_substring_data_preserves_webidl_conversion_and_utf16_semantics() {
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        runtime.install_element_host::<ElementHostProbe>().unwrap();
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const text = document.createTextNode('A😀BC');
+              const comment = document.createComment('comment');
+              const element = document.createElement('div');
+              const fragment = document.createDocumentFragment();
+              const textPrototype = Object.getPrototypeOf(text);
+              const characterDataPrototype = Object.getPrototypeOf(textPrototype);
+              const descriptor = Object.getOwnPropertyDescriptor(
+                characterDataPrototype, 'substringData');
+              const method = descriptor && descriptor.value;
+
+              let wrongBrandConversions = 0;
+              const wrongBrands = [{}, element, fragment].every(receiver => {
+                try {
+                  method.call(receiver, { valueOf() {
+                    wrongBrandConversions++; return 0;
+                  }}, 1);
+                  return false;
+                } catch (error) { return error instanceof TypeError; }
+              });
+
+              let missingBoth = false;
+              try { method.call(text); }
+              catch (error) { missingBoth = error instanceof TypeError; }
+              let missingConversion = 0;
+              let missingCount = false;
+              try {
+                method.call(text, { valueOf() { missingConversion++; return 0; }});
+              } catch (error) { missingCount = error instanceof TypeError; }
+
+              const order = [];
+              const converted = method.call(
+                text,
+                { valueOf() { order.push('offset'); return 1; }},
+                { valueOf() { order.push('count'); return 2; }},
+              );
+              const sentinel = new Error('substringData conversion');
+              let secondThrowPreserved = false;
+              const throwingOrder = [];
+              try {
+                method.call(
+                  text,
+                  { valueOf() { throwingOrder.push('offset'); return 1; }},
+                  { valueOf() { throwingOrder.push('count'); throw sentinel; }},
+                );
+              } catch (error) { secondThrowPreserved = error === sentinel; }
+              let symbolRejected = false;
+              try { text.substringData(Symbol('offset'), 1); }
+              catch (error) { symbolRejected = error instanceof TypeError; }
+
+              let indexSize = false;
+              try { text.substringData(6, 0); }
+              catch (error) {
+                indexSize = error instanceof DOMException && error instanceof Error &&
+                  error.name === 'IndexSizeError' && error.message === '' &&
+                  error.code === 1 && DOMException.INDEX_SIZE_ERR === 1 &&
+                  Object.getPrototypeOf(error) === DOMException.prototype;
+              }
+
+              globalThis.substringDataForNoContext = text;
+              globalThis.substringDataDiagnostics = {
+                descriptor: !Object.hasOwn(text, 'substringData') && !!descriptor &&
+                  method.name === 'substringData' && method.length === 2 &&
+                  descriptor.writable && descriptor.enumerable && descriptor.configurable,
+                sharedPrototype: Object.getPrototypeOf(Object.getPrototypeOf(comment)) ===
+                  characterDataPrototype,
+                noFakeGlobal: typeof CharacterData === 'undefined',
+                wrongBrands, brandBeforeConversion: wrongBrandConversions === 0,
+                missingArguments: missingBoth && missingCount && missingConversion === 0,
+                orderedConversion: converted === '😀' && order.join(',') === 'offset,count',
+                preservesThrow: secondThrowPreserved &&
+                  throwingOrder.join(',') === 'offset,count',
+                symbolRejected,
+                uint32Conversion:
+                  text.substringData(4294967297, 2) === '😀' &&
+                  text.substringData(-4294967295, 2) === '😀' &&
+                  text.substringData(NaN, Infinity) === '',
+                utf16Semantics:
+                  text.substringData(0, 0xffffffff) === 'A😀BC' &&
+                  text.substringData(1, 1) === '\uFFFD' &&
+                  text.substringData(2, 1) === '\uFFFDB' &&
+                  text.substringData(5, 1) === '' &&
+                  method.call(comment, 0, 3, 'ignored') === 'com',
+                indexSize,
+                pure: text.data === 'A😀BC' && text.length === 5,
+              };
+            })();"#,
+            "character-data-substring.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: the non-null token remains live for synchronous creation.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        for check in [
+            "descriptor",
+            "sharedPrototype",
+            "noFakeGlobal",
+            "wrongBrands",
+            "brandBeforeConversion",
+            "missingArguments",
+            "orderedConversion",
+            "preservesThrow",
+            "symbolRejected",
+            "uint32Conversion",
+            "utf16Semantics",
+            "indexSize",
+            "pure",
+        ] {
+            assert!(
+                runtime
+                    .eval_bool_in_realm(realm, &format!("substringDataDiagnostics.{check}"))
+                    .unwrap(),
+                "CharacterData.substringData bridge check failed: {check}"
+            );
+        }
+        assert!(
+            runtime
+                .eval_bool_in_realm(
+                    realm,
+                    "substringDataForNoContext.substringData(1, 2) === '😀'",
+                )
+                .unwrap(),
+            "pure CharacterData.substringData must not require a host context"
+        );
+
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(node_drops.get(), 4);
+    }
+
+    #[test]
     fn character_data_rejects_malformed_owned_results_and_drops_owners() {
         CHARACTER_DATA_OWNER_DROPS.store(0, Ordering::SeqCst);
         let mut runtime = Runtime::new(Options {
@@ -10618,6 +10977,95 @@ mod tests {
     }
 
     #[test]
+    fn character_data_substring_rejects_malformed_outcomes_and_drops_owners() {
+        CHARACTER_DATA_SUBSTRING_OWNER_DROPS.store(0, Ordering::SeqCst);
+        let mut runtime = Runtime::new(Options {
+            expose_gc: 1,
+            ..Options::default()
+        })
+        .unwrap();
+        let mut vtable = element_host_vtable::<ElementHostProbe>();
+        vtable.substring_data = Some(adversarial_character_data_substring_data);
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: the complete table uses the one installed probe host type.
+        assert_eq!(
+            unsafe { servo_v8_install_element_host(runtime.raw.as_ptr(), &vtable, &mut error) },
+            1,
+            "custom substringData vtable install failed: {:?}",
+            error_from(&storage, &error),
+        );
+        let realm = runtime.create_realm().unwrap();
+        let document_drops = Rc::new(Cell::new(0));
+        let node_drops = Rc::new(Cell::new(0));
+        let mut document = DocumentHostProbe::new(
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::clone(&document_drops),
+        );
+        document.element_drops = Rc::clone(&node_drops);
+        runtime.install_document_host(realm, document).unwrap();
+
+        let script = compiled(runtime.compile_script_in_realm(
+            realm,
+            r#"(() => {
+              const rejected = [
+                'callback-failure-owned', 'returned-missing-data-owned',
+                'returned-missing-owner', 'returned-owner-without-drop',
+                'returned-invalid-utf8-owned', 'returned-oversized-owned',
+                'index-size-owned', 'host-failure-owned', 'unknown-status-owned',
+              ].every(mode => {
+                const value = document.createComment(mode);
+                try { value.substringData(0, 1); return false; }
+                catch (error) { return error instanceof TypeError; }
+              });
+              const empty = document.createComment('valid-empty');
+              const index = document.createComment('index-size');
+              const hostFailure = document.createComment('host-failure');
+              let indexRejected = false;
+              try { index.substringData(0, 1); }
+              catch (error) {
+                indexRejected = error instanceof DOMException &&
+                  error.name === 'IndexSizeError' && error.code === 1;
+              }
+              let hostRejected = false;
+              try { hostFailure.substringData(0, 1); }
+              catch (error) { hostRejected = error instanceof TypeError; }
+              globalThis.characterDataSubstringMalformedProof =
+                rejected && empty.substringData(0, 1) === '' &&
+                indexRejected && hostRejected;
+            })();"#,
+            "character-data-substring-malformed.js",
+            1,
+        ));
+        let mut host_context = 0_u8;
+        // SAFETY: the token stays live for all synchronous creation callbacks.
+        assert_eq!(
+            unsafe {
+                runtime.run_script_in_realm_with_host_context(
+                    realm,
+                    script,
+                    (&mut host_context as *mut u8).cast(),
+                )
+            }
+            .unwrap(),
+            ScriptRunOutcome::Completed,
+        );
+        assert!(
+            runtime
+                .eval_bool_in_realm(realm, "characterDataSubstringMalformedProof")
+                .unwrap()
+        );
+        assert_eq!(
+            CHARACTER_DATA_SUBSTRING_OWNER_DROPS.load(Ordering::SeqCst),
+            8
+        );
+        runtime.destroy_realm(realm).unwrap();
+        assert_eq!(document_drops.get(), 1);
+        assert_eq!(node_drops.get(), 12);
+    }
+
+    #[test]
     fn character_data_thunks_validate_abi_inputs() {
         let drops = Rc::new(Cell::new(0));
         let identity = Rc::new(0_u8);
@@ -10640,7 +11088,12 @@ mod tests {
         let get_data = vtable.get_data.unwrap();
         let set_data = vtable.set_data.unwrap();
         let get_length = vtable.get_length.unwrap();
+        let substring_data = vtable.substring_data.unwrap();
         let mut owned = raw_empty_owned_utf8();
+        let mut substring = RawCharacterDataStringOutcome {
+            status: CHARACTER_DATA_STRING_HOST_FAILURE,
+            value: raw_empty_owned_utf8(),
+        };
         let mut length = 0;
         let mut host_context = 0_u8;
         let host_context = (&mut host_context as *mut u8).cast::<c_void>();
@@ -10658,6 +11111,26 @@ mod tests {
             assert_eq!(get_length(native, std::ptr::null_mut()), 0);
             assert_eq!(get_length(native, &mut length), 1);
             assert_eq!(length, 3);
+            assert_eq!(
+                substring_data(std::ptr::null_mut(), 1, 2, &mut substring),
+                0
+            );
+            assert_eq!(substring_data(native, 1, 2, std::ptr::null_mut()), 0);
+            assert_eq!(substring_data(native, 1, 2, &mut substring), 1);
+            assert_eq!(substring.status, CHARACTER_DATA_STRING_RETURNED);
+            assert_eq!(
+                std::str::from_utf8(std::slice::from_raw_parts(
+                    substring.value.data,
+                    substring.value.length,
+                ))
+                .unwrap(),
+                "😀"
+            );
+            substring.value.drop_owner.unwrap()(substring.value.owner);
+            assert_eq!(substring_data(native, 4, 0, &mut substring), 1);
+            assert_eq!(substring.status, CHARACTER_DATA_STRING_INDEX_SIZE_ERROR);
+            assert!(substring.value.data.is_null());
+            assert!(substring.value.owner.is_null());
             assert_eq!(
                 set_data(std::ptr::null_mut(), host_context, std::ptr::null(), 0),
                 0
@@ -10681,6 +11154,10 @@ mod tests {
             assert_eq!(length, 0);
             state.remove_fails.set(true);
             assert_eq!(set_data(native, host_context, b"x".as_ptr(), 1), 0);
+            assert_eq!(substring_data(native, 0, 1, &mut substring), 1);
+            assert_eq!(substring.status, CHARACTER_DATA_STRING_HOST_FAILURE);
+            assert!(substring.value.data.is_null());
+            assert!(substring.value.owner.is_null());
             vtable.drop.unwrap()(native);
         }
         assert_eq!(drops.get(), 1);
