@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const ABI_VERSION: u32 = 47;
+const ABI_VERSION: u32 = 48;
 const ERROR_CAPACITY: usize = 2048;
 
 #[repr(C)]
@@ -362,6 +362,31 @@ pub struct HTMLCollectionHandle {
     pub native: *mut c_void,
 }
 
+/// One live `MediaQueryList` host returned by a Window `matchMedia` call.
+///
+/// The native pointer is owned by the V8 bridge after a successful callback
+/// and is released through the runtime's installed
+/// [`MediaQueryListHostBinding`] vtable.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct MediaQueryListHandle {
+    pub native: *mut c_void,
+}
+
+impl MediaQueryListHandle {
+    /// Boxes one MediaQueryList host for transfer to V8.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the exact type previously passed to
+    /// [`Runtime::install_media_query_list_host`] for the receiving runtime.
+    pub unsafe fn new<T: MediaQueryListHostBinding>(host: T) -> Self {
+        Self {
+            native: Box::into_raw(Box::new(host)).cast(),
+        }
+    }
+}
+
 impl HTMLCollectionHandle {
     /// Boxes `host` and transfers it through the runtime's installed
     /// HTMLCollection vtable. `key` identifies the collection's owner for the
@@ -418,6 +443,135 @@ pub unsafe trait HTMLCollectionHostBinding: Sized + 'static {
     fn item(&self, index: u32) -> Option<InterfaceHandle>;
     fn named_item(&self, name: &str) -> Option<InterfaceHandle>;
     fn supported_names(&self) -> Vec<String>;
+}
+
+/// A realm-owned host for Window `matchMedia` calls.
+///
+/// # Safety
+///
+/// Implementations and `Drop` must stay on the owning script thread, must not
+/// unwind, re-enter V8 or cppgc, or pump an event loop. `host_context` is
+/// valid only during the synchronous callback that supplies it. Returned
+/// handles must be freshly owned hosts of the exact type installed through
+/// [`Runtime::install_media_query_list_host`].
+pub unsafe trait WindowHostBinding: Sized + 'static {
+    unsafe fn match_media(
+        &self,
+        host_context: *mut c_void,
+        query: &str,
+    ) -> Option<MediaQueryListHandle>;
+}
+
+/// A type-level host for one live `MediaQueryList`.
+///
+/// # Safety
+///
+/// Implementations and `Drop` must stay on the owning script thread, must not
+/// unwind, re-enter V8 or cppgc, or pump an event loop.
+pub unsafe trait MediaQueryListHostBinding: Sized + 'static {
+    fn get_matches(&self) -> bool;
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct WindowHostVTable {
+    pub match_media: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            *const u8,
+            usize,
+            *mut MediaQueryListHandle,
+        ) -> u8,
+    >,
+    pub drop: Option<DropCallback>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct MediaQueryListHostVTable {
+    pub get_matches: Option<unsafe extern "C" fn(*mut c_void, *mut u8) -> u8>,
+    pub drop: Option<DropCallback>,
+}
+
+unsafe extern "C" fn window_host_match_media<T: WindowHostBinding>(
+    native: *mut c_void,
+    host_context: *mut c_void,
+    query: *const u8,
+    query_length: usize,
+    output: *mut MediaQueryListHandle,
+) -> u8 {
+    if native.is_null() || output.is_null() || (query.is_null() && query_length != 0) {
+        return 0;
+    }
+    let bytes = if query_length == 0 {
+        &[]
+    } else {
+        // SAFETY: The C++ caller lends this exact byte range for the
+        // synchronous callback and retains it until the callback returns.
+        unsafe { std::slice::from_raw_parts(query, query_length) }
+    };
+    let Ok(query) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let Some(handle) = (unsafe { (&*native.cast::<T>()).match_media(host_context, query) }) else {
+        return 0;
+    };
+    if handle.native.is_null() {
+        return 0;
+    }
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = handle };
+    1
+}
+
+unsafe extern "C" fn window_host_drop<T: WindowHostBinding>(native: *mut c_void) {
+    if native.is_null() {
+        return;
+    }
+    // SAFETY: The bridge hands back exactly the Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+impl WindowHostVTable {
+    pub fn for_type<T: WindowHostBinding>() -> Self {
+        Self {
+            match_media: Some(window_host_match_media::<T>),
+            drop: Some(window_host_drop::<T>),
+        }
+    }
+}
+
+unsafe extern "C" fn media_query_list_host_get_matches<T: MediaQueryListHostBinding>(
+    native: *mut c_void,
+    output: *mut u8,
+) -> u8 {
+    if native.is_null() || output.is_null() {
+        return 0;
+    }
+    // SAFETY: The vtable contract supplies this exact live Box<T>.
+    let matches = unsafe { &*native.cast::<T>() }.get_matches();
+    // SAFETY: output is non-null and points to caller-owned writable storage.
+    unsafe { *output = u8::from(matches) };
+    1
+}
+
+unsafe extern "C" fn media_query_list_host_drop<T: MediaQueryListHostBinding>(native: *mut c_void) {
+    if native.is_null() {
+        return;
+    }
+    // SAFETY: The bridge hands back exactly the Box<T> it consumed, once.
+    drop(unsafe { Box::from_raw(native.cast::<T>()) });
+}
+
+impl MediaQueryListHostVTable {
+    pub fn for_type<T: MediaQueryListHostBinding>() -> Self {
+        Self {
+            get_matches: Some(media_query_list_host_get_matches::<T>),
+            drop: Some(media_query_list_host_drop::<T>),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2486,6 +2640,13 @@ unsafe extern "C" {
         vtable: *const TimerHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
+    fn servo_v8_realm_install_window_host(
+        runtime: *mut RawRuntime,
+        realm_id: RealmId,
+        native: *mut c_void,
+        vtable: *const WindowHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
     fn servo_v8_realm_install_console_host(
         runtime: *mut RawRuntime,
         realm_id: RealmId,
@@ -2526,6 +2687,11 @@ unsafe extern "C" {
     fn servo_v8_install_html_collection_host(
         runtime: *mut RawRuntime,
         vtable: *const HTMLCollectionHostVTable,
+        error: *mut ErrorBuffer,
+    ) -> i32;
+    fn servo_v8_install_media_query_list_host(
+        runtime: *mut RawRuntime,
+        vtable: *const MediaQueryListHostVTable,
         error: *mut ErrorBuffer,
     ) -> i32;
     fn servo_v8_install_engine_binding_smoke(
@@ -3067,6 +3233,25 @@ impl Runtime {
         Ok(())
     }
 
+    /// Registers the type-level host for MediaQueryLists returned by Window
+    /// `matchMedia`.
+    pub fn install_media_query_list_host<T: MediaQueryListHostBinding>(
+        &mut self,
+    ) -> Result<(), Error> {
+        let vtable = MediaQueryListHostVTable::for_type::<T>();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: The runtime is live and C++ copies the complete vtable
+        // synchronously before this method returns.
+        let succeeded = unsafe {
+            servo_v8_install_media_query_list_host(self.raw.as_ptr(), &vtable, &mut error)
+        };
+        if succeeded == 0 {
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
     /// Discards a retained classic script without executing it.
     pub fn discard_script_in_realm(
         &mut self,
@@ -3113,6 +3298,35 @@ impl Runtime {
         if succeeded == 0 {
             // SAFETY: C++ leaves native untouched on every failure path, so it
             // is still the exact Box<T> allocated above.
+            drop(unsafe { Box::from_raw(native.cast::<T>()) });
+            return Err(error_from(&storage, &error));
+        }
+        Ok(())
+    }
+
+    /// Installs one realm-owned host that implements Window `matchMedia`.
+    /// Failed installation leaves ownership with Rust.
+    pub fn install_window_host<T: WindowHostBinding>(
+        &mut self,
+        realm_id: RealmId,
+        host: T,
+    ) -> Result<(), Error> {
+        let vtable = WindowHostVTable::for_type::<T>();
+        let native = Box::into_raw(Box::new(host)).cast();
+        let mut storage = [0; ERROR_CAPACITY];
+        let mut error = error_buffer(&mut storage);
+        // SAFETY: native is one live Box<T>; C++ consumes it only on success.
+        let succeeded = unsafe {
+            servo_v8_realm_install_window_host(
+                self.raw.as_ptr(),
+                realm_id,
+                native,
+                &vtable,
+                &mut error,
+            )
+        };
+        if succeeded == 0 {
+            // SAFETY: Every C++ failure path leaves native untouched.
             drop(unsafe { Box::from_raw(native.cast::<T>()) });
             return Err(error_from(&storage, &error));
         }
@@ -3474,6 +3688,74 @@ mod tests {
         static CALLBACK_REENTRY_RUNTIME: Cell<*mut RawRuntime> = Cell::new(std::ptr::null_mut());
         static CALLBACK_REENTRY_ATTEMPTS: RefCell<Vec<(&'static str, i32, String)>> =
             const { RefCell::new(Vec::new()) };
+    }
+
+    struct MatchMediaWindowProbe;
+
+    unsafe impl WindowHostBinding for MatchMediaWindowProbe {
+        unsafe fn match_media(
+            &self,
+            _host_context: *mut c_void,
+            query: &str,
+        ) -> Option<MediaQueryListHandle> {
+            (query == "(min-width: 1px)").then_some(MediaQueryListHandle {
+                native: std::ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+            })
+        }
+    }
+
+    struct MatchMediaListProbe;
+
+    unsafe impl MediaQueryListHostBinding for MatchMediaListProbe {
+        fn get_matches(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn match_media_host_vtables_validate_and_dispatch() {
+        let window_vtable = WindowHostVTable::for_type::<MatchMediaWindowProbe>();
+        let window = Box::into_raw(Box::new(MatchMediaWindowProbe));
+        let mut handle = MediaQueryListHandle {
+            native: std::ptr::null_mut(),
+        };
+        let query = b"(min-width: 1px)";
+        assert_eq!(
+            unsafe {
+                window_vtable.match_media.unwrap()(
+                    window.cast(),
+                    std::ptr::null_mut(),
+                    query.as_ptr(),
+                    query.len(),
+                    &mut handle,
+                )
+            },
+            1
+        );
+        assert!(!handle.native.is_null());
+        assert_eq!(
+            unsafe {
+                window_vtable.match_media.unwrap()(
+                    window.cast(),
+                    std::ptr::null_mut(),
+                    [0xff].as_ptr(),
+                    1,
+                    &mut handle,
+                )
+            },
+            0
+        );
+        unsafe { window_vtable.drop.unwrap()(window.cast()) };
+
+        let list_vtable = MediaQueryListHostVTable::for_type::<MatchMediaListProbe>();
+        let list = Box::into_raw(Box::new(MatchMediaListProbe));
+        let mut matches = 0;
+        assert_eq!(
+            unsafe { list_vtable.get_matches.unwrap()(list.cast(), &mut matches) },
+            1
+        );
+        assert_eq!(matches, 1);
+        unsafe { list_vtable.drop.unwrap()(list.cast()) };
     }
 
     struct CallbackReentryConfig;

@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 47u
+#define SERVO_V8_ABI_VERSION 48u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
@@ -374,6 +374,31 @@ typedef struct ServoV8TimerHostVTable {
   ServoV8DropCallback drop;
 } ServoV8TimerHostVTable;
 
+/* A MediaQueryList object returned by a Window matchMedia host. The native
+ * pointer is owned by the bridge and is released through the installed
+ * MediaQueryList host vtable. */
+typedef struct ServoV8MediaQueryListHandle {
+  void* native;
+} ServoV8MediaQueryListHandle;
+
+/* A realm-owned host for Window.matchMedia. `host_context` is the live
+ * SpiderMonkey JSContext for the current V8 entry and may be used only
+ * synchronously. On success, the callback writes one owned MQL handle. */
+typedef struct ServoV8WindowHostVTable {
+  uint8_t (*match_media)(void* native,
+                         void* host_context,
+                         const uint8_t* query,
+                         size_t query_length,
+                         ServoV8MediaQueryListHandle* output);
+  ServoV8DropCallback drop;
+} ServoV8WindowHostVTable;
+
+/* A type-level host for one MediaQueryList's live `matches` state. */
+typedef struct ServoV8MediaQueryListHostVTable {
+  uint8_t (*get_matches)(void* native, uint8_t* output);
+  ServoV8DropCallback drop;
+} ServoV8MediaQueryListHostVTable;
+
 /* The supported console namespace logging levels. Values are stable ABI. */
 enum ServoV8ConsoleLevel {
   SERVO_V8_CONSOLE_DEBUG = 0,
@@ -501,6 +526,14 @@ int32_t servo_v8_realm_install_timer_host(
     ServoV8ErrorBuffer* error);
 
 /* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_window_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8WindowHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Consumes native only on success; failure leaves ownership with the caller. */
 int32_t servo_v8_realm_install_console_host(
     ServoV8Runtime* runtime,
     ServoV8RealmId realm_id,
@@ -546,6 +579,12 @@ int32_t servo_v8_install_node_list_host(
 int32_t servo_v8_install_html_collection_host(
     ServoV8Runtime* runtime,
     const ServoV8HTMLCollectionHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Registers the type-level MediaQueryList host vtable for this runtime. */
+int32_t servo_v8_install_media_query_list_host(
+    ServoV8Runtime* runtime,
+    const ServoV8MediaQueryListHostVTable* vtable,
     ServoV8ErrorBuffer* error);
 
 int32_t servo_v8_install_engine_binding_smoke(

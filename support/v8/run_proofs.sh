@@ -74,6 +74,7 @@ proofs=(
   "authoritative_character_data_proof.html:rendered:0:0"
   "authoritative_character_data_substring_proof.html:rendered:0:0"
   "authoritative_character_data_append_proof.html:rendered:0:0"
+  "authoritative_match_media_proof.html:rendered:0:0"
   # bgColor is set by the SpiderMonkey error handler, not by V8.
   "authoritative_job_error_proof.html:(0, 255, 0):0:0"
 )
@@ -146,6 +147,9 @@ PY
         ;;
       authoritative_character_data_append_proof.html)
         marker="RESULT characterData append v47 PASS text=Hello"
+        ;;
+      authoritative_match_media_proof.html)
+        marker="RESULT matchMedia v48 PASS"
         ;;
       *) marker="" ;;
     esac

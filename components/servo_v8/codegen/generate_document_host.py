@@ -204,6 +204,14 @@ def write_outputs(webidls_dir: Path, out_dir: Path) -> None:
             Path(cache_dir) / "timers",
             webidls_dir=webidls_dir,
         )
+        production_webidl.select_window_host_members(
+            Path(cache_dir) / "window",
+            webidls_dir=webidls_dir,
+        )
+        production_webidl.select_media_query_list_host_members(
+            Path(cache_dir) / "media_query_list",
+            webidls_dir=webidls_dir,
+        )
         production_webidl.select_console_host_members(
             Path(cache_dir) / "console",
             webidls_dir=webidls_dir,

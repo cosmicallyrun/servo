@@ -236,6 +236,49 @@ class ProductionDocumentHiddenTests(unittest.TestCase):
         )
 
 
+class ProductionMatchMediaTests(unittest.TestCase):
+    def test_selects_real_window_match_media(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_window_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(list(members), list(production_webidl.WINDOW_HOST))
+        method = members[production_webidl.WINDOW_MATCH_MEDIA]
+        self.assertEqual(set(method._extendedAttrDict), {"Exposed", "NewObject"})
+        return_type, arguments = method.signatures()[0]
+        self.assertFalse(return_type.nullable())
+        self.assertTrue(return_type.isInterface())
+        self.assertEqual(return_type.name, "MediaQueryList")
+        self.assertEqual(len(arguments), 1)
+        self.assertEqual(arguments[0].identifier.name, "query")
+        self.assertFalse(arguments[0].optional)
+        self.assertFalse(arguments[0].variadic)
+        self.assertIsNone(arguments[0].defaultValue)
+        self.assertFalse(arguments[0].type.nullable())
+        self.assertTrue(arguments[0].type.isDOMString())
+        self.assertFalse(arguments[0]._extendedAttrDict)
+        self.assertFalse(arguments[0].type._extendedAttrDict)
+
+    def test_selects_real_media_query_list_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            members = production_webidl.select_media_query_list_host_members(
+                Path(temporary_directory) / "cache",
+                environment={},
+            )
+
+        self.assertEqual(
+            list(members), list(production_webidl.MEDIA_QUERY_LIST_HOST)
+        )
+        matches = members[production_webidl.MEDIA_QUERY_LIST_MATCHES]
+        self.assertEqual(matches.identifier.name, "matches")
+        self.assertTrue(matches.readonly)
+        self.assertFalse(matches.type.nullable())
+        self.assertTrue(matches.type.isBoolean())
+        self.assertFalse(matches._extendedAttrDict)
+
+
 class ProductionTimerTests(unittest.TestCase):
     def test_pins_all_four_real_timer_operations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2250,6 +2293,66 @@ class SyntheticSelectionTests(unittest.TestCase):
                 parser_results,
                 f"WindowOrWorkerGlobalScope.{member}",
             )
+
+    def assert_match_media_rejected(self, declaration: str, expected: str) -> None:
+        parser_results = self.parse(
+            {
+                "Window.webidl": f"""
+                    [Exposed=Window]
+                    interface MediaQueryList {{}};
+                    [Global=Window, Exposed=Window]
+                    interface Window {{ {declaration} }};
+                """
+            }
+        )
+        with self.assertRaisesRegex(
+            production_webidl.WebIDLSelectionError,
+            re.escape(expected),
+        ):
+            production_webidl._select_window_match_media_operation(
+                parser_results,
+            )
+
+    def test_selects_window_match_media_operation(self) -> None:
+        parser_results = self.parse(
+            {
+                "Window.webidl": """
+                    [Exposed=Window]
+                    interface MediaQueryList {};
+                    [Global=Window, Exposed=Window]
+                    interface Window {
+                      [Exposed=(Window), NewObject]
+                      MediaQueryList matchMedia(DOMString query);
+                    };
+                """
+            }
+        )
+        method = production_webidl._select_window_match_media_operation(parser_results)
+        self.assertEqual(method.identifier.name, "matchMedia")
+
+    def test_rejects_match_media_without_newobject(self) -> None:
+        self.assert_match_media_rejected(
+            "[Exposed=(Window)] MediaQueryList matchMedia(DOMString query);",
+            "`Window.matchMedia` must carry exactly ['Exposed', 'NewObject'], got ['Exposed']",
+        )
+
+    def test_rejects_match_media_wrong_return_interface(self) -> None:
+        self.assert_match_media_rejected(
+            "[Exposed=(Window), NewObject] Window matchMedia(DOMString query);",
+            "`Window.matchMedia` must return non-nullable `MediaQueryList`, got `Window`",
+        )
+
+    def test_rejects_match_media_optional_query(self) -> None:
+        self.assert_match_media_rejected(
+            "[Exposed=(Window), NewObject] MediaQueryList matchMedia(optional DOMString query);",
+            "`Window.matchMedia` argument must be required non-nullable `DOMString query`",
+        )
+
+    def test_rejects_match_media_wrong_query_type(self) -> None:
+        self.assert_match_media_rejected(
+            "[Exposed=(Window), NewObject] MediaQueryList matchMedia(long query);",
+            "`Window.matchMedia` argument must be required non-nullable `DOMString query`",
+        )
 
     def test_selects_timer_operation_from_interface_mixin(self) -> None:
         parser_results = self.parse(

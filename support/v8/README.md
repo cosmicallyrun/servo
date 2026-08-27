@@ -1,5 +1,7 @@
 # Experimental Servo–V8 compile-shadow bridge
 
+The current bridge ABI is v48.
+
 The current build target is native Apple silicon (`aarch64-apple-darwin`). Linux
 ARM64 cross-compilation is intentionally deferred until the embedding boundary
 is farther along. This is not yet an alternate production JavaScript backend.
@@ -402,6 +404,12 @@ brands, conversion and thrown-value ordering, astral UTF-16 length after
 mutation, ordinary null/undefined conversion, generic Node identity, and
 SpiderMonkey visibility of the final Comment and rendered Text mutations.
 
+ABI v48 adds the production `Window.matchMedia(query)` surface and the live
+`MediaQueryList.matches` readonly accessor. The authoritative proof checks
+WebIDL descriptors, receiver and required-argument ordering, one-shot
+DOMString conversion with thrown-value identity, fresh wrappers, illegal
+construction, viewport evaluation, and the final cross-engine DOM marker.
+
 ## Compile real Servo scripts in the V8 shadow
 
 The non-default `v8-shadow` feature creates a V8 sidecar on Servo's main script
@@ -673,6 +681,7 @@ The proof suite uses that same counting argument:
 | `authoritative_character_data_proof.html` | CharacterData.data and length preserve shared Text/Comment inheritance, brand-before-conversion ordering, LegacyNullToEmptyString and UTF-16 semantics, generic Node identity, and cross-engine visibility of live Comment/Text mutation |
 | `authoritative_character_data_substring_proof.html` | CharacterData.substringData preserves its shared prototype, required and ordered unsigned-long conversion, UTF-16 slicing, IndexSizeError shape, owned-result safety, and final cross-engine DOM visibility |
 | `authoritative_character_data_append_proof.html` | CharacterData.appendData preserves its shared prototype, required DOMString conversion and exception ordering, synchronous live mutation, generic Node identity, and final cross-engine DOM visibility |
+| `authoritative_match_media_proof.html` | Window.matchMedia and MediaQueryList.matches preserve the v48 WebIDL surface, conversion/brand ordering, fresh wrappers, viewport values, and a cross-engine DOM marker |
 
 `support/v8/run_proofs.sh` runs all of them and checks both signals each one
 depends on, plus two cases it generates rather than commits: the
@@ -696,7 +705,7 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 47 and remains experimental. The original
+The current exported C ABI is version 48 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume

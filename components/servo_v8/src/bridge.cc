@@ -235,6 +235,7 @@ enum class ServoV8HostKind : uint8_t {
   kComment = SERVO_V8_INTERFACE_COMMENT,
   kNodeList,
   kHTMLCollection,
+  kMediaQueryList,
 };
 
 struct ServoV8HostCell final : public v8::Object::Wrappable {
@@ -305,6 +306,12 @@ struct ServoV8DocumentHostState {
   ServoV8DocumentHostVTable vtable{};
 };
 
+struct ServoV8WindowHostState {
+  ServoV8Runtime* runtime = nullptr;
+  void* native = nullptr;
+  ServoV8WindowHostVTable vtable{};
+};
+
 struct ServoV8TimerHostState {
   ServoV8Runtime* runtime = nullptr;
   void* native = nullptr;
@@ -365,9 +372,13 @@ struct ServoV8RealmState {
   v8::Global<v8::ObjectTemplate> html_collection_template;
   v8::Global<v8::Object> html_collection_prototype;
   v8::Global<v8::Function> html_collection_constructor;
+  v8::Global<v8::ObjectTemplate> media_query_list_template;
+  v8::Global<v8::Object> media_query_list_prototype;
+  v8::Global<v8::Function> media_query_list_constructor;
   v8::Global<v8::Function> dom_exception_constructor;
   v8::Global<v8::Object> dom_exception_prototype;
   ServoV8DocumentHostState document_host;
+  ServoV8WindowHostState window_host;
   ServoV8TimerHostState timer_host;
   ServoV8ConsoleHostState console_host;
   bool tearing_down = false;
@@ -417,6 +428,8 @@ struct ServoV8Runtime {
   bool node_list_host_installed = false;
   ServoV8HTMLCollectionHostVTable html_collection_host_vtable{};
   bool html_collection_host_installed = false;
+  ServoV8MediaQueryListHostVTable media_query_list_host_vtable{};
+  bool media_query_list_host_installed = false;
   bool expose_gc = false;
 };
 
@@ -772,6 +785,14 @@ void DropUnownedHTMLCollectionHost(ServoV8Runtime* runtime, void* native) {
   if (!runtime || !native || !runtime->html_collection_host_vtable.drop) return;
   RustCallbackScope callback_scope(runtime);
   runtime->html_collection_host_vtable.drop(native);
+}
+
+void DropUnownedMediaQueryListHost(ServoV8Runtime* runtime, void* native) {
+  if (!runtime || !native || !runtime->media_query_list_host_vtable.drop) {
+    return;
+  }
+  RustCallbackScope callback_scope(runtime);
+  runtime->media_query_list_host_vtable.drop(native);
 }
 
 v8::Local<v8::Private> DomExceptionBrandKey(v8::Isolate* isolate) {
@@ -1464,6 +1485,49 @@ v8::Local<v8::Object> WrapperForNodeListHost(
     }
   }
 
+  realm->uncached_hosts.emplace_back(cell);
+  pending.Clear();
+  return wrapper;
+}
+
+v8::Local<v8::Object> WrapperForMediaQueryListHost(
+    ServoV8RealmState* realm,
+    v8::Local<v8::Context> context,
+    void* native) {
+  ServoV8Runtime* runtime = realm->runtime;
+  v8::Isolate* isolate = runtime->isolate;
+  const ServoV8MediaQueryListHostVTable& vtable =
+      runtime->media_query_list_host_vtable;
+  auto fail = [&]() {
+    DropUnownedMediaQueryListHost(runtime, native);
+    return v8::Local<v8::Object>();
+  };
+
+  if (!native || !runtime->media_query_list_host_installed ||
+      !vtable.get_matches || !vtable.drop ||
+      realm->media_query_list_template.IsEmpty() ||
+      realm->media_query_list_prototype.IsEmpty()) {
+    return fail();
+  }
+
+  v8::Local<v8::Object> wrapper;
+  if (!realm->media_query_list_template.Get(isolate)
+           ->NewInstance(context)
+           .ToLocal(&wrapper) ||
+      !wrapper
+           ->SetPrototype(context,
+                          realm->media_query_list_prototype.Get(isolate))
+           .FromMaybe(false)) {
+    return fail();
+  }
+
+  v8::CppHeap* cpp_heap = isolate->GetCppHeap();
+  auto* cell = cppgc::MakeGarbageCollected<ServoV8HostCell>(
+      cpp_heap->GetAllocationHandle(), runtime, native, vtable.drop, nullptr,
+      ServoV8HostKind::kMediaQueryList);
+  cppgc::Persistent<ServoV8HostCell> pending(cell);
+  v8::Object::Wrap<kServoHostTag>(isolate, wrapper, cell);
+  cell->SetWrapper(isolate, wrapper);
   realm->uncached_hosts.emplace_back(cell);
   pending.Clear();
   return wrapper;
@@ -4280,6 +4344,181 @@ ServoV8RealmState* CallbackRealm(
   return realm;
 }
 
+ServoV8HostCell* UnwrapMediaQueryListHostCell(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Local<v8::Value> receiver = info.This();
+  if (!receiver->IsObject()) return nullptr;
+  auto* cell = v8::Object::Unwrap<kServoHostTag, ServoV8HostCell>(
+      info.GetIsolate(), receiver.As<v8::Object>());
+  return cell && cell->kind() == ServoV8HostKind::kMediaQueryList ? cell
+                                                                  : nullptr;
+}
+
+bool MediaQueryListHostCallbackState(
+    const v8::FunctionCallbackInfo<v8::Value>& info,
+    ServoV8RealmState** realm_output,
+    void** native_output) {
+  v8::Isolate* isolate = info.GetIsolate();
+  auto* realm = static_cast<ServoV8RealmState*>(
+      info.This()->GetAlignedPointerFromEmbedderDataInCreationContext(
+          isolate, kServoRealmStateEmbedderSlot, kServoRealmStateEmbedderTag));
+  ServoV8HostCell* cell = UnwrapMediaQueryListHostCell(info);
+  if (!realm || realm->tearing_down || !realm->runtime ||
+      realm->runtime->isolate != isolate || realm->context.IsEmpty() ||
+      realm->context.Get(isolate) != isolate->GetCurrentContext() || !cell ||
+      !cell->native() ||
+      !realm->runtime->media_query_list_host_installed) {
+    ThrowTypeError(isolate, "invalid MediaQueryList host state");
+    return false;
+  }
+  if (realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "re-entrant MediaQueryList host callback");
+    return false;
+  }
+  *realm_output = realm;
+  *native_output = cell->native();
+  return true;
+}
+
+void MediaQueryListHostGetMatches(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = nullptr;
+  void* native = nullptr;
+  if (!MediaQueryListHostCallbackState(info, &realm, &native)) return;
+  uint8_t matches = 0;
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->runtime->media_query_list_host_vtable.get_matches(
+                    native, &matches) != 0;
+  }
+  if (!succeeded || matches > 1) {
+    ThrowTypeError(isolate, "MediaQueryList.matches host callback failed");
+    return;
+  }
+  info.GetReturnValue().Set(matches != 0);
+}
+
+void MediaQueryListIllegalConstructor(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  ThrowTypeError(info.GetIsolate(), "Illegal constructor");
+}
+
+void WindowHostMatchMedia(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  ServoV8RealmState* realm = CallbackRealm(info);
+  if (!realm || !info.This()->StrictEquals(isolate->GetCurrentContext()->Global()) ||
+      !realm->window_host.native ||
+      !realm->window_host.vtable.match_media ||
+      !realm->runtime->media_query_list_host_installed ||
+      realm->runtime->rust_callback_depth != 0) {
+    ThrowTypeError(isolate, "invalid Window matchMedia host state");
+    return;
+  }
+  if (info.Length() < 1) {
+    ThrowTypeError(isolate, "Window.matchMedia requires 1 argument");
+    return;
+  }
+  if (!realm->document_host.active_host_context) {
+    ThrowTypeError(isolate, "Window.matchMedia requires a live host context");
+    return;
+  }
+
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::String> string;
+  if (!info[0]->ToString(context).ToLocal(&string)) return;
+  v8::String::Utf8Value utf8(isolate, string);
+  if (!*utf8 && utf8.length() != 0) return;
+
+  ServoV8MediaQueryListHandle handle{};
+  bool succeeded = false;
+  {
+    RustCallbackScope callback_scope(realm->runtime);
+    succeeded = realm->window_host.vtable.match_media(
+                    realm->window_host.native,
+                    realm->document_host.active_host_context,
+                    reinterpret_cast<const uint8_t*>(*utf8),
+                    static_cast<size_t>(utf8.length()), &handle) != 0;
+  }
+  if (!succeeded || !handle.native) {
+    DropUnownedMediaQueryListHost(realm->runtime, handle.native);
+    ThrowTypeError(isolate, "Window.matchMedia host callback failed");
+    return;
+  }
+  v8::Local<v8::Object> wrapper =
+      WrapperForMediaQueryListHost(realm, context, handle.native);
+  if (wrapper.IsEmpty()) {
+    ThrowTypeError(isolate, "MediaQueryList wrapper could not be created");
+    return;
+  }
+  info.GetReturnValue().Set(wrapper);
+}
+
+bool InstallMediaQueryListInterface(ServoV8RealmState* realm,
+                                    v8::Local<v8::Context> context,
+                                    v8::Local<v8::Object> global) {
+  v8::Isolate* isolate = realm->runtime->isolate;
+  v8::Local<v8::FunctionTemplate> constructor_template =
+      v8::FunctionTemplate::New(isolate, MediaQueryListIllegalConstructor);
+  constructor_template->SetClassName(V8String(isolate, "MediaQueryList"));
+  v8::Local<v8::ObjectTemplate> instance_template =
+      constructor_template->InstanceTemplate();
+  v8::Local<v8::Function> constructor;
+  if (!constructor_template->GetFunction(context).ToLocal(&constructor)) {
+    return false;
+  }
+  v8::Local<v8::Value> prototype_value;
+  if (!constructor->Get(context, V8String(isolate, "prototype"))
+           .ToLocal(&prototype_value) ||
+      !prototype_value->IsObject()) {
+    return false;
+  }
+  v8::Local<v8::Object> prototype = prototype_value.As<v8::Object>();
+  v8::Local<v8::Function> matches_getter;
+  if (!v8::Function::New(context, MediaQueryListHostGetMatches, {}, 0,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasNoSideEffect)
+           .ToLocal(&matches_getter)) {
+    return false;
+  }
+  matches_getter->SetName(V8String(isolate, "get matches"));
+  prototype->SetAccessorProperty(V8String(isolate, "matches"), matches_getter,
+                                 v8::Local<v8::Function>(), v8::None);
+
+  v8::Local<v8::Value> callback_data =
+      v8::BigInt::NewFromUnsigned(isolate, realm->id);
+  v8::Local<v8::Function> match_media;
+  if (!v8::Function::New(context, WindowHostMatchMedia, callback_data, 1,
+                         v8::ConstructorBehavior::kThrow,
+                         v8::SideEffectType::kHasSideEffect)
+           .ToLocal(&match_media)) {
+    return false;
+  }
+  match_media->SetName(V8String(isolate, "matchMedia"));
+  if (!prototype
+           ->DefineOwnProperty(context, v8::Symbol::GetToStringTag(isolate),
+                               V8String(isolate, "MediaQueryList"),
+                               static_cast<v8::PropertyAttribute>(
+                                   v8::ReadOnly | v8::DontEnum))
+           .FromMaybe(false) ||
+      !global
+           ->DefineOwnProperty(context, V8String(isolate, "MediaQueryList"),
+                               constructor, v8::DontEnum)
+           .FromMaybe(false) ||
+      !global
+           ->DefineOwnProperty(context, V8String(isolate, "matchMedia"),
+                               match_media, v8::None)
+           .FromMaybe(false)) {
+    return false;
+  }
+  realm->media_query_list_template.Reset(isolate, instance_template);
+  realm->media_query_list_prototype.Reset(isolate, prototype);
+  realm->media_query_list_constructor.Reset(isolate, constructor);
+  return true;
+}
+
 bool TimerDelay(v8::Local<v8::Context> context,
                 const v8::FunctionCallbackInfo<v8::Value>& info,
                 int32_t* timeout_ms) {
@@ -4631,6 +4870,16 @@ void ResetDocumentHost(ServoV8DocumentHostState* state) {
   }
 }
 
+void ResetWindowHost(ServoV8WindowHostState* state) {
+  void* native = std::exchange(state->native, nullptr);
+  const ServoV8DropCallback drop = state->vtable.drop;
+  state->vtable = {};
+  if (native && drop) {
+    RustCallbackScope callback_scope(state->runtime);
+    drop(native);
+  }
+}
+
 void ResetTimerHost(ServoV8TimerHostState* state) {
   void* native = std::exchange(state->native, nullptr);
   const ServoV8DropCallback drop = state->vtable.drop;
@@ -4730,12 +4979,16 @@ void DetachRealm(ServoV8Runtime* runtime, ServoV8RealmState* realm) {
   realm->html_collection_template.Reset();
   realm->html_collection_prototype.Reset();
   realm->html_collection_constructor.Reset();
+  realm->media_query_list_template.Reset();
+  realm->media_query_list_prototype.Reset();
+  realm->media_query_list_constructor.Reset();
   realm->dom_exception_constructor.Reset();
   realm->dom_exception_prototype.Reset();
   realm->document.Reset();
   realm->context.Reset();
   ResetConsoleHost(&realm->console_host);
   ResetTimerHost(&realm->timer_host);
+  ResetWindowHost(&realm->window_host);
   ResetDocumentHost(&realm->document_host);
   runtime->isolate->ContextDisposedNotification(
       v8::ContextDependants::kSomeDependants);
@@ -4980,6 +5233,7 @@ extern "C" int32_t servo_v8_realm_create(
   const ServoV8RealmId id = runtime->next_realm_id++;
   realm->id = id;
   realm->document_host.runtime = runtime;
+  realm->window_host.runtime = runtime;
   realm->timer_host.runtime = runtime;
   realm->console_host.runtime = runtime;
   v8::Local<v8::Context> context = v8::Context::New(isolate);
@@ -5063,6 +5317,7 @@ extern "C" int32_t servo_v8_realm_create(
   v8::Local<v8::Object> comment_prototype = v8::Object::New(isolate);
   if (!InstallNodeListInterface(realm.get(), context, global) ||
       !InstallHTMLCollectionInterface(realm.get(), context, global) ||
+      !InstallMediaQueryListInterface(realm.get(), context, global) ||
       !InstallNodePrototype(realm.get(), context, node_prototype) ||
       !InstallCharacterDataPrototype(realm.get(), context, character_data_prototype) ||
       !InstallElementPrototype(realm.get(), context, element_prototype) ||
@@ -5446,6 +5701,37 @@ extern "C" int32_t servo_v8_realm_install_document_host(
   return 1;
 }
 
+extern "C" int32_t servo_v8_realm_install_window_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8WindowHostVTable* vtable,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!native) {
+    WriteError(error, "Window host native pointer is null");
+    return 0;
+  }
+  if (!vtable || !vtable->match_media || !vtable->drop) {
+    WriteError(error, "Window host vtable is incomplete");
+    return 0;
+  }
+  ServoV8RealmState* realm = FindRealm(runtime, realm_id, error);
+  if (!realm) return 0;
+  if (realm->tearing_down) {
+    WriteError(error, "cannot install a Window host while its realm tears down");
+    return 0;
+  }
+  if (realm->window_host.native) {
+    WriteError(error, "Window host is already installed in this realm");
+    return 0;
+  }
+  realm->window_host.native = native;
+  realm->window_host.vtable = *vtable;
+  return 1;
+}
+
 extern "C" int32_t servo_v8_realm_install_timer_host(
     ServoV8Runtime* runtime,
     ServoV8RealmId realm_id,
@@ -5714,6 +6000,25 @@ extern "C" int32_t servo_v8_install_html_collection_host(
   }
   runtime->html_collection_host_vtable = *vtable;
   runtime->html_collection_host_installed = true;
+  return 1;
+}
+
+extern "C" int32_t servo_v8_install_media_query_list_host(
+    ServoV8Runtime* runtime,
+    const ServoV8MediaQueryListHostVTable* vtable,
+    ServoV8ErrorBuffer* error) {
+  ClearError(error);
+  if (!CheckRuntime(runtime, error)) return 0;
+  if (!vtable || !vtable->get_matches || !vtable->drop) {
+    WriteError(error, "MediaQueryList host vtable is incomplete");
+    return 0;
+  }
+  if (runtime->media_query_list_host_installed) {
+    WriteError(error, "MediaQueryList host is already installed");
+    return 0;
+  }
+  runtime->media_query_list_host_vtable = *vtable;
+  runtime->media_query_list_host_installed = true;
   return 1;
 }
 

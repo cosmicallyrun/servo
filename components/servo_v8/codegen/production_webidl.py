@@ -71,6 +71,8 @@ WINDOW_OR_WORKER_SET_TIMEOUT = "WindowOrWorkerGlobalScope.setTimeout"
 WINDOW_OR_WORKER_CLEAR_TIMEOUT = "WindowOrWorkerGlobalScope.clearTimeout"
 WINDOW_OR_WORKER_SET_INTERVAL = "WindowOrWorkerGlobalScope.setInterval"
 WINDOW_OR_WORKER_CLEAR_INTERVAL = "WindowOrWorkerGlobalScope.clearInterval"
+WINDOW_MATCH_MEDIA = "Window.matchMedia"
+MEDIA_QUERY_LIST_MATCHES = "MediaQueryList.matches"
 CONSOLE_DEBUG = "console.debug"
 CONSOLE_ERROR = "console.error"
 CONSOLE_INFO = "console.info"
@@ -154,6 +156,12 @@ CREATE_DOCUMENT_FRAGMENT = "NewObject createDocumentFragment"
 CREATE_TEXT_NODE = "NewObject DOMString createTextNode"
 CREATE_COMMENT = "NewObject DOMString createComment"
 
+# These are global Window and returned MediaQueryList surfaces rather than
+# Document members. They are gated separately because the V8 bridge installs
+# matchMedia on the Window global and wraps each returned list as a NewObject.
+WINDOW_HOST = (WINDOW_MATCH_MEDIA,)
+MEDIA_QUERY_LIST_HOST = (MEDIA_QUERY_LIST_MATCHES,)
+
 # Extended attributes change conversion, reaction, and lifetime semantics that
 # the generated glue implements literally, so an unlisted one is silently wrong
 # rather than merely unsupported. Each selector therefore allows exactly what its
@@ -189,6 +197,7 @@ CREATE_DOCUMENT_FRAGMENT_EXTENDED_ATTRIBUTES = frozenset({"NewObject"})
 CREATE_TEXT_NODE_EXTENDED_ATTRIBUTES = frozenset({"NewObject"})
 CREATE_COMMENT_EXTENDED_ATTRIBUTES = frozenset({"NewObject"})
 SAMEOBJECT_READONLY_INTERFACE_EXTENDED_ATTRIBUTES = frozenset({"SameObject"})
+WINDOW_MATCH_MEDIA_EXTENDED_ATTRIBUTES = frozenset({"Exposed", "NewObject"})
 
 # An enum crosses the ABI as its string value, so the generated glue is only
 # correct for the exact value set it was written against. Pinning the set makes
@@ -1225,6 +1234,104 @@ def _select_domstring_to_nullable_interface_operation(
         )
 
     return member
+
+
+def _select_window_match_media_operation(
+    parser_results: Sequence[WebIDL.IDLObjectWithIdentifier],
+    qualified_name: str = WINDOW_MATCH_MEDIA,
+) -> WebIDL.IDLMethod:
+    """Select Window.matchMedia's exact NewObject DOMString shape."""
+
+    interface_name, member_name = _split_qualified_name(qualified_name)
+    interfaces = [
+        result
+        for result in parser_results
+        if result.isInterface() and result.identifier.name == interface_name
+    ]
+    if len(interfaces) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one interface `{interface_name}`, found {len(interfaces)}"
+        )
+    members = [member for member in interfaces[0].members if member.identifier.name == member_name]
+    if len(members) != 1:
+        raise WebIDLSelectionError(
+            f"expected exactly one member `{qualified_name}`, found {len(members)}"
+        )
+
+    member = members[0]
+    if not member.isMethod() or member.isStatic() or member.isSpecial():
+        raise WebIDLSelectionError(f"`{qualified_name}` must be an ordinary instance operation")
+    actual_attributes = set(member._extendedAttrDict)
+    if actual_attributes != WINDOW_MATCH_MEDIA_EXTENDED_ATTRIBUTES:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must carry exactly "
+            f"{sorted(WINDOW_MATCH_MEDIA_EXTENDED_ATTRIBUTES)}, "
+            f"got {sorted(actual_attributes)}"
+        )
+
+    signatures = member.signatures()
+    if len(signatures) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must have exactly one signature, found {len(signatures)}"
+        )
+    return_type, arguments = signatures[0]
+    if return_type.nullable() or not return_type.isInterface() or return_type.name != "MediaQueryList":
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must return non-nullable `MediaQueryList`, "
+            f"got `{return_type.prettyName()}`"
+        )
+    if len(arguments) != 1:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` must take exactly one argument, found {len(arguments)}"
+        )
+    argument = arguments[0]
+    if (
+        argument.identifier.name != "query"
+        or argument.optional
+        or argument.variadic
+        or argument.defaultValue is not None
+        or argument.type.nullable()
+        or not argument.type.isDOMString()
+    ):
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument must be required non-nullable `DOMString query`"
+        )
+    argument_attributes = set(argument._extendedAttrDict) | set(argument.type._extendedAttrDict)
+    if argument_attributes:
+        raise WebIDLSelectionError(
+            f"`{qualified_name}` argument `query` carries extended attributes that are not "
+            "implemented: "
+            + ", ".join(sorted(argument_attributes))
+        )
+    return member
+
+
+def select_window_host_members(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> dict[str, WebIDL.IDLMethod]:
+    """Load the production corpus and pin the Window.matchMedia slice."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return {
+        qualified_name: _select_window_match_media_operation(parser_results, qualified_name)
+        for qualified_name in WINDOW_HOST
+    }
+
+
+def select_media_query_list_host_members(
+    cache_dir: Path,
+    environment: Mapping[str, str] | None = None,
+    webidls_dir: Path = PRODUCTION_WEBIDLS_DIR,
+) -> dict[str, WebIDL.IDLAttribute]:
+    """Load the production corpus and pin MediaQueryList.matches."""
+
+    parser_results = parse_webidl_corpus(webidls_dir, cache_dir, environment)
+    return {
+        qualified_name: select_readonly_boolean_attribute(parser_results, qualified_name)
+        for qualified_name in MEDIA_QUERY_LIST_HOST
+    }
 
 
 def _select_timer_operation(

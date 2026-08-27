@@ -135,6 +135,8 @@ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
 };
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
+#[cfg(feature = "v8-shadow")]
+use crate::dom::bindings::codegen::Bindings::MediaQueryListBinding::MediaQueryListMethods;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
@@ -177,6 +179,8 @@ use crate::dom::globalscope::GlobalScope;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::html::htmlcollection::matches_qual_tag_name;
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, ProcessingMode};
+#[cfg(feature = "v8-shadow")]
+use crate::dom::mediaquerylist::MediaQueryList;
 #[cfg(feature = "v8-shadow")]
 use crate::dom::node::iterators::ShadowIncluding;
 use crate::dom::node::{Node, NodeTraits};
@@ -1339,6 +1343,58 @@ struct V8DocumentHost {
 #[cfg(feature = "v8-shadow")]
 struct V8ConsoleHost {
     document: Trusted<Document>,
+}
+
+#[cfg(feature = "v8-shadow")]
+struct V8WindowHost {
+    window: Trusted<Window>,
+}
+
+#[cfg(feature = "v8-shadow")]
+struct V8MediaQueryListHost {
+    media_query_list: Trusted<MediaQueryList>,
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: The host is confined to the Window's script thread. It roots the
+// returned MediaQueryList for V8 and uses the supplied JSContext only during
+// the synchronous callback; it never retains or re-enters V8.
+unsafe impl servo_v8::WindowHostBinding for V8WindowHost {
+    unsafe fn match_media(
+        &self,
+        host_context: *mut c_void,
+        query: &str,
+    ) -> Option<servo_v8::MediaQueryListHandle> {
+        if host_context.is_null() {
+            return None;
+        }
+
+        // SAFETY: The authoritative V8 entry lends this owner-thread context
+        // for exactly the duration of this synchronous host callback.
+        let cx = unsafe { &mut *host_context.cast::<JSContext>() };
+        let media_query_list = self.window.root().MatchMedia(cx, DOMString::from(query));
+        if unsafe { JS_IsExceptionPending(cx) } {
+            unsafe { JS_ClearPendingException(cx) };
+            return None;
+        }
+
+        Some(unsafe {
+            servo_v8::MediaQueryListHandle::new(V8MediaQueryListHost {
+                media_query_list: Trusted::new(&*media_query_list),
+            })
+        })
+    }
+}
+
+#[cfg(feature = "v8-shadow")]
+#[expect(unsafe_code)]
+// SAFETY: The host remains on the MediaQueryList's originating script thread
+// and only performs the synchronous, readonly Servo getter.
+unsafe impl servo_v8::MediaQueryListHostBinding for V8MediaQueryListHost {
+    fn get_matches(&self) -> bool {
+        self.media_query_list.root().Matches()
+    }
 }
 
 #[cfg(feature = "v8-shadow")]
@@ -2697,6 +2753,22 @@ impl ScriptThread {
                     return Err(format!("Document host installation failed: {error}"));
                 }
 
+                if let Err(error) = shadow.runtime.install_window_host(
+                    realm_id,
+                    V8WindowHost {
+                        window: Trusted::new(document.window()),
+                    },
+                ) {
+                    if let Err(cleanup_error) = shadow.runtime.destroy_realm(realm_id) {
+                        reset_entire_state = true;
+                        return Err(format!(
+                            "Window host installation failed: {error}; fresh realm cleanup \
+                             also failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(format!("Window host installation failed: {error}"));
+                }
+
                 if let Err(error) = shadow.runtime.install_console_host(
                     realm_id,
                     V8ConsoleHost {
@@ -3417,6 +3489,10 @@ impl ScriptThread {
                 }
                 if let Err(error) = runtime.install_html_collection_host::<V8HTMLCollectionHost>() {
                     panic!("V8 HTMLCollection host installation failed: {error}");
+                }
+                if let Err(error) = runtime.install_media_query_list_host::<V8MediaQueryListHost>()
+                {
+                    panic!("V8 MediaQueryList host installation failed: {error}");
                 }
                 Some(V8ShadowState {
                     runtime,
