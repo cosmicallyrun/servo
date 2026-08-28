@@ -1,0 +1,175 @@
+<!doctype html>
+<!--
+Runtime proof for the first scalar Element WebIDL slice.
+
+The shared cppgc-backed Element prototype exposes localName, tagName, id,
+className, hasAttributes(), getAttribute(), and hasAttribute(). The script
+checks WebIDL placement and descriptors, brand-before-conversion ordering,
+DOMString failures, nullable results, live Servo mutation, and wrapper identity
+before toggling the body from red to lime exactly once.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Element scalar proof</title>
+  </head>
+  <body bgcolor="red">
+    <div id="target" class="alpha beta" data-proof="present"></div>
+    <script data-servo-v8="authoritative">
+      var target = document.getElementById("target");
+      var prototype = Object.getPrototypeOf(target);
+      if (
+        target === null ||
+        prototype !== Object.getPrototypeOf(document.documentElement)
+      ) {
+        throw new Error("Element wrappers did not share one realm prototype");
+      }
+
+      var readonlyNames = ["localName", "tagName"];
+      var writableNames = ["id", "className"];
+      for (var name of readonlyNames.concat(writableNames)) {
+        var descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+        if (
+          Object.hasOwn(target, name) ||
+          !descriptor ||
+          typeof descriptor.get !== "function" ||
+          descriptor.get.name !== "get " + name ||
+          descriptor.get.length !== 0 ||
+          !descriptor.enumerable ||
+          !descriptor.configurable ||
+          (readonlyNames.includes(name)
+            ? descriptor.set !== undefined
+            : typeof descriptor.set !== "function" ||
+              descriptor.set.name !== "set " + name ||
+              descriptor.set.length !== 1)
+        ) {
+          throw new Error(name + " accessor descriptor is wrong");
+        }
+      }
+
+      var operationLengths = {
+        hasAttributes: 0,
+        getAttribute: 1,
+        hasAttribute: 1,
+      };
+      for (var name in operationLengths) {
+        var descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+        if (
+          Object.hasOwn(target, name) ||
+          !descriptor ||
+          typeof descriptor.value !== "function" ||
+          descriptor.value.name !== name ||
+          descriptor.value.length !== operationLengths[name] ||
+          !descriptor.writable ||
+          !descriptor.enumerable ||
+          !descriptor.configurable
+        ) {
+          throw new Error(name + " operation descriptor is wrong");
+        }
+      }
+
+      var wrongBrandStringified = false;
+      var wrongBrandRejected = false;
+      try {
+        prototype.getAttribute.call({}, {
+          toString() {
+            wrongBrandStringified = true;
+            return "id";
+          },
+        });
+      } catch (error) {
+        wrongBrandRejected = error instanceof TypeError;
+      }
+      var setterWrongBrandRejected = false;
+      try {
+        Object.getOwnPropertyDescriptor(prototype, "id").set.call({}, {
+          toString() {
+            wrongBrandStringified = true;
+            return "bad";
+          },
+        });
+      } catch (error) {
+        setterWrongBrandRejected = error instanceof TypeError;
+      }
+      if (
+        !wrongBrandRejected ||
+        !setterWrongBrandRejected ||
+        wrongBrandStringified
+      ) {
+        throw new Error("Element brand check ran after DOMString conversion");
+      }
+
+      var conversionError = new Error("Element conversion sentinel");
+      var preservedConversionError = false;
+      try {
+        target.getAttribute({
+          toString() {
+            throw conversionError;
+          },
+        });
+      } catch (error) {
+        preservedConversionError = error === conversionError;
+      }
+      var rejectedSymbol = false;
+      try {
+        target.hasAttribute(Symbol("id"));
+      } catch (error) {
+        rejectedSymbol = error instanceof TypeError;
+      }
+      var rejectedMissing = false;
+      try {
+        target.getAttribute();
+      } catch (error) {
+        rejectedMissing = error instanceof TypeError;
+      }
+      if (!preservedConversionError || !rejectedSymbol || !rejectedMissing) {
+        throw new Error("Element DOMString failure semantics are wrong");
+      }
+
+      if (
+        target.localName !== "div" ||
+        target.tagName !== "DIV" ||
+        target.id !== "target" ||
+        target.className !== "alpha beta" ||
+        !target.hasAttributes() ||
+        target.getAttribute("DATA-PROOF") !== "present" ||
+        target.getAttribute("missing") !== null ||
+        !target.hasAttribute("ID") ||
+        target.hasAttribute("missing")
+      ) {
+        throw new Error("initial Element scalar values are wrong");
+      }
+
+      var idConversions = 0;
+      var setterResult = Object.getOwnPropertyDescriptor(
+        prototype,
+        "id",
+      ).set.call(
+        target,
+        {
+          toString() {
+            idConversions++;
+            return "changed-id";
+          },
+        },
+      );
+      target.className = null;
+      if (
+        setterResult !== undefined ||
+        idConversions !== 1 ||
+        target.id !== "changed-id" ||
+        target.className !== "null" ||
+        target.getAttribute("id") !== "changed-id" ||
+        target.getAttribute("class") !== "null" ||
+        document.getElementById("target") !== null ||
+        document.getElementById("changed-id") !== target
+      ) {
+        throw new Error("Element mutation did not reach the live Servo DOM");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

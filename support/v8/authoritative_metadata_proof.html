@@ -1,0 +1,95 @@
+<!doctype html>
+<!--
+Runtime proof for generated readonly USVString and DOMString metadata getters.
+
+Every member is a configurable, enumerable prototype accessor with a strict
+Document brand check. The page pins deterministic values and the format of the
+time-dependent lastModified value.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative metadata proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      var expected = {
+        documentURI: document.URL,
+        compatMode: "CSS1Compat",
+        characterSet: "UTF-8",
+        charset: "UTF-8",
+        inputEncoding: "UTF-8",
+        contentType: "text/html",
+        referrer: "",
+      };
+      var prototype = Object.getPrototypeOf(document);
+      for (var name of Object.keys(expected)) {
+        var descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+        if (
+          Object.hasOwn(document, name) ||
+          !descriptor ||
+          typeof descriptor.get !== "function" ||
+          descriptor.set !== undefined ||
+          !descriptor.enumerable ||
+          !descriptor.configurable ||
+          descriptor.get.name !== "get " + name ||
+          descriptor.get.length !== 0
+        ) {
+          throw new Error(name + " descriptor is wrong");
+        }
+        var rejectedWrongBrand = false;
+        try {
+          descriptor.get.call({});
+        } catch (error) {
+          rejectedWrongBrand = error instanceof TypeError;
+        }
+        if (!rejectedWrongBrand) {
+          throw new Error(name + " accepted a foreign receiver");
+        }
+        if (document[name] !== expected[name]) {
+          throw new Error(
+            name + " expected " + expected[name] + ", got " + document[name],
+          );
+        }
+      }
+      if (
+        document.charset !== document.characterSet ||
+        document.inputEncoding !== document.characterSet
+      ) {
+        throw new Error("encoding aliases disagree");
+      }
+
+      var lastModifiedDescriptor = Object.getOwnPropertyDescriptor(
+        prototype,
+        "lastModified",
+      );
+      if (
+        !lastModifiedDescriptor ||
+        typeof lastModifiedDescriptor.get !== "function" ||
+        lastModifiedDescriptor.set !== undefined ||
+        !lastModifiedDescriptor.enumerable ||
+        !lastModifiedDescriptor.configurable ||
+        lastModifiedDescriptor.get.name !== "get lastModified" ||
+        lastModifiedDescriptor.get.length !== 0 ||
+        !/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/.test(
+          document.lastModified,
+        )
+      ) {
+        throw new Error("lastModified descriptor or value is wrong");
+      }
+      var rejectedLastModifiedBrand = false;
+      try {
+        lastModifiedDescriptor.get.call({});
+      } catch (error) {
+        rejectedLastModifiedBrand = error instanceof TypeError;
+      }
+      if (!rejectedLastModifiedBrand) {
+        throw new Error("lastModified accepted a foreign receiver");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

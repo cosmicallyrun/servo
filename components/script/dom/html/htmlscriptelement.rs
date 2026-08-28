@@ -777,12 +777,22 @@ impl HTMLScriptElement {
 
         let kind = self.get_script_kind(script_type);
         let delayed_document = self.get_script_active_document(kind);
+        // Every classic-script execution mode routes through the same
+        // create/run pair, so the engine choice does not depend on the kind.
+        // Deferred and async scripts widen the window between compiling into
+        // the realm and running, which is why both sides fail the script
+        // rather than aborting when the sidecar or realm has gone.
+        //
+        // Module scripts stay on SpiderMonkey: they are a different creation
+        // path entirely, not a kind of classic script.
+        #[cfg(feature = "v8-classic-script-authoritative")]
+        let explicitly_v8_authoritative = element
+            .get_attribute_string_value(&LocalName::from("data-servo-v8"))
+            .is_some_and(|value| value == "authoritative");
         #[cfg(feature = "v8-classic-script-authoritative")]
         let classic_script_engine = if script_type == ScriptType::Classic
-            && matches!(kind, ExternalScriptKind::ParsingBlocking)
-            && element
-                .get_attribute_string_value(&LocalName::from("data-servo-v8"))
-                .is_some_and(|value| value == "authoritative")
+            && (cfg!(feature = "v8-all-html-classic-scripts-authoritative")
+                || explicitly_v8_authoritative)
         {
             ClassicScriptEngine::V8Authoritative
         } else {

@@ -1,0 +1,112 @@
+<!doctype html>
+<!--
+Runtime proof for inherited Node.parentElement on Element wrappers. The
+V8-authoritative script derives Node.prototype through a live Element wrapper,
+pins the accessor's WebIDL surface and identity result, then retains the child
+across a real ChildNode.remove mutation. A following SpiderMonkey script
+independently verifies the resulting Servo DOM.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Node parentElement proof</title>
+    <style>
+      #target, #detached-root { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <div id="target"><span id="child">child</span></div>
+    <div id="detached-root"><section id="detached-parent"><i id="retained-descendant"></i></section></div>
+    <script data-servo-v8="authoritative">
+      const target = document.getElementById("target");
+      const child = document.getElementById("child");
+      const elementPrototype = Object.getPrototypeOf(child);
+      // There is no Node global in the constrained realm. The inherited
+      // accessor belongs on this one shared Node prototype, not Element.
+      const nodePrototype = Object.getPrototypeOf(elementPrototype);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        nodePrototype,
+        "parentElement",
+      );
+
+      let wrongBrandRejected = false;
+      try {
+        descriptor.get.call({});
+      } catch (error) {
+        wrongBrandRejected = error instanceof TypeError;
+      }
+      if (
+        nodePrototype === null ||
+        Object.getOwnPropertyDescriptor(elementPrototype, "parentElement") !==
+          undefined ||
+        Object.hasOwn(child, "parentElement") ||
+        !descriptor ||
+        typeof descriptor.get !== "function" ||
+        descriptor.get.name !== "get parentElement" ||
+        descriptor.get.length !== 0 ||
+        descriptor.set !== undefined ||
+        !descriptor.enumerable ||
+        !descriptor.configurable ||
+        !wrongBrandRejected
+      ) {
+        throw new Error("Node.parentElement prototype surface is wrong");
+      }
+
+      target.parentMarker = 71;
+      if (
+        child.parentElement !== target ||
+        child.parentElement !== child.parentElement ||
+        child !== target.children[0] ||
+        child.parentElement !== document.getElementById("target") ||
+        child.parentElement.parentMarker !== 71 ||
+        document.documentElement.parentElement !== null
+      ) {
+        throw new Error("Node.parentElement identity or boundary is wrong");
+      }
+
+      if (
+        child.remove() !== undefined ||
+        child.parentElement !== null ||
+        target.children.length !== 0 ||
+        child.isConnected
+      ) {
+        throw new Error("Node.parentElement did not update after child removal");
+      }
+
+      // Removing a subtree disconnects it but does not sever relationships
+      // inside that retained subtree.
+      const detachedRoot = document.getElementById("detached-root");
+      const detachedParent = document.getElementById("detached-parent");
+      const retainedDescendant = document.getElementById("retained-descendant");
+      if (
+        detachedRoot.remove() !== undefined ||
+        detachedRoot.parentElement !== null ||
+        detachedParent.parentElement !== detachedRoot ||
+        retainedDescendant.parentElement !== detachedParent ||
+        detachedRoot.isConnected ||
+        detachedParent.isConnected ||
+        retainedDescendant.isConnected
+      ) {
+        throw new Error("retained detached-subtree parents were not preserved");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently verifies the production DOM mutation.
+      const target = document.getElementById("target");
+      if (
+        !target ||
+        target.children.length !== 0 ||
+        document.getElementById("child") !== null ||
+        document.getElementById("detached-root") !== null ||
+        document.getElementById("retained-descendant") !== null ||
+        document.documentElement.parentElement !== null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

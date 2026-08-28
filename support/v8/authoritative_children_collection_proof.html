@@ -1,0 +1,179 @@
+<!doctype html>
+<!--
+Runtime proof for ParentNode.children and the live HTMLCollection facade. V8
+retains the collection across a real Servo tree mutation; SpiderMonkey then
+checks the mutation reached the production DOM.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative live HTMLCollection proof</title>
+    <style>
+      .fixture {
+        display: none;
+      }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="target" class="fixture">
+      <span id="first-child" name="duplicate">
+        first
+        <strong id="nested-child">nested</strong>
+      </span>
+      <em id="duplicate" name="item">last</em>
+    </section>
+    <script data-servo-v8="authoritative">
+      const target = document.querySelector("#target");
+      const collection = target.children;
+      const documentChildren = document.children;
+      const prototype = HTMLCollection.prototype;
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(prototype, "length");
+      const itemDescriptor = Object.getOwnPropertyDescriptor(prototype, "item");
+      const namedItemDescriptor = Object.getOwnPropertyDescriptor(prototype, "namedItem");
+      const zeroDescriptor = Object.getOwnPropertyDescriptor(collection, "0");
+      const namedDescriptor = Object.getOwnPropertyDescriptor(collection, "first-child");
+      const ownNames = Object.getOwnPropertyNames(collection);
+      const firstChild = collection[0];
+
+      let illegalCall = false;
+      let illegalConstruction = false;
+      let rejectsWrongItemBrand = false;
+      let rejectsWrongNamedBrand = false;
+      let rejectsWrongLengthBrand = false;
+      try {
+        HTMLCollection();
+      } catch (error) {
+        illegalCall = error instanceof TypeError;
+      }
+      try {
+        new HTMLCollection();
+      } catch (error) {
+        illegalConstruction = error instanceof TypeError;
+      }
+      try {
+        prototype.item.call({}, 0);
+      } catch (error) {
+        rejectsWrongItemBrand = error instanceof TypeError;
+      }
+      try {
+        prototype.namedItem.call({}, "x");
+      } catch (error) {
+        rejectsWrongNamedBrand = error instanceof TypeError;
+      }
+      try {
+        lengthDescriptor.get.call({});
+      } catch (error) {
+        rejectsWrongLengthBrand = error instanceof TypeError;
+      }
+
+      if (
+        collection !== target.children ||
+        documentChildren !== document.children ||
+        collection === documentChildren ||
+        !(collection instanceof HTMLCollection) ||
+        Object.getPrototypeOf(collection) !== prototype ||
+        Object.prototype.toString.call(collection) !== "[object HTMLCollection]" ||
+        HTMLCollection.name !== "HTMLCollection" ||
+        HTMLCollection.length !== 0 ||
+        prototype.constructor !== HTMLCollection ||
+        collection.length !== 2 ||
+        collection[0] !== collection.item(0) ||
+        collection[1] !== collection.item(1) ||
+        collection[2] !== undefined ||
+        collection.item(2) !== null ||
+        collection["first-child"] !== collection[0] ||
+        collection["duplicate"] !== collection[0] ||
+        collection.namedItem("duplicate") !== collection[0] ||
+        collection.namedItem("item") !== collection[1] ||
+        collection.namedItem("nested-child") !== null ||
+        collection["nested-child"] !== undefined ||
+        collection.item !== prototype.item ||
+        prototype[Symbol.iterator] !== undefined ||
+        "forEach" in prototype ||
+        documentChildren.length !== 1 ||
+        documentChildren[0] !== document.documentElement ||
+        Object.keys(collection).join(",") !== "0,1" ||
+        !ownNames.includes("0") ||
+        !ownNames.includes("1") ||
+        !ownNames.includes("first-child") ||
+        !ownNames.includes("duplicate") ||
+        ownNames.includes("item") ||
+        !zeroDescriptor ||
+        zeroDescriptor.value !== collection[0] ||
+        zeroDescriptor.writable ||
+        !zeroDescriptor.enumerable ||
+        !zeroDescriptor.configurable ||
+        !namedDescriptor ||
+        namedDescriptor.value !== collection[0] ||
+        namedDescriptor.writable ||
+        namedDescriptor.enumerable ||
+        !namedDescriptor.configurable ||
+        !lengthDescriptor ||
+        lengthDescriptor.get.length !== 0 ||
+        lengthDescriptor.set !== undefined ||
+        !lengthDescriptor.enumerable ||
+        !lengthDescriptor.configurable ||
+        !itemDescriptor ||
+        itemDescriptor.value.name !== "item" ||
+        itemDescriptor.value.length !== 1 ||
+        !itemDescriptor.writable ||
+        !itemDescriptor.enumerable ||
+        !itemDescriptor.configurable ||
+        !namedItemDescriptor ||
+        namedItemDescriptor.value.name !== "namedItem" ||
+        namedItemDescriptor.value.length !== 1 ||
+        !namedItemDescriptor.writable ||
+        !namedItemDescriptor.enumerable ||
+        !namedItemDescriptor.configurable ||
+        !illegalCall ||
+        !illegalConstruction ||
+        !rejectsWrongItemBrand ||
+        !rejectsWrongNamedBrand ||
+        !rejectsWrongLengthBrand
+      ) {
+        throw new Error("bad live HTMLCollection interface or contents");
+      }
+
+      firstChild.id = "renamed-first";
+      const renamedOwnNames = Object.getOwnPropertyNames(collection);
+      if (
+        collection["first-child"] !== undefined ||
+        collection.namedItem("first-child") !== null ||
+        collection["renamed-first"] !== firstChild ||
+        collection.namedItem("renamed-first") !== firstChild ||
+        renamedOwnNames.includes("first-child") ||
+        !renamedOwnNames.includes("renamed-first") ||
+        collection["duplicate"] !== firstChild
+      ) {
+        throw new Error("HTMLCollection named properties were not live");
+      }
+
+      target.textContent = "";
+      if (
+        collection !== target.children ||
+        collection.length !== 0 ||
+        collection[0] !== undefined ||
+        collection.item(0) !== null ||
+        collection["first-child"] !== undefined ||
+        collection.namedItem("first-child") !== null ||
+        firstChild.isConnected ||
+        Object.keys(collection).length !== 0
+      ) {
+        throw new Error("ParentNode.children was not live and SameObject");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      if (
+        document.getElementById("target").childElementCount !== 0 ||
+        document.getElementById("first-child") !== null ||
+        document.getElementById("renamed-first") !== null ||
+        document.getElementById("duplicate") !== null ||
+        document.getElementById("nested-child") !== null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

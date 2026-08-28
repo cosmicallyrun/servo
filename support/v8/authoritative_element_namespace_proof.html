@@ -1,0 +1,114 @@
+<!doctype html>
+<!--
+Runtime proof for Element.namespaceURI and Element.prefix. The V8-authoritative
+script validates the shared Element prototype accessors and reads both HTML and
+inline SVG elements from Servo's parsed production DOM. The values are read
+twice to pin nullable-string transport without relying on an Element global.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Element namespace proof</title>
+    <style>
+      #html-element, #svg { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <div id="html-element">HTML element</div>
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg">
+      <circle id="circle" r="1"></circle>
+    </svg>
+    <script data-servo-v8="authoritative">
+      const html = document.getElementById("html-element");
+      const svg = document.getElementById("svg");
+      const circle = document.getElementById("circle");
+      // The constrained realm deliberately has no Element constructor global.
+      const elementPrototype = Object.getPrototypeOf(html);
+      const namespaceDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "namespaceURI",
+      );
+      const prefixDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "prefix",
+      );
+
+      let namespaceBrandRejected = false;
+      let prefixBrandRejected = false;
+      try {
+        namespaceDescriptor.get.call({});
+      } catch (error) {
+        namespaceBrandRejected = error instanceof TypeError;
+      }
+      try {
+        prefixDescriptor.get.call({});
+      } catch (error) {
+        prefixBrandRejected = error instanceof TypeError;
+      }
+      if (
+        !namespaceDescriptor ||
+        !prefixDescriptor ||
+        namespaceDescriptor.get.name !== "get namespaceURI" ||
+        prefixDescriptor.get.name !== "get prefix" ||
+        ![namespaceDescriptor, prefixDescriptor].every(
+          (descriptor) =>
+            descriptor.get.length === 0 &&
+            descriptor.set === undefined &&
+            descriptor.enumerable &&
+            descriptor.configurable,
+        ) ||
+        Object.getPrototypeOf(svg) !== elementPrototype ||
+        Object.getPrototypeOf(circle) !== elementPrototype ||
+        Object.hasOwn(html, "namespaceURI") ||
+        Object.hasOwn(html, "prefix") ||
+        !namespaceBrandRejected ||
+        !prefixBrandRejected
+      ) {
+        throw new Error("Element namespace accessor surface is wrong");
+      }
+
+      const htmlNamespace = "http://www.w3.org/1999/xhtml";
+      const svgNamespace = "http://www.w3.org/2000/svg";
+      if (
+        html.namespaceURI !== htmlNamespace ||
+        html.namespaceURI !== html.namespaceURI ||
+        svg.namespaceURI !== svgNamespace ||
+        svg.namespaceURI !== svg.namespaceURI ||
+        circle.namespaceURI !== svgNamespace ||
+        circle.namespaceURI !== circle.namespaceURI ||
+        html.prefix !== null ||
+        html.prefix !== html.prefix ||
+        svg.prefix !== null ||
+        svg.prefix !== svg.prefix ||
+        circle.prefix !== null ||
+        circle.prefix !== circle.prefix ||
+        document.documentElement.namespaceURI !== htmlNamespace
+      ) {
+        throw new Error("Element namespace or null prefix values are wrong");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently checks Servo's parsed HTML/SVG namespaces.
+      const html = document.getElementById("html-element");
+      const svg = document.getElementById("svg");
+      const circle = document.getElementById("circle");
+      if (
+        !html ||
+        !svg ||
+        !circle ||
+        html.namespaceURI !== "http://www.w3.org/1999/xhtml" ||
+        svg.namespaceURI !== "http://www.w3.org/2000/svg" ||
+        circle.namespaceURI !== "http://www.w3.org/2000/svg" ||
+        html.prefix !== null ||
+        svg.prefix !== null ||
+        circle.prefix !== null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

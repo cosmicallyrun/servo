@@ -1,0 +1,43 @@
+<!doctype html>
+<!--
+Runtime proof that the V8 realm survives document.open().
+
+This was recorded as a known gap on the assumption that document.open() installs
+a fresh global that the V8 realm would not follow. It does not: HTML reuses the
+same Document and Window, and so does Servo -- open() clears the children,
+removes listeners, resets the URL, and creates a new parser, but the global and
+therefore the realm are the same object throughout. The host reads through a
+live Trusted<Document>, so the new URL is picked up rather than cached.
+
+document.open() returns early when the script nesting level is above zero, so
+it cannot be called from a parser-inserted script; the timer defers it out of
+the parse. The injected script then asserts identity and reads the post-open
+URL before toggling.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative document.open proof</title>
+  </head>
+  <body bgcolor="red">
+    <script>
+      setTimeout(function () {
+        var script =
+          '<scr' + 'ipt data-servo-v8="authoritative">' +
+          'if (globalThis !== window || window.document !== document) {' +
+          '  throw new Error("identity broken after document.open");' +
+          '}' +
+          'if (typeof document.URL !== "string" || document.URL.length === 0) {' +
+          '  throw new Error("bad URL after document.open");' +
+          '}' +
+          'document.bgColor = document.bgColor === "lime" ? "red" : "lime";' +
+          '<\/scr' + 'ipt>';
+        document.open();
+        document.write('<body bgcolor="red">' + script + '</body>');
+        document.close();
+      }, 0);
+    </script>
+  </body>
+</html>

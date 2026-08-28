@@ -1,0 +1,117 @@
+<!doctype html>
+<!--
+  Browser proof for ABI v48's production Window.matchMedia() and
+  MediaQueryList.matches. V8 checks the WebIDL surface and conversion order;
+  the following unmarked SpiderMonkey script observes the Servo DOM marker.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative matchMedia proof</title>
+  </head>
+  <body bgcolor="red">
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const windowDescriptor = Object.getOwnPropertyDescriptor(window, "matchMedia");
+      const matchMedia = windowDescriptor && windowDescriptor.value;
+      if (!windowDescriptor || typeof matchMedia !== "function" ||
+          matchMedia.name !== "matchMedia" || matchMedia.length !== 1 ||
+          !windowDescriptor.writable || !windowDescriptor.enumerable ||
+          !windowDescriptor.configurable || document.matchMedia !== undefined) {
+        throw new Error("bad matchMedia global surface");
+      }
+
+      let missingArgument = false;
+      try { matchMedia.call(window); } catch (error) {
+        missingArgument = error instanceof TypeError;
+      }
+      let wrongReceiverConverted = false;
+      let wrongReceiverRejected = false;
+      try {
+        matchMedia.call({}, { toString() {
+          wrongReceiverConverted = true;
+          return "(min-width: 1px)";
+        }});
+      } catch (error) {
+        wrongReceiverRejected = error instanceof TypeError;
+      }
+      if (!missingArgument || !wrongReceiverRejected || wrongReceiverConverted) {
+        throw new Error("matchMedia argument or receiver ordering is wrong");
+      }
+
+      let conversions = 0;
+      const query = {
+        toString() {
+          conversions++;
+          return "(min-width: 1px)";
+        },
+      };
+      const first = matchMedia.call(window, query);
+      if (conversions !== 1 || !first || first === matchMedia.call(window, "(min-width: 1px)")) {
+        throw new Error("matchMedia conversion or fresh-wrapper semantics are wrong");
+      }
+
+      const sentinel = new Error("matchMedia conversion sentinel");
+      let preservedSentinel = false;
+      let sentinelConversions = 0;
+      try {
+        matchMedia.call(window, { toString() {
+          sentinelConversions++;
+          throw sentinel;
+        }});
+      } catch (error) {
+        preservedSentinel = error === sentinel;
+      }
+      if (!preservedSentinel || sentinelConversions !== 1) {
+        throw new Error("matchMedia did not preserve the conversion exception");
+      }
+
+      const mediaPrototype = Object.getPrototypeOf(first);
+      const matchesDescriptor = Object.getOwnPropertyDescriptor(mediaPrototype, "matches");
+      if (!matchesDescriptor || typeof matchesDescriptor.get !== "function" ||
+          matchesDescriptor.set !== undefined || !matchesDescriptor.enumerable ||
+          !matchesDescriptor.configurable || Object.hasOwn(first, "matches") ||
+          matchesDescriptor.get.name !== "get matches" || matchesDescriptor.get.length !== 0 ||
+          Object.prototype.toString.call(first) !== "[object MediaQueryList]") {
+        throw new Error("bad MediaQueryList.matches surface");
+      }
+      let wrongMatchesReceiverRejected = false;
+      try { matchesDescriptor.get.call({}); } catch (error) {
+        wrongMatchesReceiverRejected = error instanceof TypeError;
+      }
+      if (!wrongMatchesReceiverRejected) {
+        throw new Error("MediaQueryList.matches did not brand-check its receiver");
+      }
+
+      let illegalCall = false;
+      let illegalConstruction = false;
+      try { MediaQueryList(); } catch (error) { illegalCall = error instanceof TypeError; }
+      try { new MediaQueryList(); } catch (error) {
+        illegalConstruction = error instanceof TypeError;
+      }
+      if (!illegalCall || !illegalConstruction ||
+          MediaQueryList.name !== "MediaQueryList" || MediaQueryList.length !== 0) {
+        throw new Error("MediaQueryList constructor was not illegal");
+      }
+
+      const alwaysTrue = matchMedia.call(window, "(min-width: 1px)");
+      const alwaysFalse = matchMedia.call(window, "(min-width: 99999px)");
+      if (alwaysTrue === alwaysFalse || alwaysTrue.matches !== true ||
+          alwaysFalse.matches !== false || alwaysTrue.matches !== true ||
+          alwaysFalse.matches !== false ||
+          matchMedia.call(window, "(min-width: 1px)") === alwaysTrue) {
+        throw new Error("MediaQueryList.matches is not live or viewport evaluation is wrong");
+      }
+
+      document.documentElement.id = "v48-match-media-pass";
+    </script>
+    <script>
+      const target = document.getElementById("visible-target");
+      if (document.documentElement.id === "v48-match-media-pass" && target) {
+        target.textContent = "matchMedia";
+        document.bgColor = "lime";
+        console.log("RESULT matchMedia v48 PASS");
+      }
+    </script>
+  </body>
+</html>

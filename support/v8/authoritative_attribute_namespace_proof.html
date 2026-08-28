@@ -1,0 +1,287 @@
+<!doctype html>
+<!--
+Runtime proof for Element.getAttributeNS, Element.hasAttributeNS, and
+Element.removeAttributeNS. The
+V8-authoritative script checks WebIDL operation descriptors, receiver brands,
+ordered conversion of both required arguments, and real HTML/SVG attribute
+namespace distinction. The SpiderMonkey follow-up independently reads the
+same parsed DOM.
+
+Run via support/v8/run_proofs.sh once ABI v41 is installed.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative namespaced attribute proof</title>
+    <style>
+      #html,
+      #svg { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <div id="html" plain="plain-value" empty="">HTML attribute fixture</div>
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1 1">
+      <use id="use" xlink:href="#shape"></use>
+    </svg>
+    <script data-servo-v8="authoritative">
+      const html = document.getElementById("html");
+      const svg = document.getElementById("svg");
+      const use = document.getElementById("use");
+      const elementPrototype = Object.getPrototypeOf(html);
+      const getDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "getAttributeNS",
+      );
+      const hasDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "hasAttributeNS",
+      );
+      const removeDescriptor = Object.getOwnPropertyDescriptor(
+        elementPrototype,
+        "removeAttributeNS",
+      );
+      const xlink = "http://www.w3.org/1999/xlink";
+
+      let getWrongBrand = false;
+      let hasWrongBrand = false;
+      let removeWrongBrand = false;
+      let wrongBrandConversion = 0;
+      try {
+        getDescriptor.value.call(
+          {},
+          { toString() { wrongBrandConversion++; return xlink; } },
+          { toString() { wrongBrandConversion++; return "href"; } },
+        );
+      } catch (error) {
+        getWrongBrand = error instanceof TypeError;
+      }
+      try {
+        hasDescriptor.value.call(
+          {},
+          { toString() { wrongBrandConversion++; return null; } },
+          { toString() { wrongBrandConversion++; return "plain"; } },
+        );
+      } catch (error) {
+        hasWrongBrand = error instanceof TypeError;
+      }
+      try {
+        removeDescriptor.value.call(
+          {},
+          { toString() { wrongBrandConversion++; return xlink; } },
+          { toString() { wrongBrandConversion++; return "href"; } },
+        );
+      } catch (error) {
+        removeWrongBrand = error instanceof TypeError;
+      }
+      if (
+        ![getDescriptor, hasDescriptor, removeDescriptor].every(
+          (descriptor) =>
+            descriptor &&
+            typeof descriptor.value === "function" &&
+            descriptor.value.length === 2 &&
+            descriptor.writable &&
+            descriptor.enumerable &&
+            descriptor.configurable,
+        ) ||
+        getDescriptor.value.name !== "getAttributeNS" ||
+        hasDescriptor.value.name !== "hasAttributeNS" ||
+        removeDescriptor.value.name !== "removeAttributeNS" ||
+        Object.hasOwn(html, "getAttributeNS") ||
+        Object.hasOwn(html, "hasAttributeNS") ||
+        Object.hasOwn(html, "removeAttributeNS") ||
+        !getWrongBrand ||
+        !hasWrongBrand ||
+        !removeWrongBrand ||
+        wrongBrandConversion !== 0
+      ) {
+        throw new Error("namespaced attribute operation surface is wrong");
+      }
+
+      const getConversionOrder = [];
+      const getValue = getDescriptor.value.call(
+        use,
+        {
+          toString() {
+            getConversionOrder.push("namespace");
+            return xlink;
+          },
+        },
+        {
+          toString() {
+            getConversionOrder.push("localName");
+            return "href";
+          },
+        },
+      );
+      const hasConversionOrder = [];
+      const hasValue = hasDescriptor.value.call(
+        use,
+        {
+          toString() {
+            hasConversionOrder.push("namespace");
+            return xlink;
+          },
+        },
+        {
+          toString() {
+            hasConversionOrder.push("localName");
+            return "href";
+          },
+        },
+      );
+      if (
+        getValue !== "#shape" ||
+        getConversionOrder.join(",") !== "namespace,localName" ||
+        hasValue !== true ||
+        hasConversionOrder.join(",") !== "namespace,localName"
+      ) {
+        throw new Error("namespaced attribute argument conversion is wrong");
+      }
+
+      let arityConversions = 0;
+      let getMissingSecond = false;
+      let hasMissingBoth = false;
+      let removeMissingSecond = false;
+      try {
+        html.getAttributeNS({
+          toString() {
+            arityConversions++;
+            return "";
+          },
+        });
+      } catch (error) {
+        getMissingSecond = error instanceof TypeError;
+      }
+      try {
+        html.hasAttributeNS();
+      } catch (error) {
+        hasMissingBoth = error instanceof TypeError;
+      }
+      try {
+        html.removeAttributeNS({
+          toString() {
+            arityConversions++;
+            return "";
+          },
+        });
+      } catch (error) {
+        removeMissingSecond = error instanceof TypeError;
+      }
+
+      const conversionError = new Error("namespace conversion sentinel");
+      let secondConverted = false;
+      let conversionErrorPreserved = false;
+      try {
+        use.getAttributeNS(
+          { toString() { throw conversionError; } },
+          { toString() { secondConverted = true; return "href"; } },
+        );
+      } catch (error) {
+        conversionErrorPreserved = error === conversionError;
+      }
+      let namespaceSymbolRejected = false;
+      let localNameSymbolRejected = false;
+      try {
+        use.getAttributeNS(Symbol("namespace"), "href");
+      } catch (error) {
+        namespaceSymbolRejected = error instanceof TypeError;
+      }
+      try {
+        use.hasAttributeNS(null, Symbol("localName"));
+      } catch (error) {
+        localNameSymbolRejected = error instanceof TypeError;
+      }
+      if (
+        !getMissingSecond ||
+        !hasMissingBoth ||
+        !removeMissingSecond ||
+        arityConversions !== 0 ||
+        !conversionErrorPreserved ||
+        secondConverted ||
+        !namespaceSymbolRejected ||
+        !localNameSymbolRejected
+      ) {
+        throw new Error("namespaced attribute conversion failures are wrong");
+      }
+
+      if (
+        html.getAttributeNS(null, "plain") !== "plain-value" ||
+        html.getAttributeNS(undefined, "plain") !== "plain-value" ||
+        html.getAttributeNS("", "plain") !== "plain-value" ||
+        !html.hasAttributeNS(null, "plain") ||
+        !html.hasAttributeNS(undefined, "plain") ||
+        !html.hasAttributeNS("", "plain") ||
+        html.getAttributeNS(null, "empty") !== "" ||
+        html.getAttributeNS(null, "missing") !== null ||
+        html.hasAttributeNS(null, "missing") ||
+        html.getAttributeNS(null, "PLAIN") !== null ||
+        html.getAttributeNS("http://www.w3.org/1999/xhtml", "plain") !== null ||
+        html.hasAttributeNS("http://www.w3.org/1999/xhtml", "plain") ||
+        use.getAttributeNS(xlink, "href") !== "#shape" ||
+        !use.hasAttributeNS(xlink, "href") ||
+        use.getAttributeNS(null, "href") !== null ||
+        use.hasAttributeNS(null, "href") ||
+        svg.getAttributeNS(null, "viewBox") !== "0 0 1 1" ||
+        !svg.hasAttributeNS(null, "viewBox") ||
+        use.getAttributeNS(7, "href") !== null ||
+        use.hasAttributeNS(7, "href") ||
+        use.getAttributeNS(xlink, 7) !== null ||
+        use.hasAttributeNS(xlink, 7) ||
+        html.getAttributeNS(null, "plain", "ignored") !== "plain-value" ||
+        html.getAttributeNS(null, 7) !== null ||
+        html.hasAttributeNS(null, 7)
+      ) {
+        throw new Error("namespaced attribute reads are not namespace-sensitive");
+      }
+
+      const removeConversionOrder = [];
+      const removeResult = removeDescriptor.value.call(
+        use,
+        {
+          toString() {
+            removeConversionOrder.push("namespace");
+            return xlink;
+          },
+        },
+        {
+          toString() {
+            removeConversionOrder.push("localName");
+            return "href";
+          },
+        },
+      );
+      if (
+        removeResult !== undefined ||
+        removeConversionOrder.join(",") !== "namespace,localName" ||
+        use.hasAttributeNS(xlink, "href") ||
+        use.getAttributeNS(xlink, "href") !== null
+      ) {
+        throw new Error("removeAttributeNS failed to remove namespaced attribute");
+      }
+
+      if (
+        html.removeAttributeNS(null, "plain") !== undefined ||
+        html.hasAttributeNS(null, "plain") ||
+        html.removeAttributeNS(null, "missing") !== undefined
+      ) {
+        throw new Error("removeAttributeNS failed to mutate HTML attribute list");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently checks the same parsed DOM values.
+      const html = document.getElementById("html");
+      const use = document.getElementById("use");
+      const xlink = "http://www.w3.org/1999/xlink";
+      if (
+        !html ||
+        !use ||
+        html.hasAttributeNS(null, "plain") ||
+        use.hasAttributeNS(xlink, "href")
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

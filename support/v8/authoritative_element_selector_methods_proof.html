@@ -1,0 +1,189 @@
+<!doctype html>
+<!--
+Runtime proof for Element.closest(), matches(), and webkitMatchesSelector().
+
+The authoritative V8 script uses Servo's production selector parser, checks
+WebIDL conversion and exception behavior, and proves that closest() results
+join the same per-realm wrapper cache as querySelector(). SpiderMonkey then
+verifies the mutation reached Servo's actual DOM.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Element selector-method proof</title>
+    <style>
+      .fixture {
+        display: none;
+      }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="ancestor" class="fixture container">
+      <div id="target" class="pick alpha">
+        <span id="child">child</span>
+      </div>
+    </section>
+    <script data-servo-v8="authoritative">
+      const target = document.querySelector("#target");
+      const ancestor = document.querySelector("#ancestor");
+      const prototype = Object.getPrototypeOf(target);
+      const names = ["closest", "matches", "webkitMatchesSelector"];
+      const descriptors = names.map((name) => [
+        name,
+        Object.getOwnPropertyDescriptor(prototype, name),
+      ]);
+      if (
+        descriptors.some(
+          ([name, descriptor]) =>
+            !descriptor ||
+            descriptor.value.name !== name ||
+            descriptor.value.length !== 1 ||
+            !descriptor.writable ||
+            !descriptor.enumerable ||
+            !descriptor.configurable,
+        ) ||
+        names.some((name) => Object.hasOwn(target, name))
+      ) {
+        throw new Error("bad Element selector-method descriptors");
+      }
+
+      let wrongBrandStringified = false;
+      for (const [, descriptor] of descriptors) {
+        let wrongBrand = false;
+        try {
+          descriptor.value.call({}, {
+            toString() {
+              wrongBrandStringified = true;
+              return "#target";
+            },
+          });
+        } catch (error) {
+          wrongBrand = error instanceof TypeError;
+        }
+        if (!wrongBrand) {
+          throw new Error("selector method accepted the wrong receiver");
+        }
+      }
+      if (wrongBrandStringified) {
+        throw new Error("selector conversion ran before the brand check");
+      }
+
+      const conversionError = new Error("selector conversion sentinel");
+      for (const name of names) {
+        let preserved = false;
+        try {
+          target[name]({
+            toString() {
+              throw conversionError;
+            },
+          });
+        } catch (error) {
+          preserved = error === conversionError;
+        }
+        if (!preserved) {
+          throw new Error(`${name} did not preserve its conversion exception`);
+        }
+
+        let missingRejected = false;
+        try {
+          target[name]();
+        } catch (error) {
+          missingRejected = error instanceof TypeError;
+        }
+        let symbolRejected = false;
+        try {
+          target[name](Symbol(name));
+        } catch (error) {
+          symbolRejected = error instanceof TypeError;
+        }
+        if (!missingRejected || !symbolRejected) {
+          throw new Error(`${name} accepted an invalid WebIDL argument`);
+        }
+      }
+
+      let conversions = 0;
+      const convertedMatch = target.matches({
+        toString() {
+          conversions++;
+          return ".pick";
+        },
+      });
+      if (
+        !convertedMatch ||
+        conversions !== 1 ||
+        !target.matches("#target.alpha") ||
+        target.matches("span") ||
+        !target.webkitMatchesSelector("div.pick") ||
+        target.webkitMatchesSelector("section") ||
+        target.matches(null) ||
+        target.webkitMatchesSelector(undefined)
+      ) {
+        throw new Error("bad matches result or DOMString conversion");
+      }
+
+      const self = target.closest("#target");
+      const nearestSection = target.closest("section.container");
+      const body = target.closest("body");
+      self.marker = 71;
+      nearestSection.marker = 73;
+      if (
+        self !== target ||
+        self.marker !== 71 ||
+        nearestSection !== ancestor ||
+        nearestSection.marker !== 73 ||
+        body !== document.querySelector("body") ||
+        target.closest("missing") !== null ||
+        target.closest(null) !== null ||
+        target.closest(undefined) !== null ||
+        target.closest("#target") !== document.getElementById("target")
+      ) {
+        throw new Error("bad closest result or wrapper identity");
+      }
+
+      const syntaxMessage = "The string did not match the expected pattern.";
+      for (const callback of [
+        () => target.closest("["),
+        () => target.matches("["),
+        () => target.webkitMatchesSelector("["),
+      ]) {
+        let syntaxError;
+        try {
+          callback();
+        } catch (error) {
+          syntaxError = error;
+        }
+        if (
+          !(syntaxError instanceof DOMException) ||
+          !(syntaxError instanceof Error) ||
+          syntaxError.name !== "SyntaxError" ||
+          syntaxError.message !== syntaxMessage ||
+          syntaxError.code !== 12 ||
+          Object.getPrototypeOf(syntaxError) !== DOMException.prototype ||
+          String(syntaxError) !== `SyntaxError: ${syntaxMessage}` ||
+          Object.hasOwn(syntaxError, "name") ||
+          Object.hasOwn(syntaxError, "message") ||
+          Object.hasOwn(syntaxError, "code") ||
+          Object.hasOwn(syntaxError, "stack")
+        ) {
+          throw new Error("bad selector-method SyntaxError DOMException");
+        }
+      }
+
+      // A syntax error must not poison either engine's later selector work.
+      if (!target.matches(".pick") || target.closest("section") !== ancestor) {
+        throw new Error("selector methods failed after SyntaxError");
+      }
+      ancestor.id = "matched-by-v8";
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      if (
+        document.getElementById("matched-by-v8") === null ||
+        document.getElementById("ancestor") !== null ||
+        !document.getElementById("target").matches("#matched-by-v8 > .pick")
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

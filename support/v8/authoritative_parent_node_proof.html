@@ -1,0 +1,120 @@
+<!doctype html>
+<!--
+Runtime proof for the generated Document and native Element ParentNode slice.
+
+The V8-authoritative script verifies production prototype descriptors, stable
+wrapper identity across independent access paths, null empty-child results,
+and live traversal after Node.textContent removes both child Elements. The
+following unmarked SpiderMonkey script independently checks Servo's DOM.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative ParentNode traversal proof</title>
+    <style>
+      #target,
+      #empty {
+        display: none;
+      }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <div id="target"><span id="first">first</span><em id="last">last</em></div>
+    <p id="empty"></p>
+    <script data-servo-v8="authoritative">
+      const documentPrototype = Object.getPrototypeOf(document);
+      const documentDescriptors = [
+        "firstElementChild",
+        "lastElementChild",
+        "childElementCount",
+      ].map((name) =>
+        Object.getOwnPropertyDescriptor(documentPrototype, name),
+      );
+
+      const target = document.getElementById("target");
+      const empty = document.getElementById("empty");
+      const elementPrototype = Object.getPrototypeOf(target);
+      const elementDescriptors = [
+        "firstElementChild",
+        "lastElementChild",
+        "childElementCount",
+      ].map((name) =>
+        Object.getOwnPropertyDescriptor(elementPrototype, name),
+      );
+      if (
+        ![...documentDescriptors, ...elementDescriptors].every(
+          (descriptor) =>
+            descriptor &&
+            descriptor.get.length === 0 &&
+            descriptor.set === undefined &&
+            descriptor.enumerable &&
+            descriptor.configurable,
+        ) ||
+        Object.hasOwn(target, "firstElementChild") ||
+        Object.hasOwn(target, "lastElementChild") ||
+        Object.hasOwn(target, "childElementCount")
+      ) {
+        throw new Error("ParentNode prototype descriptors are wrong");
+      }
+
+      if (
+        document.childElementCount !== 1 ||
+        document.firstElementChild !== document.documentElement ||
+        document.lastElementChild !== document.documentElement ||
+        empty.childElementCount !== 0 ||
+        empty.firstElementChild !== null ||
+        empty.lastElementChild !== null
+      ) {
+        throw new Error("Document or empty Element traversal is wrong");
+      }
+
+      const first = target.firstElementChild;
+      const last = target.lastElementChild;
+      first.marker = 41;
+      last.marker = 43;
+      if (
+        target.childElementCount !== 2 ||
+        first.id !== "first" ||
+        first.tagName !== "SPAN" ||
+        last.id !== "last" ||
+        last.tagName !== "EM" ||
+        first === last ||
+        target.firstElementChild !== first ||
+        target.lastElementChild !== last ||
+        document.getElementById("first") !== first ||
+        document.getElementById("last") !== last ||
+        target.firstElementChild.marker !== 41 ||
+        target.lastElementChild.marker !== 43
+      ) {
+        throw new Error("Element traversal or wrapper identity is wrong");
+      }
+
+      target.textContent = "cleared";
+      if (
+        target.childElementCount !== 0 ||
+        target.firstElementChild !== null ||
+        target.lastElementChild !== null ||
+        first.isConnected ||
+        last.isConnected
+      ) {
+        throw new Error("ParentNode traversal did not update after mutation");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      // SpiderMonkey independently verifies the real Servo DOM mutation.
+      const target = document.getElementById("target");
+      if (
+        target.textContent !== "cleared" ||
+        target.childElementCount !== 0 ||
+        target.firstElementChild !== null ||
+        target.lastElementChild !== null ||
+        document.getElementById("first") !== null ||
+        document.getElementById("last") !== null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

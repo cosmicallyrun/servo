@@ -1,0 +1,155 @@
+<!doctype html>
+<!--
+Runtime proof for production ParentNode.querySelector and V8 DOMException.
+
+The authoritative script exercises Servo's real selector parser through both
+Document and Element hosts, stable wrapper identity, conversion ordering, and
+the invalid-selector exception path. The following SpiderMonkey script then
+verifies the mutation reached Servo's actual DOM.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative querySelector proof</title>
+    <style>
+      .fixture {
+        display: none;
+      }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <div id="target" class="fixture">
+      <span id="first" class="pick">first</span>
+      <em id="last" class="pick">last</em>
+    </div>
+    <script data-servo-v8="authoritative">
+      const documentMethod = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document),
+        "querySelector",
+      );
+      const target = document.querySelector("#target");
+      const elementMethod = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(target),
+        "querySelector",
+      );
+      if (
+        ![documentMethod, elementMethod].every(
+          (descriptor) =>
+            descriptor &&
+            descriptor.value.name === "querySelector" &&
+            descriptor.value.length === 1 &&
+            descriptor.writable &&
+            descriptor.enumerable &&
+            descriptor.configurable,
+        ) ||
+        Object.hasOwn(document, "querySelector") ||
+        Object.hasOwn(target, "querySelector")
+      ) {
+        throw new Error("bad querySelector descriptors");
+      }
+
+      let wrongBrandStringified = false;
+      let wrongBrand = false;
+      try {
+        elementMethod.value.call({}, {
+          toString() {
+            wrongBrandStringified = true;
+            return ".pick";
+          },
+        });
+      } catch (error) {
+        wrongBrand = error instanceof TypeError;
+      }
+      const conversionError = new Error("conversion sentinel");
+      let conversionPreserved = false;
+      try {
+        document.querySelector({
+          toString() {
+            throw conversionError;
+          },
+        });
+      } catch (error) {
+        conversionPreserved = error === conversionError;
+      }
+      let missingRejected = false;
+      try {
+        document.querySelector();
+      } catch (error) {
+        missingRejected = error instanceof TypeError;
+      }
+
+      let syntaxError;
+      try {
+        target.querySelector("[");
+      } catch (error) {
+        syntaxError = error;
+      }
+      const syntaxMessage = "The string did not match the expected pattern.";
+      if (
+        !wrongBrand ||
+        wrongBrandStringified ||
+        !conversionPreserved ||
+        !missingRejected ||
+        !(syntaxError instanceof DOMException) ||
+        !(syntaxError instanceof Error) ||
+        syntaxError.name !== "SyntaxError" ||
+        syntaxError.message !== syntaxMessage ||
+        syntaxError.code !== DOMException.SYNTAX_ERR ||
+        syntaxError.code !== 12 ||
+        Object.getPrototypeOf(syntaxError) !== DOMException.prototype ||
+        Object.prototype.toString.call(syntaxError) !== "[object DOMException]" ||
+        String(syntaxError) !== `SyntaxError: ${syntaxMessage}` ||
+        Object.hasOwn(syntaxError, "name") ||
+        Object.hasOwn(syntaxError, "message") ||
+        Object.hasOwn(syntaxError, "code") ||
+        Object.hasOwn(syntaxError, "stack")
+      ) {
+        throw new Error("bad selector SyntaxError DOMException");
+      }
+
+      const first = target.querySelector(":scope > .pick");
+      const last = target.querySelector("#last");
+      first.marker = 53;
+      if (
+        target !== document.getElementById("target") ||
+        document.querySelector("div#target") !== target ||
+        document.querySelector("missing") !== null ||
+        target.querySelector("#target") !== null ||
+        first !== target.firstElementChild ||
+        first !== document.querySelector("#first") ||
+        first.marker !== 53 ||
+        last !== target.lastElementChild ||
+        target.querySelector("missing") !== null ||
+        document.querySelector("#target") !== target
+      ) {
+        throw new Error("bad selector result or wrapper identity");
+      }
+
+      const constructed = new DOMException("custom", "SyntaxError");
+      if (
+        !(constructed instanceof DOMException) ||
+        !(constructed instanceof Error) ||
+        constructed.name !== "SyntaxError" ||
+        constructed.message !== "custom" ||
+        constructed.code !== 12 ||
+        new DOMException(undefined, undefined).name !== "Error" ||
+        new DOMException("", "DOMStringSizeError").code !== 0 ||
+        DOMException.DOMSTRING_SIZE_ERR !== 2
+      ) {
+        throw new Error("bad DOMException constructor surface");
+      }
+
+      target.id = "queried-by-v8";
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      if (
+        document.getElementById("queried-by-v8") === null ||
+        document.getElementById("target") !== null ||
+        document.querySelector("#queried-by-v8 > #first") === null
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

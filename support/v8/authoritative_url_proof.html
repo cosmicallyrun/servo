@@ -1,0 +1,36 @@
+<!doctype html>
+<!--
+Runtime proof that Document.URL is served by the V8 host.
+
+Document.URL is the first read-only member added through the generator's shape
+manifest rather than by hand. It shares the owned-UTF-8 transfer with bgColor's
+getter but has no setter.
+
+The script throws unless the V8 host returns this page's own URL, so red means
+either the script never ran or the host returned the wrong value; only a
+correct read reaches the toggle and renders lime.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Document.URL proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      if (typeof document.URL !== "string" ||
+          !document.URL.endsWith("authoritative_url_proof.html")) {
+        throw new Error("unexpected document.URL: " + document.URL);
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document), "URL");
+      if (typeof descriptor.get !== "function" ||
+          descriptor.set !== undefined) {
+        throw new Error("Document.URL must be getter-only");
+      }
+      document.bgColor =
+        document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

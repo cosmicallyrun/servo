@@ -82,7 +82,13 @@ def stable_interface_id(interface_name: str) -> int:
 
 
 def snake_case(name: str) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    # Split on case transitions rather than before every capital, so an acronym
+    # stays one word: WebIDL is full of them and `URL` must become `url`, not
+    # `u_r_l`. The second rule splits a trailing word off an acronym run, so
+    # `innerHTMLValue` becomes `inner_html_value`.
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    name = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
+    return name.lower()
 
 
 def upper_snake_case(name: str) -> str:
@@ -633,7 +639,11 @@ def generate_cpp(
     argument_names = ", ".join(argument.identifier.name for argument in constructor_arguments)
     lines.extend(
         [
-            f"  void* native = runtime->{runtime_vtable}.constructor({argument_names});",
+            "  void* native = nullptr;",
+            "  {",
+            "    RustCallbackScope callback_scope(runtime);",
+            f"    native = runtime->{runtime_vtable}.constructor({argument_names});",
+            "  }",
             "  if (!native) {",
             "    isolate->ThrowException(v8::Exception::Error(",
             f'        V8String(isolate, "Rust {name} allocation failed")));',
@@ -642,7 +652,7 @@ def generate_cpp(
             "",
             "  v8::CppHeap* cpp_heap = isolate->GetCppHeap();",
             "  auto* cell = cppgc::MakeGarbageCollected<ServoV8DomCell>(",
-            f"      cpp_heap->GetAllocationHandle(), native, {interface_id_constant},",
+            f"      cpp_heap->GetAllocationHandle(), runtime, native, {interface_id_constant},",
             f"      runtime->{runtime_vtable});",
             "  cppgc::Persistent<ServoV8DomCell> pending(cell);",
             "  v8::Object::Wrap<kServoDomTag>(isolate, info.This(), cell);",
@@ -667,6 +677,7 @@ def generate_cpp(
                 f'    ThrowTypeError(isolate, "invalid {name} receiver");',
                 "    return;",
                 "  }",
+                "  RustCallbackScope callback_scope(cell->runtime());",
                 f"  info.GetReturnValue().Set(cell->vtable().get_{member}(cell->native()));",
                 "}",
                 "",
@@ -690,6 +701,7 @@ def generate_cpp(
                     "  if (!info[0]->Int32Value(isolate->GetCurrentContext()).To(&value)) {",
                     "    return;",
                     "  }",
+                    "  RustCallbackScope callback_scope(cell->runtime());",
                     f"  cell->vtable().set_{member}(cell->native(), value);",
                     "}",
                     "",
@@ -717,6 +729,7 @@ def generate_cpp(
             argument_names = ", " + argument_names
         lines.extend(
             [
+                "  RustCallbackScope callback_scope(cell->runtime());",
                 f"  info.GetReturnValue().Set(cell->vtable().{member}(cell->native(){argument_names}));",
                 "}",
                 "",

@@ -1,0 +1,52 @@
+<!doctype html>
+<!--
+Runtime proof that the V8 realm exposes no API it cannot actually implement.
+
+V8's inspector-oriented console silently discards output with no inspector
+delegate. The experiment replaces it with the production-pinned logging slice
+and deliberately leaves every unsupported console method absent.
+
+The script throws unless the surface is exactly what is claimed, so red means a
+wrong surface rather than merely that nothing ran.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative realm surface proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      const consoleDescriptor = Object.getOwnPropertyDescriptor(window, "console");
+      const consoleMethods = ["debug", "error", "info", "log", "trace", "warn"];
+      const unsupportedConsoleMethods = [
+        "assert", "clear", "dir", "count", "countReset", "group",
+        "groupCollapsed", "groupEnd", "time", "timeLog", "timeEnd",
+      ];
+      if (!consoleDescriptor || consoleDescriptor.enumerable ||
+          !consoleDescriptor.writable || !consoleDescriptor.configurable ||
+          Object.prototype.toString.call(console) !== "[object Console]" ||
+          Object.keys(console).join(",") !== consoleMethods.join(",") ||
+          unsupportedConsoleMethods.some(name => typeof console[name] !== "undefined") ||
+          !consoleMethods.every(name => {
+            const descriptor = Object.getOwnPropertyDescriptor(console, name);
+            return descriptor && descriptor.enumerable && descriptor.writable &&
+              descriptor.configurable && descriptor.value.name === name &&
+              descriptor.value.length === 0;
+          })) {
+        throw new Error("bad console surface");
+      }
+      // The surface that IS claimed must still be intact.
+      if (globalThis !== window || window.window !== window ||
+          window.document !== document || typeof setTimeout !== "function" ||
+          typeof clearTimeout !== "function" ||
+          typeof setInterval !== "function" ||
+          typeof clearInterval !== "function") {
+        throw new Error("bad identity");
+      }
+      document.bgColor =
+        document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

@@ -1,0 +1,183 @@
+<!doctype html>
+<!--
+Browser proof for ABI v46's CharacterData.substringData(). V8 validates the
+production operation descriptor, receiver/argument ordering, unsigned-long
+conversion, UTF-16 indexing, and IndexSizeError. SpiderMonkey then observes
+the final Comment/Text nodes in Servo's one production DOM tree.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative CharacterData substring proof</title>
+    <style>
+      body { color: #101010; font: 48px/1.2 sans-serif; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const text = document.createTextNode("A😀BC");
+      const comment = document.createComment("comment-data");
+      const element = document.createElement("div");
+      const fragment = document.createDocumentFragment();
+      const target = document.getElementById("visible-target");
+      const textPrototype = Object.getPrototypeOf(text);
+      const commentPrototype = Object.getPrototypeOf(comment);
+      const characterDataPrototype = Object.getPrototypeOf(textPrototype);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        characterDataPrototype, "substringData",
+      );
+      const method = descriptor && descriptor.value;
+
+      if (
+        Object.getPrototypeOf(commentPrototype) !== characterDataPrototype ||
+        Object.hasOwn(text, "substringData") ||
+        Object.hasOwn(comment, "substringData") ||
+        !descriptor || typeof method !== "function" ||
+        method.name !== "substringData" || method.length !== 2 ||
+        !descriptor.writable || !descriptor.enumerable || !descriptor.configurable ||
+        typeof CharacterData !== "undefined" || typeof Text !== "undefined" ||
+        typeof Comment !== "undefined"
+      ) {
+        throw new Error("CharacterData.substringData surface is wrong");
+      }
+
+      for (const receiver of [{}, element, fragment]) {
+        let conversionTouched = false;
+        let rejected = false;
+        try {
+          method.call(receiver, {
+            valueOf() {
+              conversionTouched = true;
+              return 0;
+            },
+          }, 1);
+        } catch (error) {
+          rejected = error instanceof TypeError;
+        }
+        if (!rejected || conversionTouched) {
+          throw new Error("substringData did not brand-check before conversion");
+        }
+      }
+
+      let missingBoth = false;
+      try { method.call(text); } catch (error) {
+        missingBoth = error instanceof TypeError;
+      }
+      let missingConversionTouched = false;
+      let missingCount = false;
+      try {
+        method.call(text, {
+          valueOf() {
+            missingConversionTouched = true;
+            return 0;
+          },
+        });
+      } catch (error) {
+        missingCount = error instanceof TypeError;
+      }
+      if (!missingBoth || !missingCount || missingConversionTouched) {
+        throw new Error("substringData required-argument handling is wrong");
+      }
+
+      const order = [];
+      const converted = method.call(
+        text,
+        { valueOf() { order.push("offset"); return 1; } },
+        { valueOf() { order.push("count"); return 2; } },
+      );
+      if (converted !== "😀" || order.join(",") !== "offset,count") {
+        throw new Error("substringData argument conversion order is wrong");
+      }
+
+      const sentinel = new Error("substringData conversion sentinel");
+      const throwingOrder = [];
+      let preservedSentinel = false;
+      try {
+        method.call(
+          text,
+          { valueOf() { throwingOrder.push("offset"); return 1; } },
+          { valueOf() { throwingOrder.push("count"); throw sentinel; } },
+        );
+      } catch (error) {
+        preservedSentinel = error === sentinel;
+      }
+      let rejectedSymbol = false;
+      try { text.substringData(Symbol("offset"), 1); } catch (error) {
+        rejectedSymbol = error instanceof TypeError;
+      }
+      if (
+        !preservedSentinel || throwingOrder.join(",") !== "offset,count" ||
+        !rejectedSymbol
+      ) {
+        throw new Error("substringData conversion failure propagation is wrong");
+      }
+
+      let indexSize = false;
+      try { text.substringData(6, 0); } catch (error) {
+        indexSize = error instanceof DOMException && error instanceof Error &&
+          error.name === "IndexSizeError" && error.message === "" &&
+          error.code === 1 && DOMException.INDEX_SIZE_ERR === 1 &&
+          Object.getPrototypeOf(error) === DOMException.prototype;
+      }
+      if (!indexSize) {
+        throw new Error("substringData did not create a V8 IndexSizeError");
+      }
+
+      const semantics = [
+        text.substringData(0, 0xffffffff),
+        text.substringData(1, 1),
+        text.substringData(2, 1),
+        text.substringData(5, 1),
+        text.substringData(4294967297, 2),
+        text.substringData(-4294967295, 2),
+        text.substringData(NaN, Infinity),
+        method.call(comment, 0, 7, "ignored"),
+        text.data,
+        text.length,
+      ];
+      if (
+        semantics[0] !== "A😀BC" || semantics[1] !== "\uFFFD" ||
+        semantics[2] !== "\uFFFDB" || semantics[3] !== "" ||
+        semantics[4] !== "😀" || semantics[5] !== "😀" ||
+        semantics[6] !== "" || semantics[7] !== "comment" ||
+        semantics[8] !== "A😀BC" || semantics[9] !== 5
+      ) {
+        throw new Error(
+          "substringData UTF-16 or unsigned-long semantics are wrong: " +
+          JSON.stringify(semantics),
+        );
+      }
+
+      comment.data = "v46-comment";
+      text.data = "Hello";
+      if (
+        fragment.appendChild(comment) !== comment ||
+        fragment.appendChild(text) !== text ||
+        target.appendChild(fragment) !== fragment || fragment.hasChildNodes() ||
+        comment.parentElement !== target || text.parentElement !== target ||
+        !comment.isConnected || !text.isConnected || target.textContent !== "Hello"
+      ) {
+        throw new Error("substringData proof lost generic Node identity");
+      }
+      document.documentElement.id = "v46-character-data-substring-pass";
+    </script>
+    <script>
+      // SpiderMonkey independently sees the V8-tested and mutated Servo tree.
+      const target = document.getElementById("visible-target");
+      if (
+        document.documentElement.id === "v46-character-data-substring-pass" &&
+        target && target.childNodes.length === 2 &&
+        target.childNodes[0].nodeType === 8 &&
+        target.childNodes[0].data === "v46-comment" &&
+        target.childNodes[0].nodeValue === "v46-comment" &&
+        target.childNodes[1].nodeType === 3 &&
+        target.childNodes[1].data === "Hello" &&
+        target.childNodes[1].nodeValue === "Hello" && target.textContent === "Hello"
+      ) {
+        document.bgColor = "lime";
+        console.log("RESULT characterData substring v46 PASS text=Hello");
+      }
+    </script>
+  </body>
+</html>

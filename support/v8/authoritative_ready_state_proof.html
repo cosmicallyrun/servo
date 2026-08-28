@@ -1,0 +1,52 @@
+<!doctype html>
+<!--
+Runtime proof for the second generated enum-valued Document attribute.
+
+The manifest pins DocumentReadyState to loading/interactive/complete, and the
+parser-blocking authoritative script must observe loading. The getter remains
+an enumerable, configurable, readonly prototype accessor with a brand check.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative readyState proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      var descriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document),
+        "readyState",
+      );
+      if (
+        Object.hasOwn(document, "readyState") ||
+        !descriptor ||
+        typeof descriptor.get !== "function" ||
+        descriptor.set !== undefined ||
+        !descriptor.enumerable ||
+        !descriptor.configurable ||
+        descriptor.get.name !== "get readyState" ||
+        descriptor.get.length !== 0
+      ) {
+        throw new Error("readyState descriptor is wrong");
+      }
+      var rejectedWrongBrand = false;
+      try {
+        descriptor.get.call({});
+      } catch (error) {
+        rejectedWrongBrand = error instanceof TypeError;
+      }
+      if (!rejectedWrongBrand) {
+        throw new Error("readyState accepted a foreign receiver");
+      }
+      if (
+        document.readyState !== "loading" ||
+        !["loading", "interactive", "complete"].includes(document.readyState)
+      ) {
+        throw new Error("unexpected parser-time readyState: " + document.readyState);
+      }
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

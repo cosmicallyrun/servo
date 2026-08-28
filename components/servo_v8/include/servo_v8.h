@@ -12,13 +12,14 @@
 extern "C" {
 #endif
 
-#define SERVO_V8_ABI_VERSION 7u
+#define SERVO_V8_ABI_VERSION 48u
 
 typedef struct ServoV8Runtime ServoV8Runtime;
 typedef struct ServoV8DomCell ServoV8DomCell;
 typedef struct ServoV8TraceVisitor ServoV8TraceVisitor;
 typedef uint64_t ServoV8RealmId;
 typedef uint64_t ServoV8ScriptId;
+typedef uint64_t ServoV8TimerCallbackId;
 
 typedef struct ServoV8ErrorBuffer {
   char* data;
@@ -66,9 +67,360 @@ typedef void (*ServoV8TraceCallback)(void* native,
                                      ServoV8TraceVisitor* visitor);
 typedef void (*ServoV8DropCallback)(void* native);
 
+/* A DOM object being handed to script.
+ *
+ * `key` is the DOM object's address, used only as a cache identity. It is safe
+ * as one because the wrapper cell holds a strong Servo root, so the object
+ * cannot be freed -- and its address cannot be reused -- while a cache entry
+ * for it can still be hit.
+ *
+ * `native` is a freshly boxed host. The bridge consumes it only when it
+ * creates a new wrapper, and drops it through the vtable's drop callback when
+ * an existing wrapper is found, so the transfer stays transactional. */
+typedef struct ServoV8InterfaceValue {
+  /* Stable dynamic interface discriminator.  Null has no payload. */
+  uint8_t kind;
+  const void* key;
+  void* native;
+} ServoV8InterfaceValue;
+
+#define SERVO_V8_INTERFACE_NULL 0u
+#define SERVO_V8_INTERFACE_ELEMENT 1u
+#define SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT 2u
+#define SERVO_V8_INTERFACE_TEXT 3u
+#define SERVO_V8_INTERFACE_COMMENT 4u
+
 /* Generated typed WebIDL vtables contain only POD values and native pointers. */
 #include "servo_v8_generated.h"
 #include "servo_v8_document_host_generated.h"
+
+/* Declared after the generated header, which defines ServoV8OwnedUtf8. */
+typedef struct ServoV8OptionalOwnedUtf8 {
+  uint8_t is_null;
+  ServoV8OwnedUtf8 value;
+} ServoV8OptionalOwnedUtf8;
+
+#define SERVO_V8_CHARACTER_DATA_STRING_RETURNED 0u
+#define SERVO_V8_CHARACTER_DATA_STRING_INDEX_SIZE_ERROR 1u
+#define SERVO_V8_CHARACTER_DATA_STRING_HOST_FAILURE 2u
+
+/* A CharacterData operation either transfers one owned DOMString, reports the
+ * one DOMException in its selected WebIDL contract, or fails internally. */
+typedef struct ServoV8CharacterDataStringOutcome {
+  uint32_t status;
+  ServoV8OwnedUtf8 value;
+} ServoV8CharacterDataStringOutcome;
+
+/* One atomic snapshot of a WebIDL sequence<DOMString>. Every view borrows its
+ * bytes from the single owner for the lifetime of the synchronous callback. */
+typedef struct ServoV8Utf8View {
+  const uint8_t* data;
+  size_t length;
+} ServoV8Utf8View;
+
+typedef struct ServoV8OwnedUtf8Sequence {
+  const ServoV8Utf8View* values;
+  size_t length;
+  void* owner;
+  ServoV8DropCallback drop_owner;
+} ServoV8OwnedUtf8Sequence;
+
+#define SERVO_V8_NODE_MUTATION_RETURNED 0u
+#define SERVO_V8_NODE_MUTATION_DOM_EXCEPTION 1u
+#define SERVO_V8_NODE_MUTATION_HOST_FAILURE 2u
+
+#define SERVO_V8_NODE_MUTATION_EXCEPTION_NONE 0u
+#define SERVO_V8_NODE_MUTATION_EXCEPTION_HIERARCHY_REQUEST 1u
+#define SERVO_V8_NODE_MUTATION_EXCEPTION_NOT_FOUND 2u
+
+typedef struct ServoV8NodeMutationOutcome {
+  uint32_t status;
+  uint32_t exception_kind;
+  ServoV8OwnedUtf8 exception_message;
+  ServoV8InterfaceValue value;
+} ServoV8NodeMutationOutcome;
+
+#define SERVO_V8_ATTRIBUTE_MUTATION_RETURNED 0u
+#define SERVO_V8_ATTRIBUTE_MUTATION_DOM_EXCEPTION 1u
+#define SERVO_V8_ATTRIBUTE_MUTATION_HOST_FAILURE 2u
+
+#define SERVO_V8_ATTRIBUTE_MUTATION_EXCEPTION_NONE 0u
+#define SERVO_V8_ATTRIBUTE_MUTATION_EXCEPTION_INVALID_CHARACTER 1u
+
+typedef struct ServoV8ToggleAttributeOutcome {
+  uint32_t status;
+  uint32_t exception_kind;
+  ServoV8OwnedUtf8 exception_message;
+  uint8_t value;
+} ServoV8ToggleAttributeOutcome;
+
+typedef struct ServoV8ElementHostVTable {
+  uint8_t (*get_local_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*get_tag_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*get_namespace_uri)(void* native,
+                               ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*get_prefix)(void* native, ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*get_id)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*set_id)(void* native,
+                    void* host_context,
+                    const uint8_t* value,
+                    size_t value_length);
+  uint8_t (*get_class_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*set_class_name)(void* native,
+                            void* host_context,
+                            const uint8_t* value,
+                            size_t value_length);
+  uint8_t (*has_attributes)(void* native, uint8_t* output);
+  uint8_t (*get_attribute_names)(void* native,
+                                 ServoV8OwnedUtf8Sequence* output);
+  uint8_t (*get_attribute)(void* native,
+                           void* host_context,
+                           const uint8_t* name,
+                           size_t name_length,
+                           ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*has_attribute)(void* native,
+                           void* host_context,
+                           const uint8_t* name,
+                           size_t name_length,
+                           uint8_t* output);
+  uint8_t (*get_attribute_ns)(void* native,
+                              void* host_context,
+                              uint8_t namespace_is_null,
+                              const uint8_t* namespace_bytes,
+                              size_t namespace_length,
+                              const uint8_t* local_name,
+                              size_t local_name_length,
+                              ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*has_attribute_ns)(void* native,
+                              void* host_context,
+                              uint8_t namespace_is_null,
+                              const uint8_t* namespace_bytes,
+                              size_t namespace_length,
+                              const uint8_t* local_name,
+                              size_t local_name_length,
+                              uint8_t* output);
+  uint8_t (*toggle_attribute)(void* native,
+                              void* host_context,
+                              const uint8_t* name,
+                              size_t name_length,
+                              uint8_t force_is_present,
+                              uint8_t force,
+                              ServoV8ToggleAttributeOutcome* output);
+  uint8_t (*remove_attribute)(void* native,
+                              void* host_context,
+                              const uint8_t* name,
+                              size_t name_length);
+  uint8_t (*remove_attribute_ns)(void* native,
+                                 void* host_context,
+                                 uint8_t namespace_is_null,
+                                 const uint8_t* namespace_bytes,
+                                 size_t namespace_length,
+                                 const uint8_t* local_name,
+                                 size_t local_name_length);
+  uint8_t (*get_node_type)(void* native, uint16_t* output);
+  uint8_t (*get_node_name)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*get_is_connected)(void* native, uint8_t* output);
+  uint8_t (*get_text_content)(void* native,
+                              ServoV8OptionalOwnedUtf8* output);
+  uint8_t (*set_text_content)(void* native,
+                              void* host_context,
+                              uint8_t is_null,
+                              const uint8_t* value,
+                              size_t value_length);
+  uint8_t (*get_parent_element)(void* native,
+                                ServoV8InterfaceValue* output);
+  uint8_t (*has_child_nodes)(void* native, uint8_t* output);
+  uint8_t (*get_data)(void* native, ServoV8OwnedUtf8* output);
+  uint8_t (*set_data)(void* native,
+                      void* host_context,
+                      const uint8_t* value,
+                      size_t value_length);
+  uint8_t (*get_length)(void* native, uint32_t* output);
+  uint8_t (*substring_data)(void* native,
+                            uint32_t offset,
+                            uint32_t count,
+                            ServoV8CharacterDataStringOutcome* output);
+  uint8_t (*append_data)(void* native,
+                         void* host_context,
+                         const uint8_t* value,
+                         size_t value_length);
+  uint8_t (*insert_before)(void* native,
+                           void* host_context,
+                           void* node_native,
+                           uint8_t child_is_null,
+                           void* child_native,
+                           ServoV8NodeMutationOutcome* output);
+  uint8_t (*append_child)(void* native,
+                          void* host_context,
+                          void* node_native,
+                          ServoV8NodeMutationOutcome* output);
+  uint8_t (*replace_child)(void* native,
+                           void* host_context,
+                           void* node_native,
+                           void* child_native,
+                           ServoV8NodeMutationOutcome* output);
+  uint8_t (*remove_child)(void* native,
+                          void* host_context,
+                          void* child_native,
+                          ServoV8NodeMutationOutcome* output);
+  uint8_t (*get_children)(void* native,
+                          ServoV8HTMLCollectionValue* output);
+  uint8_t (*get_elements_by_tag_name)(
+      void* native,
+      const uint8_t* qualified_name,
+      size_t qualified_name_length,
+      ServoV8HTMLCollectionValue* output);
+  uint8_t (*get_elements_by_tag_name_ns)(
+      void* native,
+      uint8_t namespace_is_null,
+      const uint8_t* namespace_value,
+      size_t namespace_length,
+      const uint8_t* local_name,
+      size_t local_name_length,
+      ServoV8HTMLCollectionValue* output);
+  uint8_t (*get_elements_by_class_name)(
+      void* native,
+      const uint8_t* class_names,
+      size_t class_names_length,
+      ServoV8HTMLCollectionValue* output);
+  uint8_t (*get_first_element_child)(void* native,
+                                     ServoV8InterfaceValue* output);
+  uint8_t (*get_last_element_child)(void* native,
+                                    ServoV8InterfaceValue* output);
+  uint8_t (*get_child_element_count)(void* native, uint32_t* output);
+  uint8_t (*get_previous_element_sibling)(void* native,
+                                          ServoV8InterfaceValue* output);
+  uint8_t (*get_next_element_sibling)(void* native,
+                                      ServoV8InterfaceValue* output);
+  uint8_t (*remove)(void* native, void* host_context);
+  uint8_t (*query_selector)(void* native,
+                            void* host_context,
+                            const uint8_t* selectors,
+                            size_t selectors_length,
+                            ServoV8SelectorElementOutcome* output);
+  uint8_t (*closest)(void* native,
+                     void* host_context,
+                     const uint8_t* selectors,
+                     size_t selectors_length,
+                     ServoV8SelectorElementOutcome* output);
+  uint8_t (*matches)(void* native,
+                     void* host_context,
+                     const uint8_t* selectors,
+                     size_t selectors_length,
+                     ServoV8SelectorBooleanOutcome* output);
+  uint8_t (*webkit_matches_selector)(void* native,
+                                     void* host_context,
+                                     const uint8_t* selectors,
+                                     size_t selectors_length,
+                                     ServoV8SelectorBooleanOutcome* output);
+  uint8_t (*query_selector_all)(void* native,
+                                void* host_context,
+                                const uint8_t* selectors,
+                                size_t selectors_length,
+                                ServoV8SelectorNodeListOutcome* output);
+  ServoV8DropCallback drop;
+} ServoV8ElementHostVTable;
+
+/* One static NodeList returned by querySelectorAll. The host owns strong Servo
+ * roots for the result snapshot; item() transfers a fresh Element host whose
+ * wrapper is deduplicated by the realm cache. */
+typedef struct ServoV8NodeListHostVTable {
+  uint8_t (*get_length)(void* native, uint32_t* output);
+  uint8_t (*item)(void* native,
+                  uint32_t index,
+                  ServoV8InterfaceValue* output);
+  ServoV8DropCallback drop;
+} ServoV8NodeListHostVTable;
+
+/* One live HTMLCollection. The host roots its owner and derives the current
+ * matching elements on every callback. */
+typedef struct ServoV8HTMLCollectionHostVTable {
+  uint8_t (*get_length)(void* native, uint32_t* output);
+  uint8_t (*item)(void* native,
+                  uint32_t index,
+                  ServoV8InterfaceValue* output);
+  uint8_t (*named_item)(void* native,
+                        const uint8_t* name,
+                        size_t name_length,
+                        ServoV8InterfaceValue* output);
+  uint8_t (*get_supported_name_count)(void* native, uint32_t* output);
+  uint8_t (*supported_name)(void* native,
+                            uint32_t index,
+                            ServoV8OwnedUtf8* output);
+  ServoV8DropCallback drop;
+} ServoV8HTMLCollectionHostVTable;
+
+/* A realm-owned host for HTML's timer scheduling algorithms.
+ *
+ * V8 owns callable handlers and their arbitrary JS arguments. Servo owns wall
+ * clock scheduling, nesting, cancellation, and the numeric handle exposed to
+ * the page. `host_context` is the live SpiderMonkey JSContext for the current
+ * V8 entry and may be used only synchronously. */
+typedef struct ServoV8TimerHostVTable {
+  uint8_t (*schedule_function)(void* native,
+                               void* host_context,
+                               ServoV8TimerCallbackId callback_id,
+                               int32_t timeout_ms,
+                               uint8_t is_interval,
+                               int32_t* handle);
+  uint8_t (*schedule_string)(void* native,
+                             void* host_context,
+                             const uint8_t* source,
+                             size_t source_length,
+                             int32_t timeout_ms,
+                             uint8_t is_interval,
+                             int32_t* handle);
+  void (*clear)(void* native, int32_t handle);
+  ServoV8DropCallback drop;
+} ServoV8TimerHostVTable;
+
+/* A MediaQueryList object returned by a Window matchMedia host. The native
+ * pointer is owned by the bridge and is released through the installed
+ * MediaQueryList host vtable. */
+typedef struct ServoV8MediaQueryListHandle {
+  void* native;
+} ServoV8MediaQueryListHandle;
+
+/* A realm-owned host for Window.matchMedia. `host_context` is the live
+ * SpiderMonkey JSContext for the current V8 entry and may be used only
+ * synchronously. On success, the callback writes one owned MQL handle. */
+typedef struct ServoV8WindowHostVTable {
+  uint8_t (*match_media)(void* native,
+                         void* host_context,
+                         const uint8_t* query,
+                         size_t query_length,
+                         ServoV8MediaQueryListHandle* output);
+  ServoV8DropCallback drop;
+} ServoV8WindowHostVTable;
+
+/* A type-level host for one MediaQueryList's live `matches` state. */
+typedef struct ServoV8MediaQueryListHostVTable {
+  uint8_t (*get_matches)(void* native, uint8_t* output);
+  ServoV8DropCallback drop;
+} ServoV8MediaQueryListHostVTable;
+
+/* The supported console namespace logging levels. Values are stable ABI. */
+enum ServoV8ConsoleLevel {
+  SERVO_V8_CONSOLE_DEBUG = 0,
+  SERVO_V8_CONSOLE_ERROR = 1,
+  SERVO_V8_CONSOLE_INFO = 2,
+  SERVO_V8_CONSOLE_LOG = 3,
+  SERVO_V8_CONSOLE_TRACE = 4,
+  SERVO_V8_CONSOLE_WARN = 5,
+};
+
+/* A realm-owned sink for V8 console output.
+ *
+ * V8 values are formatted while they are still local handles in C++. Only
+ * validated UTF-8 and a POD level cross into Rust, so no V8 handle, traced
+ * pointer, or cross-heap ownership edge enters Servo. */
+typedef struct ServoV8ConsoleHostVTable {
+  void (*write)(void* native,
+                uint32_t level,
+                const uint8_t* message,
+                size_t message_length);
+  ServoV8DropCallback drop;
+} ServoV8ConsoleHostVTable;
 
 uint32_t servo_v8_abi_version(void);
 
@@ -124,6 +476,39 @@ int32_t servo_v8_realm_script_discard(ServoV8Runtime* runtime,
                                       ServoV8ScriptId script_id,
                                       ServoV8ErrorBuffer* error);
 
+/* Drains the isolate's explicit microtask queue.
+ *
+ * The queue is isolate-wide because V8 requires contexts that can access each
+ * other synchronously to share one queue, and same-origin Servo pipelines on
+ * one script thread do exactly that. A job may therefore belong to any realm,
+ * so the ephemeral host context is installed on every live realm for the
+ * duration of the drain and cleared from all of them on every return path.
+ *
+ * Only termination is reported through the outcome. A job that fails is
+ * buffered instead, because one drain can produce many failures; pull them
+ * with servo_v8_runtime_take_pending_job_error. That covers both channels: an
+ * uncaught job exception and a rejection still unhandled when the drain
+ * ends. */
+int32_t servo_v8_runtime_perform_microtask_checkpoint(
+    ServoV8Runtime* runtime,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error);
+
+/* Pops the oldest buffered microtask job error, if any.
+ *
+ * Sets *has_error to 0 and leaves the exception cleared once drained, so the
+ * caller loops until it reports none. *realm_id names the realm the failure
+ * belongs to -- for a rejection, the realm that created the promise rather
+ * than whichever was entered -- so the embedder can fire the event on the
+ * right global. It is 0 when the realm could not be determined. */
+int32_t servo_v8_runtime_take_pending_job_error(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId* realm_id,
+    ServoV8ScriptException* exception,
+    uint8_t* has_error,
+    ServoV8ErrorBuffer* error);
+
 /* Consumes native only on success; failure leaves ownership with the caller. */
 int32_t servo_v8_realm_install_document_host(
     ServoV8Runtime* runtime,
@@ -132,10 +517,75 @@ int32_t servo_v8_realm_install_document_host(
     const ServoV8DocumentHostVTable* vtable,
     ServoV8ErrorBuffer* error);
 
+/* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_timer_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8TimerHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_window_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8WindowHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Consumes native only on success; failure leaves ownership with the caller. */
+int32_t servo_v8_realm_install_console_host(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    void* native,
+    const ServoV8ConsoleHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Invokes one V8 function handler retained by setTimeout/setInterval. */
+int32_t servo_v8_realm_timer_callback_run(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
+    void* host_context,
+    ServoV8ScriptRunOutcome* outcome,
+    ServoV8ErrorBuffer* error);
+
+/* Releases a retained timer function without invoking it. Missing callbacks
+ * are a successful no-op, matching clearTimeout/clearInterval semantics. */
+int32_t servo_v8_realm_timer_callback_clear(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    ServoV8TimerCallbackId callback_id,
+    ServoV8ErrorBuffer* error);
+
 int32_t servo_v8_realm_document_hidden(ServoV8Runtime* runtime,
                                        ServoV8RealmId realm_id,
                                        uint8_t* result,
                                        ServoV8ErrorBuffer* error);
+
+/* Registers the type-level Element host vtable for this runtime. */
+int32_t servo_v8_install_element_host(
+    ServoV8Runtime* runtime,
+    const ServoV8ElementHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Registers the type-level static NodeList host vtable for this runtime. */
+int32_t servo_v8_install_node_list_host(
+    ServoV8Runtime* runtime,
+    const ServoV8NodeListHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Registers the type-level live HTMLCollection host vtable for this runtime. */
+int32_t servo_v8_install_html_collection_host(
+    ServoV8Runtime* runtime,
+    const ServoV8HTMLCollectionHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
+
+/* Registers the type-level MediaQueryList host vtable for this runtime. */
+int32_t servo_v8_install_media_query_list_host(
+    ServoV8Runtime* runtime,
+    const ServoV8MediaQueryListHostVTable* vtable,
+    ServoV8ErrorBuffer* error);
 
 int32_t servo_v8_install_engine_binding_smoke(
     ServoV8Runtime* runtime,
@@ -169,6 +619,13 @@ void servo_v8_terminate_execution(ServoV8Runtime* runtime);
 
 /* Requires the runtime to have been created with expose_gc for test use. */
 void servo_v8_collect_garbage_for_testing(ServoV8Runtime* runtime);
+
+/* Test-only visibility into weak wrapper-cache pruning; requires expose_gc. */
+int32_t servo_v8_realm_wrapper_cache_size_for_testing(
+    ServoV8Runtime* runtime,
+    ServoV8RealmId realm_id,
+    size_t* result,
+    ServoV8ErrorBuffer* error);
 
 /* Returns the native allocation only when the live cell's interface ID matches. */
 void* servo_v8_dom_cell_native(ServoV8DomCell* cell,

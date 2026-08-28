@@ -67,12 +67,47 @@ pub(crate) enum ClassicScriptEngine {
 
 #[cfg(feature = "v8-classic-script-authoritative")]
 enum V8ClassicScriptRecord {
-    Compiled {
-        realm_id: servo_v8::RealmId,
-        script_id: servo_v8::ScriptId,
-    },
+    Compiled(V8RetainedScript),
     ParseError(servo_v8::ScriptException),
     InternalFailure(String),
+}
+
+/// A compiled classic script that V8 retains until it is either executed or
+/// discarded. HTML lets a created script never run — "check if we can run
+/// script" can say "do not run", and a fetched script can be abandoned — so
+/// this owns the handle and releases it on drop. Realm destruction would
+/// eventually reclaim it, but a long-lived pipeline must not accumulate
+/// compiled scripts that can no longer be reached.
+#[cfg(feature = "v8-classic-script-authoritative")]
+struct V8RetainedScript {
+    realm_id: servo_v8::RealmId,
+    script_id: servo_v8::ScriptId,
+    /// Set when the handle has been handed to V8 for execution, which
+    /// consumes it. Discarding it again would target a dead handle.
+    consumed: bool,
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+impl V8RetainedScript {
+    /// Records that V8 took the handle, so dropping this must not discard it.
+    ///
+    /// Call this only once V8 has reported an outcome. V8 consumes the handle
+    /// for every outcome it reports, including a throw, but it releases it
+    /// only after the last way the call can fail, so a failure to reach V8
+    /// leaves the handle retained and still needing a discard.
+    fn mark_consumed(mut self) {
+        self.consumed = true;
+    }
+}
+
+#[cfg(feature = "v8-classic-script-authoritative")]
+impl Drop for V8RetainedScript {
+    fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
+        ScriptThread::discard_authoritative_classic_script(self.realm_id, self.script_id);
+    }
 }
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
@@ -143,10 +178,11 @@ impl GlobalScope {
                     line_number,
                 ) {
                     Ok((realm_id, servo_v8::ScriptCompileOutcome::Compiled(script_id))) => {
-                        V8ClassicScriptRecord::Compiled {
+                        V8ClassicScriptRecord::Compiled(V8RetainedScript {
                             realm_id,
                             script_id,
-                        }
+                            consumed: false,
+                        })
                     },
                     Ok((_, servo_v8::ScriptCompileOutcome::ParseError(exception))) => {
                         V8ClassicScriptRecord::ParseError(exception)
@@ -237,29 +273,47 @@ impl GlobalScope {
             let mut realm = enter_auto_realm(cx, self);
             let cx = &mut realm.current_realm();
             return run_a_script::<DomTypeHolder, _, _>(cx, self, |cx| match v8_record {
-                V8ClassicScriptRecord::Compiled {
-                    realm_id,
-                    script_id,
-                } => match ScriptThread::run_authoritative_classic_script(
-                    self.pipeline_id(),
-                    realm_id,
-                    script_id,
-                    cx,
-                ) {
-                    Ok(servo_v8::ScriptRunOutcome::Completed) => Ok(()),
-                    Ok(servo_v8::ScriptRunOutcome::Thrown(exception)) => {
-                        self.report_v8_classic_script_error(cx, exception, muted_errors)
-                    },
-                    Ok(servo_v8::ScriptRunOutcome::Terminated) => Err(Error::JSFailed),
-                    Err(error) => panic!(
-                        "authoritative V8 classic-script execution failed internally: {error}"
-                    ),
+                V8ClassicScriptRecord::Compiled(retained) => {
+                    let outcome = ScriptThread::run_authoritative_classic_script(
+                        self.pipeline_id(),
+                        retained.realm_id,
+                        retained.script_id,
+                        cx,
+                    );
+                    // Only an outcome means V8 took the handle. On failure the
+                    // handle is still retained, so leaving `retained` to drop
+                    // discards it instead of leaking it to realm destruction.
+                    if outcome.is_ok() {
+                        retained.mark_consumed();
+                    }
+                    match outcome {
+                        Ok(servo_v8::ScriptRunOutcome::Completed) => Ok(()),
+                        Ok(servo_v8::ScriptRunOutcome::Thrown(exception)) => {
+                            self.report_v8_classic_script_error(cx, exception, muted_errors)
+                        },
+                        Ok(servo_v8::ScriptRunOutcome::Terminated) => Err(Error::JSFailed),
+                        // The script thread can be torn down between compiling
+                        // this script and running it: the sidecar may be gone
+                        // and the realm destroyed. That is a lost script, not a
+                        // bug, and it must not abort the process. Failing the
+                        // script is still strict — nothing re-runs it on
+                        // SpiderMonkey.
+                        Err(error) => {
+                            warn!("authoritative V8 classic script could not run: {error}");
+                            Err(Error::JSFailed)
+                        },
+                    }
                 },
                 V8ClassicScriptRecord::ParseError(exception) => {
                     self.report_v8_classic_script_error(cx, exception, muted_errors)
                 },
+                // Compilation happens when the script is created, which for a
+                // deferred or async script can be long before it runs. The
+                // same teardown races apply, so this fails the script rather
+                // than aborting, for the same reason as the run path above.
                 V8ClassicScriptRecord::InternalFailure(error) => {
-                    panic!("authoritative V8 classic-script compilation failed internally: {error}")
+                    warn!("authoritative V8 classic script could not compile: {error}");
+                    Err(Error::JSFailed)
                 },
             });
         }
@@ -362,7 +416,7 @@ impl GlobalScope {
     }
 
     #[cfg(feature = "v8-classic-script-authoritative")]
-    fn report_v8_classic_script_error(
+    pub(crate) fn report_v8_classic_script_error(
         &self,
         cx: &mut JSContext,
         exception: servo_v8::ScriptException,

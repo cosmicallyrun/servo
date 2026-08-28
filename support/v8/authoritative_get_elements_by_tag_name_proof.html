@@ -1,0 +1,209 @@
+<!doctype html>
+<!--
+Runtime proof for Document/Element getElementsByTagName() and fresh live
+HTMLCollection hosts. It pins WebIDL conversion and receiver ordering, HTML
+case folding, namespace-sensitive SVG names, scope/order/identity, and live
+updates after a real Servo tree mutation.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative getElementsByTagName proof</title>
+    <style>
+      .fixture { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <section id="scope" class="fixture">
+      <article id="first" name="named-first">
+        first
+        <span id="nested">nested</span>
+      </article>
+      <em id="second" name="named-second">second</em>
+      <svg id="graphic" xmlns="http://www.w3.org/2000/svg">
+        <circle id="circle"></circle>
+      </svg>
+    </section>
+    <script data-servo-v8="authoritative">
+      const scope = document.querySelector("#scope");
+      const first = document.querySelector("#first");
+      const nested = document.querySelector("#nested");
+      const second = document.querySelector("#second");
+      const graphic = document.querySelector("#graphic");
+      const circle = document.querySelector("#circle");
+      const documentDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document),
+        "getElementsByTagName",
+      );
+      const elementDescriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(scope),
+        "getElementsByTagName",
+      );
+
+      for (const [receiver, descriptor] of [
+        [document, documentDescriptor],
+        [scope, elementDescriptor],
+      ]) {
+        if (
+          !descriptor ||
+          typeof descriptor.value !== "function" ||
+          descriptor.value.name !== "getElementsByTagName" ||
+          descriptor.value.length !== 1 ||
+          !descriptor.writable ||
+          !descriptor.enumerable ||
+          !descriptor.configurable ||
+          Object.hasOwn(receiver, "getElementsByTagName")
+        ) {
+          throw new Error("bad getElementsByTagName method descriptor");
+        }
+      }
+
+      let wrongBrandStringified = false;
+      for (const descriptor of [documentDescriptor, elementDescriptor]) {
+        let rejected = false;
+        try {
+          descriptor.value.call({}, {
+            toString() {
+              wrongBrandStringified = true;
+              return "*";
+            },
+          });
+        } catch (error) {
+          rejected = error instanceof TypeError;
+        }
+        if (!rejected) {
+          throw new Error("getElementsByTagName accepted the wrong receiver");
+        }
+      }
+      if (wrongBrandStringified) {
+        throw new Error("getElementsByTagName converted before its brand check");
+      }
+
+      const conversionError = new Error("tag-name conversion sentinel");
+      for (const receiver of [document, scope]) {
+        let preserved = false;
+        let missingRejected = false;
+        let symbolRejected = false;
+        try {
+          receiver.getElementsByTagName({
+            toString() { throw conversionError; },
+          });
+        } catch (error) {
+          preserved = error === conversionError;
+        }
+        try {
+          receiver.getElementsByTagName();
+        } catch (error) {
+          missingRejected = error instanceof TypeError;
+        }
+        try {
+          receiver.getElementsByTagName(Symbol("article"));
+        } catch (error) {
+          symbolRejected = error instanceof TypeError;
+        }
+        let conversions = 0;
+        const converted = receiver.getElementsByTagName({
+          toString() {
+            conversions++;
+            return "ARTICLE";
+          },
+        });
+        if (
+          !preserved ||
+          !missingRejected ||
+          !symbolRejected ||
+          conversions !== 1 ||
+          converted.length !== 1 ||
+          converted[0] !== first
+        ) {
+          throw new Error("bad getElementsByTagName WebIDL conversion");
+        }
+      }
+
+      const documentArticles = document.getElementsByTagName("ARTICLE");
+      const scopedArticles = scope.getElementsByTagName("ARTICLE");
+      const scopedAll = scope.getElementsByTagName("*");
+      const svgCircles = scope.getElementsByTagName("circle");
+      if (
+        !(documentArticles instanceof HTMLCollection) ||
+        !(scopedArticles instanceof HTMLCollection) ||
+        documentArticles === document.getElementsByTagName("article") ||
+        scopedArticles === scope.getElementsByTagName("article") ||
+        documentArticles === scopedArticles ||
+        scopedArticles === scope.children ||
+        scopedArticles === scope.getElementsByClassName("fixture") ||
+        documentArticles.length !== 1 ||
+        documentArticles[0] !== first ||
+        scopedArticles.length !== 1 ||
+        scopedArticles[0] !== first ||
+        scopedArticles.item(0) !== first ||
+        scopedArticles[1] !== undefined ||
+        scopedArticles.item(1) !== null ||
+        scopedArticles["first"] !== first ||
+        scopedArticles.namedItem("first") !== first ||
+        scopedArticles["named-first"] !== first ||
+        scopedArticles.namedItem("named-first") !== first ||
+        scope.getElementsByTagName("SECTION").length !== 0 ||
+        scope.getElementsByTagName("").length !== 0 ||
+        scopedAll.length !== 5 ||
+        scopedAll[0] !== first ||
+        scopedAll[1] !== nested ||
+        scopedAll[2] !== second ||
+        scopedAll[3] !== graphic ||
+        scopedAll[4] !== circle ||
+        svgCircles.length !== 1 ||
+        svgCircles[0] !== circle ||
+        scope.getElementsByTagName("CIRCLE").length !== 0
+      ) {
+        throw new Error("bad tag collection scope, order, names, or case matching");
+      }
+
+      first.tagMarker = 83;
+      if (
+        document.getElementById("first") !== first ||
+        scope.querySelector("#first").tagMarker !== 83 ||
+        scope.getElementsByTagName("article")[0] !== first
+      ) {
+        throw new Error("tag collection items did not join the Element wrapper cache");
+      }
+
+      scope.textContent = "";
+      if (
+        scopedArticles.length !== 0 ||
+        scopedArticles[0] !== undefined ||
+        scopedArticles.item(0) !== null ||
+        scopedArticles["first"] !== undefined ||
+        scopedArticles.namedItem("first") !== null ||
+        scopedAll.length !== 0 ||
+        svgCircles.length !== 0 ||
+        documentArticles.length !== 0 ||
+        first.isConnected ||
+        nested.isConnected ||
+        second.isConnected ||
+        graphic.isConnected ||
+        circle.isConnected
+      ) {
+        throw new Error("tag collections were not live across tree mutation");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+    <script>
+      var nativeScope = document.getElementById("scope");
+      if (
+        nativeScope.childElementCount !== 0 ||
+        document.getElementById("first") !== null ||
+        document.getElementById("nested") !== null ||
+        document.getElementById("second") !== null ||
+        document.getElementById("graphic") !== null ||
+        document.getElementById("circle") !== null ||
+        document.getElementsByTagName("article").length !== 0 ||
+        document.getElementsByTagName("section")[0] !== nativeScope
+      ) {
+        document.body.setAttribute("bgcolor", "red");
+      }
+    </script>
+  </body>
+</html>

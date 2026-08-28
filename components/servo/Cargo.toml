@@ -62,6 +62,10 @@ tracing = [
 ]
 v8-shadow = ["script/v8-shadow"]
 v8-classic-script-authoritative = ["v8-shadow", "script/v8-classic-script-authoritative"]
+v8-all-html-classic-scripts-authoritative = [
+    "v8-classic-script-authoritative",
+    "script/v8-all-html-classic-scripts-authoritative",
+]
 v8-document-hidden-diagnostic = ["v8-shadow", "script/v8-document-hidden-diagnostic"]
 v8-document-hidden-authoritative = [
     "v8-document-hidden-diagnostic",

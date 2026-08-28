@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 
+import generate  # noqa: E402
 import generate_document_host  # noqa: E402
 import production_webidl  # noqa: E402
 
@@ -20,17 +21,17 @@ class DocumentHostGenerationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.temporary_directory = tempfile.TemporaryDirectory()
-        cls.attributes = production_webidl.select_document_host_attributes(
+        cls.members = production_webidl.select_document_host_members(
             Path(cls.temporary_directory.name) / "cache",
             environment={},
         )
-        cls.outputs = generate_document_host.generate_outputs(cls.attributes)
+        cls.outputs = generate_document_host.generate_outputs(cls.members)
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temporary_directory.cleanup()
 
-    def test_generates_c_vtable_from_real_document_attributes(self) -> None:
+    def test_generates_c_vtable_from_real_document_members(self) -> None:
         output = self.outputs[generate_document_host.HEADER_NAME]
         expected_fragments = (
             "typedef struct ServoV8OwnedUtf8 {",
@@ -38,6 +39,41 @@ class DocumentHostGenerationTests(unittest.TestCase):
             "uint8_t (*get_hidden)(void* native);",
             "uint8_t (*get_bg_color)(void* native, ServoV8OwnedUtf8* output);",
             "uint8_t (*set_bg_color)(void* native, void* host_context,",
+            "uint8_t (*get_document_uri)(void* native, ServoV8OwnedUtf8* output);",
+            "uint8_t (*get_compat_mode)(void* native, ServoV8OwnedUtf8* output);",
+            "uint8_t (*get_last_modified)(void* native, ServoV8OwnedUtf8* output);",
+            "uint8_t (*get_ready_state)(void* native, ServoV8OwnedUtf8* output);",
+            "uint8_t (*get_title)(void* native, ServoV8OwnedUtf8* output);",
+            "uint8_t (*set_title)(void* native, void* host_context,",
+            "uint8_t (*get_head)(void* native, ServoV8InterfaceValue* output);",
+            "typedef struct ServoV8HTMLCollectionValue {",
+            "const void* key;",
+            "void* native;",
+            "uint8_t (*get_children)(void* native, ServoV8HTMLCollectionValue* output);",
+            "uint8_t (*get_elements_by_tag_name)(void* native,",
+            "const uint8_t* qualified_name,",
+            "size_t qualified_name_length,",
+            "uint8_t (*get_elements_by_tag_name_ns)(void* native,",
+            "uint8_t namespace_is_null,",
+            "const uint8_t* namespace_,",
+            "size_t namespace_length,",
+            "uint8_t (*get_elements_by_class_name)(void* native,",
+            "const uint8_t* class_names,",
+            "size_t class_names_length,",
+            "uint8_t (*get_first_element_child)(void* native, ServoV8InterfaceValue* output);",
+            "uint8_t (*get_last_element_child)(void* native, ServoV8InterfaceValue* output);",
+            "uint32_t (*get_child_element_count)(void* native);",
+            "uint8_t (*get_element_by_id)(void* native, void* host_context,",
+            "typedef struct ServoV8SelectorElementOutcome {",
+            "typedef struct ServoV8SelectorBooleanOutcome {",
+            "typedef struct ServoV8SelectorNodeListOutcome {",
+            "typedef struct ServoV8DocumentCreateElementOutcome {",
+            "uint8_t (*query_selector)(void* native, void* host_context,",
+            "uint8_t (*query_selector_all)(void* native, void* host_context,",
+            "ServoV8SelectorNodeListOutcome* output);",
+            "uint8_t (*create_element)(void* native, void* host_context,",
+            "ServoV8DocumentCreateElementOutcome* output);",
+            "const uint8_t* element_id,",
             "ServoV8DropCallback drop;",
         )
         for fragment in expected_fragments:
@@ -49,12 +85,52 @@ class DocumentHostGenerationTests(unittest.TestCase):
         expected_fragments = (
             "fn hidden(&self) -> bool;",
             "fn bg_color(&self) -> String;",
+            "fn document_uri(&self) -> String;",
+            "fn compat_mode(&self) -> String;",
+            "fn last_modified(&self) -> String;",
+            "fn ready_state(&self) -> String;",
+            "fn title(&self) -> String;",
+            "unsafe fn set_title(",
             "unsafe fn set_bg_color(",
             "pub struct OwnedUtf8 {",
             "Box::new(native.bg_color().into_bytes())",
             "Box::from_raw(owner.cast::<Vec<u8>>())",
             "std::str::from_utf8(bytes)",
+            "fn head(&self) -> Option<InterfaceHandle>;",
+            "fn children(&self) -> HTMLCollectionHandle;",
+            "fn get_elements_by_tag_name(&self, qualified_name: &str) -> HTMLCollectionHandle;",
+            "fn get_elements_by_tag_name_ns(",
+            "namespace: Option<&str>,",
+            "qualified_name: &str,",
+            "fn get_elements_by_class_name(&self, class_names: &str) -> HTMLCollectionHandle;",
+            "pub struct RawHTMLCollectionValue {",
+            "output: *mut RawHTMLCollectionValue,",
+            "*output = RawHTMLCollectionValue {",
+            "fn first_element_child(&self) -> Option<InterfaceHandle>;",
+            "fn last_element_child(&self) -> Option<InterfaceHandle>;",
+            "fn child_element_count(&self) -> u32;",
+            "unsafe fn get_element_by_id(",
+            "unsafe fn query_selector(",
+            "unsafe fn query_selector_all(",
+            "pub struct RawSelectorElementOutcome {",
+            "pub struct RawSelectorBooleanOutcome {",
+            "pub struct RawSelectorNodeListOutcome {",
+            "pub enum DocumentCreateElementResult {",
+            "pub struct RawDocumentCreateElementOutcome {",
+            "unsafe fn create_element(",
+            "local_name: &str,",
+            "is: Option<&str>,",
+            "std::slice::from_raw_parts(element_id, element_id_length)",
+            "std::slice::from_raw_parts(class_names, class_names_length)",
             "set_bg_color: Some(document_host_set_bg_color::<T>)",
+            "set_title: Some(document_host_set_title::<T>)",
+            "get_element_by_id: Some(document_host_get_element_by_id::<T>)",
+            "get_elements_by_tag_name: Some(document_host_get_elements_by_tag_name::<T>)",
+            "get_elements_by_tag_name_ns: Some(document_host_get_elements_by_tag_name_ns::<T>)",
+            "get_elements_by_class_name: Some(document_host_get_elements_by_class_name::<T>)",
+            "query_selector: Some(document_host_query_selector::<T>)",
+            "query_selector_all: Some(document_host_query_selector_all::<T>)",
+            "create_element: Some(document_host_create_element::<T>)",
         )
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
@@ -64,31 +140,447 @@ class DocumentHostGenerationTests(unittest.TestCase):
         output = self.outputs[generate_document_host.CPP_NAME]
         expected_fragments = (
             "class DocumentHostOwnedUtf8Scope {",
+            "RustCallbackScope callback_scope(runtime_);",
+            "DocumentHostOwnedUtf8Scope value_scope(state->runtime, &value);",
             "DocumentHostGetHidden(",
             "DocumentHostGetBgColor(",
             "DocumentHostSetBgColor(",
+            "DocumentHostGetDocumentUri(",
+            "DocumentHostGetCompatMode(",
+            "DocumentHostGetLastModified(",
+            "DocumentHostGetTitle(",
+            "DocumentHostSetTitle(",
+            "DocumentHostGetDocumentElement(",
+            "DocumentHostGetHead(",
+            "DocumentHostGetChildren(",
+            "DocumentHostCallGetElementsByTagName(",
+            "DocumentHostCallGetElementsByTagNameNs(",
+            "DocumentHostCallGetElementsByClassName(",
+            "ServoV8HTMLCollectionValue value{};",
+            "!realm->runtime->html_collection_host_installed",
+            "DropUnownedHTMLCollectionHost(state->runtime, value.native);",
+            "WrapperForHTMLCollectionValue(realm, context, value);",
+            "DocumentHostGetFirstElementChild(",
+            "DocumentHostGetLastElementChild(",
+            "DocumentHostGetChildElementCount(",
+            "DocumentHostCallGetElementById(",
+            "DocumentHostCallQuerySelector(",
+            "DocumentHostCallQuerySelectorAll(",
+            "DocumentHostCallCreateElement(",
             "auto* state = UnwrapDocumentHostState(info);",
             "if (info[0]->IsNull()) {",
             "info[0]->ToString(context)",
             "v8::String::Utf8Value utf8(isolate, value);",
-            "CallDocumentHostSetBgColor(",
+            "state->vtable.set_bg_color(",
+            "state->vtable.get_ready_state(state->native, &value)",
+            "value.kind > SERVO_V8_INTERFACE_ELEMENT",
+            "Document.getElementById requires one argument",
+            "Document.getElementsByTagName requires one argument",
+            "Document.getElementsByTagNameNS requires two arguments",
+            "Document.getElementsByClassName requires one argument",
+            "DropUnownedNodeListHost(state->runtime, outcome.native);",
+            "ReturnSelectorNodeListOutcome(realm, context, outcome, \"Document.querySelectorAll\"",
+            "InstallDocumentHostMembers(",
         )
         for fragment in expected_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, output)
+        self.assertNotIn("CallDocumentHostGet", output)
+        self.assertNotIn("CallDocumentHostSet", output)
+
+    def test_generates_create_element_webidl_conversion_before_callback(self) -> None:
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        callback = cpp.split("void DocumentHostCallCreateElement(", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        ordered_fragments = (
+            "if (!state || !state->native || !state->vtable.create_element)",
+            "element_host_installed",
+            "if (info.Length() < 1)",
+            "if (!state->active_host_context)",
+            "info[0]->ToString(context)",
+            "if (info.Length() >= 2 && !info[1]->IsUndefined())",
+            "if (info[1]->IsNull())",
+            "else if (info[1]->IsObject())",
+            '->Get(context, V8String(isolate, "is"))',
+            "if (!is_member->IsUndefined())",
+            "discarded_options_string",
+            "v8::String::Utf8Value local_name_utf8",
+            "RustCallbackScope callback_scope",
+        )
+        positions = [callback.index(fragment) for fragment in ordered_fragments]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("!*local_name_utf8 && local_name_utf8.length() != 0", callback)
+        self.assertIn("!*is_utf8 && is_utf8.length() != 0", callback)
+
+    def test_generates_create_element_outcome_cleanup_and_validation(self) -> None:
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        callback = cpp.split("void DocumentHostCallCreateElement(", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        for fragment in (
+            "DocumentHostOwnedUtf8Scope message_scope",
+            "DropUnownedElementHost(state->runtime, outcome.value.native",
+            "outcome.value.native = nullptr;",
+            "const bool valid_created =",
+            "const bool canonical_null_value =",
+            "const bool valid_invalid_character =",
+            "const bool valid_host_failure =",
+            "IsCanonicalEmptyOwnedUtf8(outcome.exception_message)",
+            "IsValidUtf8(outcome.exception_message.data,",
+            "V8String(isolate, \"InvalidCharacterError\")",
+            "WrapperForInterfaceValue(realm, isolate, context, outcome.value)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, callback)
+
+    def test_generates_create_element_thunk_validation(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        thunk = rust.split(
+            'unsafe extern "C" fn document_host_create_element', 1
+        )[1].split("\n}", 1)[0]
+
+        for fragment in (
+            "native.is_null() || host_context.is_null() || output.is_null()",
+            "local_name.is_null() && local_name_length != 0",
+            "is_is_null > 1",
+            "is_is_null == 1 && (!is.is_null() || is_length != 0)",
+            "is_is_null == 0 && is.is_null() && is_length != 0",
+            "std::str::from_utf8(local_name_bytes)",
+            "std::str::from_utf8(is_bytes)",
+            "raw_document_create_element_outcome(result)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, thunk)
+
+    def test_create_element_descriptor_uses_the_required_argument_length(self) -> None:
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallCreateElement,", 1
+        )[1].split(".ToLocal", 1)[0]
+
+        self.assertIn("v8::Local<v8::Data>(), 1,", install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", install)
+
+    def test_generates_create_document_fragment_abi_and_cleanup(self) -> None:
+        header = self.outputs[generate_document_host.HEADER_NAME]
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        self.assertIn(
+            "uint8_t (*create_document_fragment)(void* native, void* host_context,",
+            header,
+        )
+        self.assertIn("unsafe fn create_document_fragment(", rust)
+        self.assertIn(
+            'unsafe extern "C" fn document_host_create_document_fragment',
+            rust,
+        )
+        callback = cpp.split("void DocumentHostCallCreateDocumentFragment(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        for fragment in (
+            "state->active_host_context",
+            "document_fragment_template.IsEmpty()",
+            "document_fragment_prototype.IsEmpty()",
+            "DropUnownedElementHost(state->runtime, value.native",
+            "value.kind != SERVO_V8_INTERFACE_DOCUMENT_FRAGMENT",
+            "WrapperForInterfaceValue(realm, isolate, context, value)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, callback)
+        self.assertNotIn("info.Length()", callback)
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallCreateDocumentFragment,", 1
+        )[1].split(".ToLocal", 1)[0]
+        self.assertIn("v8::Local<v8::Data>(), 0,", install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", install)
+
+    def test_generates_create_text_node_abi_conversion_and_cleanup(self) -> None:
+        header = self.outputs[generate_document_host.HEADER_NAME]
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        self.assertIn(
+            "uint8_t (*create_text_node)(void* native, void* host_context,",
+            header,
+        )
+        self.assertIn(
+            "unsafe fn create_text_node(",
+            rust,
+        )
+        self.assertIn(
+            'unsafe extern "C" fn document_host_create_text_node',
+            rust,
+        )
+        callback = cpp.split("void DocumentHostCallCreateTextNode(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        ordered = (
+            "if (!state || !state->native || !state->vtable.create_text_node)",
+            "if (info.Length() < 1)",
+            "info[0]->ToString(context)",
+            "v8::String::Utf8Value data_utf8",
+            "state->active_host_context",
+            "RustCallbackScope callback_scope",
+        )
+        positions = [callback.index(fragment) for fragment in ordered]
+        self.assertEqual(positions, sorted(positions))
+        for fragment in (
+            "text_template.IsEmpty()",
+            "text_prototype.IsEmpty()",
+            "character_data_prototype.IsEmpty()",
+            "DropUnownedElementHost(state->runtime, value.native",
+            "value.kind != SERVO_V8_INTERFACE_TEXT",
+            "WrapperForInterfaceValue(realm, isolate, context, value)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, callback)
+        self.assertNotIn("info.Length() !=", callback)
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallCreateTextNode,", 1
+        )[1].split(".ToLocal", 1)[0]
+        self.assertIn("v8::Local<v8::Data>(), 1,", install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", install)
+
+    def test_generates_create_comment_abi_and_exact_kind_cleanup(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        self.assertIn("unsafe fn create_comment(", rust)
+        callback = cpp.split("void DocumentHostCallCreateComment(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        for fragment in (
+            "comment_template.IsEmpty()",
+            "comment_prototype.IsEmpty()",
+            "character_data_prototype.IsEmpty()",
+            "value.kind != SERVO_V8_INTERFACE_COMMENT",
+            "DropUnownedElementHost(state->runtime, value.native",
+            "WrapperForInterfaceValue(realm, isolate, context, value)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, callback)
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallCreateComment,", 1
+        )[1].split(".ToLocal", 1)[0]
+        self.assertIn("v8::Local<v8::Data>(), 1,", install)
+
+    def test_marks_only_pure_selector_operations_as_side_effect_free(self) -> None:
+        output = self.outputs[generate_document_host.CPP_NAME]
+        query_selector_install = output.split(
+            "v8::Function::New(context, DocumentHostCallQuerySelector,", 1
+        )[1].split(".ToLocal", 1)[0]
+        query_selector_all_install = output.split(
+            "v8::Function::New(context, DocumentHostCallQuerySelectorAll,", 1
+        )[1].split(".ToLocal", 1)[0]
+        class_query_install = output.split(
+            "v8::Function::New(context, DocumentHostCallGetElementsByClassName,", 1
+        )[1].split(".ToLocal", 1)[0]
+        tag_query_install = output.split(
+            "v8::Function::New(context, DocumentHostCallGetElementsByTagName,", 1
+        )[1].split(".ToLocal", 1)[0]
+
+        self.assertIn("v8::SideEffectType::kHasNoSideEffect", query_selector_install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", query_selector_all_install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", class_query_install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", tag_query_install)
+
+    def test_generates_context_free_class_collection_callback(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        rust_trait = rust.split(
+            "pub unsafe trait DocumentHostBinding: Sized + 'static {", 1
+        )[1].split("\n}", 1)[0]
+        rust_thunk = rust.split(
+            'unsafe extern "C" fn document_host_get_elements_by_class_name', 1
+        )[1].split("\n}", 1)[0]
+        cpp_callback = cpp.split(
+            "void DocumentHostCallGetElementsByClassName(", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn(
+            "fn get_elements_by_class_name(&self, class_names: &str) "
+            "-> HTMLCollectionHandle;",
+            rust_trait,
+        )
+        self.assertNotIn("unsafe fn get_elements_by_class_name", rust_trait)
+        self.assertNotIn("host_context", rust_thunk)
+        self.assertNotIn("active_host_context", cpp_callback)
+        self.assertIn("WrapperForHTMLCollectionValue", cpp_callback)
+        self.assertIn("DropUnownedHTMLCollectionHost", cpp_callback)
+
+    def test_generates_context_free_tag_collection_callback(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        rust_trait = rust.split(
+            "pub unsafe trait DocumentHostBinding: Sized + 'static {", 1
+        )[1].split("\n}", 1)[0]
+        rust_thunk = rust.split(
+            'unsafe extern "C" fn document_host_get_elements_by_tag_name', 1
+        )[1].split("\n}", 1)[0]
+        cpp_callback = cpp.split(
+            "void DocumentHostCallGetElementsByTagName(", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn(
+            "fn get_elements_by_tag_name(&self, qualified_name: &str) "
+            "-> HTMLCollectionHandle;",
+            rust_trait,
+        )
+        self.assertNotIn("unsafe fn get_elements_by_tag_name", rust_trait)
+        self.assertNotIn("host_context", rust_thunk)
+        self.assertNotIn("active_host_context", cpp_callback)
+        self.assertIn("WrapperForHTMLCollectionValue", cpp_callback)
+        self.assertIn("DropUnownedHTMLCollectionHost", cpp_callback)
+
+    def test_generates_namespace_collection_conversion_and_thunk_validation(self) -> None:
+        rust = self.outputs[generate_document_host.RUST_NAME]
+        cpp = self.outputs[generate_document_host.CPP_NAME]
+        rust_trait = rust.split(
+            "pub unsafe trait DocumentHostBinding: Sized + 'static {", 1
+        )[1].split("\n}", 1)[0]
+        rust_thunk = rust.split(
+            'unsafe extern "C" fn document_host_get_elements_by_tag_name_ns', 1
+        )[1].split("\n}", 1)[0]
+        cpp_callback = cpp.split(
+            "void DocumentHostCallGetElementsByTagNameNs(", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn("fn get_elements_by_tag_name_ns(", rust_trait)
+        self.assertIn("namespace: Option<&str>", rust_trait)
+        self.assertIn("qualified_name: &str", rust_trait)
+        self.assertNotIn("host_context", rust_thunk)
+        for fragment in (
+            "namespace_is_null > 1",
+            "namespace_is_null == 1 && (!namespace_.is_null() || namespace_length != 0)",
+            "namespace_is_null == 0 && namespace_.is_null() && namespace_length != 0",
+            "qualified_name.is_null() && qualified_name_length != 0",
+            "std::str::from_utf8(bytes)",
+            "std::str::from_utf8(qualified_name_bytes)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, rust_thunk)
+
+        ordered_fragments = (
+            "if (!state || !state->native || !state->vtable.get_elements_by_tag_name_ns)",
+            "html_collection_host_installed",
+            "if (info.Length() < 2)",
+            "info[0]->IsNullOrUndefined()",
+            "info[0]->ToString(context)",
+            "info[1]->ToString(context)",
+            "v8::String::Utf8Value namespace_utf8",
+            "RustCallbackScope callback_scope",
+        )
+        positions = [cpp_callback.index(fragment) for fragment in ordered_fragments]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("active_host_context", cpp_callback)
+        self.assertIn("namespace_is_null ? 1 : 0", cpp_callback)
+        self.assertIn("namespace_is_null\n            ? nullptr", cpp_callback)
+        self.assertIn("DropUnownedHTMLCollectionHost", cpp_callback)
+        self.assertIn("WrapperForHTMLCollectionValue", cpp_callback)
+
+        install = cpp.split(
+            "v8::Function::New(context, DocumentHostCallGetElementsByTagNameNs,", 1
+        )[1].split(".ToLocal", 1)[0]
+        self.assertIn("v8::Local<v8::Data>(), 2,", install)
+        self.assertIn("v8::SideEffectType::kHasSideEffect", install)
+
+    def test_generates_distinct_ordinary_and_legacy_null_conversion(self) -> None:
+        output = self.outputs[generate_document_host.CPP_NAME]
+        bg_color_setter = output.split("void DocumentHostSetBgColor(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        title_setter = output.split("void DocumentHostSetTitle(", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn("info[0]->IsNull()", bg_color_setter)
+        self.assertIn("info[0]->ToString(context)", bg_color_setter)
+        self.assertNotIn("info[0]->IsNull()", title_setter)
+        self.assertIn("info[0]->ToString(context)", title_setter)
+
+    def test_rejects_a_selection_that_does_not_match_the_manifest(self) -> None:
+        incomplete = {
+            production_webidl.DOCUMENT_HIDDEN: self.members[production_webidl.DOCUMENT_HIDDEN],
+        }
+
+        with self.assertRaises(production_webidl.WebIDLSelectionError):
+            generate_document_host.generate_outputs(incomplete)
+
+    def test_emits_one_slot_per_manifest_member(self) -> None:
+        header = self.outputs[generate_document_host.HEADER_NAME]
+
+        for member in production_webidl.DOCUMENT_HOST:
+            member_name = member.qualified_name.split(".")[1]
+            with self.subTest(member=member.qualified_name):
+                slot = generate.snake_case(member_name)
+                operation_shapes = {
+                    production_webidl.DOMSTRING_TO_NONNULLABLE_INTERFACE,
+                    production_webidl.NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE,
+                    production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
+                    production_webidl.CREATE_ELEMENT,
+                    production_webidl.CREATE_DOCUMENT_FRAGMENT,
+                    production_webidl.CREATE_TEXT_NODE,
+                    production_webidl.CREATE_COMMENT,
+                }
+                if member.shape not in operation_shapes:
+                    slot = f"get_{slot}"
+                self.assertIn(f"(*{slot})", header)
+
+    def test_registers_every_manifest_member_on_the_document_prototype(self) -> None:
+        output = self.outputs[generate_document_host.CPP_NAME]
+
+        for member in production_webidl.DOCUMENT_HOST:
+            member_name = member.qualified_name.split(".")[1]
+            callback = generate.upper_camel_case(member_name)
+            local = generate.snake_case(member_name)
+            with self.subTest(member=member.qualified_name):
+                if member.shape in {
+                    production_webidl.DOMSTRING_TO_NONNULLABLE_INTERFACE,
+                    production_webidl.NULLABLE_DOMSTRING_DOMSTRING_TO_NONNULLABLE_INTERFACE,
+                    production_webidl.PURE_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.PURE_THROWS_DOMSTRING_TO_NULLABLE_INTERFACE,
+                    production_webidl.NEWOBJECT_THROWS_DOMSTRING_TO_INTERFACE,
+                    production_webidl.CREATE_ELEMENT,
+                    production_webidl.CREATE_DOCUMENT_FRAGMENT,
+                    production_webidl.CREATE_TEXT_NODE,
+                    production_webidl.CREATE_COMMENT,
+                }:
+                    self.assertIn(f"DocumentHostCall{callback}", output)
+                    self.assertIn(f"{local}_method, v8::None", output)
+                else:
+                    self.assertIn(f"DocumentHostGet{callback}", output)
+                    self.assertIn(f"v8::PropertyDescriptor {local}_descriptor", output)
+                self.assertIn(f'V8String(isolate, "{member_name}")', output)
 
     def test_cli_writes_exactly_the_three_document_host_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             out_dir = Path(temporary_directory) / "out"
-            with mock.patch.dict("os.environ", {}, clear=True):
-                generate_document_host.main(
-                    [str(production_webidl.PRODUCTION_WEBIDLS_DIR), str(out_dir)]
-                )
+            with mock.patch.object(
+                production_webidl,
+                "select_html_collection_interface",
+                wraps=production_webidl.select_html_collection_interface,
+            ) as html_collection_gate, mock.patch.object(
+                production_webidl,
+                "select_character_data_host_members",
+                wraps=production_webidl.select_character_data_host_members,
+            ) as character_data_gate:
+                with mock.patch.dict("os.environ", {}, clear=True):
+                    generate_document_host.main(
+                        [
+                            str(production_webidl.PRODUCTION_WEBIDLS_DIR),
+                            str(out_dir),
+                        ]
+                    )
             written = {
                 path.name: path.read_text(encoding="utf-8")
                 for path in out_dir.iterdir()
             }
 
+        html_collection_gate.assert_called_once()
+        character_data_gate.assert_called_once()
         self.assertEqual(written, self.outputs)
 
 

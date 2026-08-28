@@ -1,5 +1,7 @@
 # Experimental Servo–V8 compile-shadow bridge
 
+The current bridge ABI is v48.
+
 The current build target is native Apple silicon (`aarch64-apple-darwin`). Linux
 ARM64 cross-compilation is intentionally deferred until the embedding boundary
 is farther along. This is not yet an alternate production JavaScript backend.
@@ -61,19 +63,352 @@ both survival and final reclamation are asserted after test-only full
 collections with an explicit no-heap-pointers stack state so conservative
 stack scanning cannot hide a broken edge or make the test flaky.
 
-The first production binding slice is generated separately from the enabled
-`Document.hidden` and `Document.bgColor` declarations in Servo's real
-`components/script_bindings/webidls/Document.webidl`. Each pipeline realm owns
+Every generated C++ call into Rust is covered by the runtime's callback-depth
+scope, including constructors, attributes, methods, cppgc tracing and
+destruction. Rust-owned UTF-8 release callbacks use the same scope. A hostile
+test implementation attempts to enter its runtime from each phase, including
+inside marking and sweeping, and must be rejected before V8 is touched.
+
+The production binding slice is generated from the enabled `Document.hidden`,
+`Document.bgColor`, `Document.URL`, `Document.documentURI`, `Document.compatMode`,
+`Document.characterSet`, `Document.charset`, `Document.inputEncoding`,
+`Document.contentType`, `Document.referrer`, `Document.lastModified`,
+`Document.visibilityState`, `Document.readyState`, `Document.title`,
+`Node.nodeType`, `Node.parentElement`, `Document.documentElement`,
+`Document.head`, and `Document.children`, `Document.firstElementChild`,
+`Document.childElementCount`, `Document.getElementById`,
+`Document.createElement`, and `Document.querySelector`,
+`Document.querySelectorAll`, and
+`Document.getElementsByClassName`, `Document.getElementsByTagName`,
+`Document.getElementsByTagNameNS`, plus
+`Element.children`, `Element.querySelectorAll`,
+`Element.getElementsByClassName`, `Element.getElementsByTagName`,
+`Element.getElementsByTagNameNS`,
+`Element.remove`,
+`Element.previousElementSibling`, `Element.nextElementSibling`, `Element.closest`,
+`Element.matches`, `Element.webkitMatchesSelector`, `Element.namespaceURI`,
+`Element.prefix`, `Element.getAttributeNS`, `Element.hasAttributeNS`, and
+`Element.getAttributeNames` declarations in Servo's real production WebIDL
+corpus. Which members are exposed is a data manifest of `(qualified name,
+shape, exact returned interface)` records, with the interface field absent for
+non-interface values. One selector and one emitter are registered per shape,
+so widening the slice with a member of a known shape is an edit to that
+manifest. The generator emits accessor and operation bodies, prototype
+registration, ABI slots, and Rust thunks. Each shape also declares an
+extended-attribute allowlist and fails on anything outside it, because an
+unlisted extended attribute usually changes conversion or reaction semantics
+that the generated glue implements literally -- it would be silently wrong
+rather than merely unsupported.
+
+`Node.nodeType` lands on the existing `document` facade rather than needing a
+second host: `Document` inherits from `Node`, so no second native pointer and
+no second vtable are involved. An enum crosses the ABI as its string value, so
+its selector pins the exact value set the glue was generated against; a new
+state appearing upstream becomes a build failure rather than an unvalidated
+string.
+
+`Document.documentElement`, `Document.head`, `Document.getElementById`,
+`Document.createElement`,
+`Document.querySelector`, the
+ParentNode traversal getters, and the Element slice are the members whose value
+or receiver is another DOM object, and they rest on per-realm weak wrapper caches
+described in `wrapper-identity-design.md`. Independent Document, id, and child
+traversal paths prove that distinct DOM identities get distinct stable wrappers
+while repeated paths to one object converge on the same wrapper. That
+cache was recorded here as blocked by a cross-heap cycle; it is not, because
+every edge between the heaps points from cppgc into SpiderMonkey and none point
+back.
+The design doc records the constraint that keeps that true, along with why the
+DOM object's address is a safe cache key and why realm teardown must release
+hosts synchronously. A major-GC epilogue prunes every cleared weak entry after
+cppgc has finished atomic sweeping, so the cache tracks live wrappers instead
+of the historical set of elements exposed by `getElementById`.
+
+Each pipeline realm owns
 a stable V8 `document` facade. Its native accessors recover tagged per-context
 embedder state from the holder's creation context and call typed Rust C ABI
 thunks. The Rust host owns a `Trusted<Document>` rather than a raw DOM pointer;
 realm destruction first detaches and resets all V8 handles, then drops that
 host synchronously and exactly once. The callbacks root the live Servo document
-for the operation. The `bgColor` setter uses Servo's production CEReactions
-stack and an owned UTF-8 transfer across the C ABI. A C++/Rust reentry barrier
-turns accidental recursive entry into a deterministic failure. Failed
-installation leaves ownership with Rust, so every host transfer is
-transactional.
+for the operation. `getElementById` performs V8 `ToString`, preserves a thrown
+conversion exception, transfers validated UTF-8 as a borrowed DOMString, and
+borrows the embedding JSContext only until its Rust callback returns. The
+`bgColor` setter uses the same ephemeral context and leaves custom-element
+reactions on Servo's current or backup element queue. Servo drains them only
+after the V8 callback and sidecar borrow unwind;
+`ce-reactions-boundary.md` records the ordering and remaining limitation. A
+C++/Rust reentry barrier turns accidental recursive entry into a deterministic
+failure. Failed installation leaves ownership with Rust, so every host
+transfer is transactional.
+
+`Document.querySelector`, `Element.querySelector`, `Element.closest`,
+`Element.matches`, and `Element.webkitMatchesSelector` route production
+selector operations through Servo's actual parser. Typed element and boolean
+ABI outcomes keep successful null/false results distinct from SyntaxError;
+it never transports a SpiderMonkey exception object or leaves a pending
+SpiderMonkey exception while V8 is executing. Each realm instead retains its
+own V8-native `DOMException` constructor and prototype. Invalid selectors
+throw a V8-owned native error with the production name, message and legacy
+code, while successful `closest` results reuse the same weak wrapper cache as
+the other Element-returning paths.
+
+`Document.querySelectorAll` and `Element.querySelectorAll` reuse that parser
+without constructing an unused SpiderMonkey `NodeList`. Servo first roots the
+matched `Element` vector as a static snapshot, then ABI v27 transfers one
+fresh, uncached NodeList host to V8. The wrapper exposes `length`, `item`,
+enumerable indexed values, and Web IDL's realm-local Array iterator/forEach
+intrinsics. Its items still converge on the Element wrapper cache, while the
+collection host itself is weakly tracked for GC and synchronously released on
+realm teardown. The current indexed surface is deliberately a facade: ordinary
+read-only numeric properties reproduce lookup, enumeration and iteration, but
+not every `LegacyPlatformObject` edge case involving deletion, redefinition or
+`preventExtensions`.
+
+`Document.children` and `Element.children` use a different collection path:
+one `Trusted<Node>` roots the ParentNode owner and each callback walks its
+current direct element children, so a retained wrapper observes tree, id, and
+name changes. A separate weak cache keyed by the owner preserves
+`[SameObject]` without colliding with the Element cache, even though both keys
+are the same DOM address. The `HTMLCollection` facade exposes live indexed and
+supported named properties through V8 interceptors, including tree-order
+deduplication, HTML-only `name` matching, prototype masking, and the WebIDL
+enumerability split. It intentionally has no NodeList iterator or `forEach`.
+Like the NodeList facade, it does not yet reproduce every
+`LegacyPlatformObject` edge case around `defineProperty`, deletion, or
+`preventExtensions`.
+
+ABI v29 adds `Document.getElementsByClassName` and
+`Element.getElementsByClassName`. Each call owns a fresh live collection host
+rooted at its Document or Element receiver. The host parses an ASCII-whitespace
+class set and walks current descendants in tree order on every callback; it
+excludes the Element receiver itself, requires every requested class, and uses
+the document's standards/quirks class-matching mode. These results share the
+existing `HTMLCollection` facade and Element wrapper cache, but not the
+`children` `[SameObject]` key: a unique per-call native-host key prevents one
+class filter from aliasing another or either from aliasing `children`.
+
+ABI v30 adds `Element.remove`. The zero-argument, brand-checked method is
+installed on `Element.prototype` and marks itself unscopable. Its host call
+uses Servo's production ChildNode removal algorithm with the ephemeral
+SpiderMonkey context, leaves custom-element reactions on Servo's outer or
+backup queue, and clears any unexpected pending SpiderMonkey exception before
+returning failure to V8. Retained `children` collections update live, while
+pre-existing `querySelectorAll` NodeLists remain static rooted snapshots.
+
+ABI v31 adds `Element.previousElementSibling` and
+`Element.nextElementSibling`. The read-only, brand-checked accessors use
+Servo's production NonDocumentTypeChildNode traversal and return the existing
+per-realm Element wrapper for a non-null sibling. They skip text nodes and
+therefore immediately reflect a preceding `Element.remove` mutation without
+creating a second wrapper for a still-reachable sibling.
+
+ABI v32 adds `Element.namespaceURI` and `Element.prefix`. These read-only,
+brand-checked nullable-string accessors delegate to Servo's production Element
+getters, preserving the HTML and SVG namespace URI values and `null` for an
+unprefixed element. A non-null prefix is additionally pinned by Rust ABI tests.
+
+ABI v33 adds inherited `Node.parentElement` to Element wrappers. The read-only,
+brand-checked nullable Element accessor stays on the shared Node prototype and
+uses Servo's production `GetParentElement`; a non-null parent reuses the
+per-realm Element wrapper cache, while a retained removed child reads `null`.
+
+ABI v34 adds `Element.getAttributeNS` and `Element.hasAttributeNS`. These
+brand-checked two-argument operations use Servo's production namespace-aware
+attribute getters with an ephemeral SpiderMonkey context. They preserve WebIDL
+nullable namespace conversion, DOMString conversion order, nullable string
+results, and the distinction between an unnamespaced HTML/SVG attribute and an
+XLink namespaced attribute.
+
+ABI v35 adds `Element.getAttributeNames`. The zero-argument, brand-checked
+operation copies Servo's current attribute-list names in list order into a
+fresh ordinary JavaScript Array. A single owned UTF-8 sequence crosses
+the ABI atomically, so returned arrays are snapshots rather than a live view.
+Servo's current parsed-XLink behavior emits local `href` from this operation;
+`getAttributeNS` separately preserves the XLink namespace identity. Retaining
+the source prefix is a pre-existing Servo parser issue outside this V8 slice.
+
+ABI v36 adds `Document.getElementsByTagName` and
+`Element.getElementsByTagName`. Each call returns a fresh live
+`HTMLCollection` rooted at its receiver and reuses the existing indexed,
+named-property, teardown, and Element-wrapper machinery. The production host
+matches `*`, ASCII-folds HTML element names only when the root is in an HTML
+document, and otherwise preserves case and qualified-prefix matching exactly
+as Servo's native collection filter does.
+
+ABI v37 adds the narrow, Element-backed `Node.insertBefore`,
+`Node.appendChild`, `Node.replaceChild`, and `Node.removeChild` slice. The V8
+host roots receiver and argument Elements through their existing
+`Trusted<Element>` owners and invokes Servo's production `NodeMethods`; it
+does not duplicate pointer, adoption, mutation-observer, range, layout, slot,
+or custom-element work. Results retain the existing per-realm Element wrapper
+identity. `HierarchyRequestError` and `NotFoundError` cross the ABI as typed
+POD outcomes and are constructed as V8-owned realm-local DOMExceptions, rather
+than creating a SpiderMonkey exception while V8 has borrowed the sidecar.
+Unexpected SpiderMonkey exceptions are cleared and reported as an internal V8
+host failure. Reactions remain on Servo's outer or backup element queue until
+the V8 callback returns. `authoritative_node_mutation_proof.html` exercises
+all four operations, their descriptors/brands/returns/error variants, live
+and static collection behavior, a SpiderMonkey follow-up observation, and
+leaves one visible rendered `Hello` for the browser screenshot milestone.
+
+ABI v38 adds `Element.toggleAttribute` and `Element.removeAttribute`. Both
+methods call Servo's production Element algorithms with the same ephemeral
+SpiderMonkey context used by the existing Element attribute readers and
+setters. `toggleAttribute` carries its `InvalidCharacterError` through a
+typed POD outcome and creates the result as a realm-local V8 `DOMException`;
+`removeAttribute` has no production throwing branch. Both preserve V8-side
+WebIDL receiver branding, required-argument checks, DOMString conversion,
+optional-boolean semantics, and the Element prototype descriptor surface.
+They leave custom-element reactions on Servo's outer or backup queue and
+clear unexpected SpiderMonkey exceptions before returning. `setAttribute` is
+deliberately deferred: its `(TrustedType or DOMString)` union and default
+Trusted Types policy may execute SpiderMonkey policy code, so exposing only a
+string-shaped approximation would be semantically dishonest and unsafe under
+the sidecar borrow. `authoritative_attribute_mutation_proof.html` validates
+both operations, conversion/error behavior, and a SpiderMonkey observation of
+the V8-mutated DOM.
+
+ABI v39 adds the narrow `Document.createElement` operation. Its required
+`localName` is converted first, then the optional
+`(DOMString or ElementCreationOptions)` union is converted with Web IDL's
+dictionary-versus-string rules. Returned elements are fresh Servo DOM objects
+with fresh per-realm wrappers, and HTML local names are ASCII-lowercased by
+Servo while `tagName` retains the HTML uppercase projection. Invalid local
+names become V8-owned `InvalidCharacterError` DOMExceptions.
+
+The production declaration pinned by this slice is
+`[CEReactions, NewObject, Throws] Element createElement(DOMString localName,
+optional (DOMString or ElementCreationOptions) options = {});`.
+
+The operation is deliberately fail-closed for a customized built-in whose
+registered definition matches both the requested local name and `options.is`:
+it throws a V8 `TypeError` before invoking Servo's synchronous custom-element
+constructor. An unrelated registered definition does not block ordinary
+creation, including a definition whose built-in local name does not match.
+This is a safety boundary, not a custom-element registry bridge: V8 cannot
+yet execute or observe SpiderMonkey custom-element constructors, upgrade
+reactions, or registry callbacks. `authoritative_create_element_proof.html`
+sets up the registry in an unmarked SpiderMonkey script, checks the matching
+fail-closed path and the union conversion cases, then uses `textContent` and
+the existing Element-backed Node mutation methods to reparent a real target
+and render `Hello`.
+
+ABI v40 adds `Document.getElementsByTagNameNS` and
+`Element.getElementsByTagNameNS`. Each call returns a fresh live
+`HTMLCollection` rooted at its receiver and shares the existing collection
+teardown, supported-name, and Element-wrapper machinery. Nullable namespace
+conversion preserves Web IDL ordering before Servo normalizes both null and
+the empty string to the empty namespace. The host uses the same predicate as
+Servo's production collection: `*` is independently special in the namespace
+and local-name positions, while every other value matches the element's
+namespace and local name exactly and case-sensitively. Element queries include
+descendants only, never their receiver. The operation cannot invoke a
+SpiderMonkey callback and needs no borrowed JSContext or exception transport.
+`authoritative_get_elements_by_tag_name_ns_proof.html` covers descriptors,
+branding, arity and conversions, namespace normalization, both wildcards,
+case and prefix behavior, Document/Element scope, wrapper identity, and live
+insertion/removal observed by both engines.
+
+ABI v41 adds `Element.removeAttributeNS`. `Element.removeAttributeNS` removes
+attributes by namespace URI and local name on the real Servo Element. It is
+exposed as a `[CEReactions]` ordinary method on `Element.prototype` returning
+`undefined`. Receivers are checked for brand before argument count and
+conversions. Nullable `namespace` conversion occurs first, followed by
+`localName` DOMString conversion, preserving `ToString` exceptions in WebIDL
+order. It uses Servo's `ElementMethods::RemoveAttributeNS` with an ephemeral
+host context and leaves `CEReactions` on Servo's queue without manually
+pushing/popping reaction queues.
+
+ABI v42 adds `Document.createDocumentFragment` and generalizes the installed
+Node host from Element-only to one concrete `Trusted<Node>` host with an
+explicit Element/DocumentFragment interface kind. The wrapper identity key is
+the rooted Node allocation address, and a cache hit is accepted only when the
+cell's dynamic kind also matches, so the same concrete Rust host type and
+type-erased vtable back both wrappers without a cross-kind cast. C++ dispatches
+Element-only callbacks only after its
+`kElement` brand check and Rust then performs a checked downcast; common Node
+callbacks work directly on the rooted Node. The new Document operation borrows
+the live SpiderMonkey context only to call Servo's exact
+`DocumentMethods::CreateDocumentFragment`, clears any unexpected pending
+SpiderMonkey exception, and returns a freshly boxed DocumentFragment-kind
+host. It neither enters V8 nor pumps custom-element reactions. Servo's native
+fragment insertion algorithm splices the children into an Element, returns the
+same fragment wrapper, and leaves the fragment empty.
+`authoritative_document_fragment_proof.html` pins the descriptor and brands,
+fresh dynamic identities, Node scalars and mutations, the V8 DOMException
+path, and a SpiderMonkey observation of the final real tree.
+
+ABI v43 adds `Document.createTextNode`. The same concrete `Trusted<Node>` host
+now carries a Text interface kind, so Elements, DocumentFragments, and Text
+all use one installed Rust type and cannot cross a monomorphized vtable with a
+different host representation. The operation borrows the ephemeral live
+SpiderMonkey context solely to call Servo's exact
+`DocumentMethods::CreateTextNode(cx, DOMString)`, clears an unexpected pending
+SpiderMonkey exception on either side of that call, and returns a freshly
+boxed Text-kind host without entering V8 or pumping reactions. The selected
+Text facade deliberately remains the common Node surface: `nodeType`,
+`nodeName`, `textContent`, connection/parent state, and structural mutations.
+CharacterData/Text-specific APIs such as `data`, `substringData`, `wholeText`,
+and `splitText` remain unexposed until their Web IDL conversion and mutation
+semantics have an explicit ABI. `authoritative_create_text_node_proof.html`
+pins receiver-before-conversion behavior, Text identity and brands, fragment
+splicing and Element insertion, and SpiderMonkey visibility of `Hello`.
+
+ABI v44 adds `Document.createComment`. Comments use the same generic
+`Trusted<Node>` host with a Comment kind, preserving one installed Rust type
+and dynamic allocation-plus-kind wrapper identity across Element,
+DocumentFragment, Text, and Comment. The generated operation uses the live
+ephemeral context only for Servo's exact
+`DocumentMethods::CreateComment(cx, DOMString)`, clearing an unexpected pending
+SpiderMonkey exception before returning a freshly boxed Comment-kind host. It
+cannot enter V8 or pump custom-element reactions. The selected facade exposes
+only inherited Node behavior through Comment's dedicated
+Comment → CharacterData → Node prototype chain; `data`, `wholeText`, and other
+CharacterData-specific APIs remain explicitly out of scope. The v44 proof
+pins this chain and its toString tags, conversion ordering, Element-brand
+rejection, generic fragment/Element mutation identity, and a SpiderMonkey
+observation of the Comment and Text sibling nodes.
+
+ABI v45 adds the exact production `CharacterData.data` and
+`CharacterData.length` attributes to the existing shared CharacterData
+prototype used by Text and Comment. `data` preserves
+`[LegacyNullToEmptyString] DOMString` conversion, including receiver-brand
+checks before conversion, and `length` reports Servo's UTF-16 code-unit count.
+The Rust host downcasts only Text- and Comment-kind generic Node hosts, calls
+Servo's exact `CharacterDataMethods::Data`, `SetData`, and `Length` methods,
+and keeps the synchronous setter inside the existing no-V8-reentry boundary.
+Owned UTF-8 getter results are released on success and every malformed or
+callback-failure path. The v45 proof pins the shared prototype and descriptors,
+wrong brands, conversion/error ordering, astral length, generic Node identity,
+and SpiderMonkey visibility of the final Comment and rendered Text mutations.
+
+ABI v46 adds the exact production `CharacterData.substringData(offset, count)`
+operation to the shared Text/Comment prototype. V8 performs required-argument
+checking and ordered Web IDL `unsigned long` conversion before the Rust host
+calls Servo's exact `CharacterDataMethods::SubstringData`. Successful strings
+cross as owned UTF-8 and are released on success, callback failure, and every
+malformed outcome; Servo's `Error::IndexSize` crosses only as typed data before
+V8 creates a realm-local `IndexSizeError`. The operation is pure and needs no
+live SpiderMonkey mutation context. The v46 proof pins its descriptor, brands,
+conversion/error ordering, wrapping unsigned conversion, UTF-16 astral-split
+behavior, DOMException shape, and cross-engine visibility of the final tree.
+
+ABI v47 adds the exact production `CharacterData.appendData(data)` operation
+to the same shared Text/Comment prototype. V8 brand-checks the receiver and
+enforces the required argument before ordinary Web IDL `DOMString` conversion,
+then the Rust host borrows Servo's live SpiderMonkey context solely for the
+synchronous `CharacterDataMethods::AppendData` mutation. The callback cannot
+reenter V8 or pump reactions, and any unexpected SpiderMonkey exception is
+cleared before failure crosses the typed ABI. The v47 proof pins the descriptor,
+brands, conversion and thrown-value ordering, astral UTF-16 length after
+mutation, ordinary null/undefined conversion, generic Node identity, and
+SpiderMonkey visibility of the final Comment and rendered Text mutations.
+
+ABI v48 adds the production `Window.matchMedia(query)` surface and the live
+`MediaQueryList.matches` readonly accessor. The authoritative proof checks
+WebIDL descriptors, receiver and required-argument ordering, one-shot
+DOMString conversion with thrown-value identity, fresh wrappers, illegal
+construction, viewport evaluation, and the final cross-engine DOM marker.
 
 ## Compile real Servo scripts in the V8 shadow
 
@@ -103,10 +438,26 @@ cargo build -p servoshell --features v8-document-hidden-authoritative
 ```
 
 The authoritative feature is intentionally strict: missing runtimes, realms,
-hosts, reentrant callbacks, or failed reads abort the experiment rather than
-silently returning Servo's native value. It makes only `document.hidden`
-V8-authoritative; SpiderMonkey still parses and executes page JavaScript and
-owns all other DOM bindings.
+hosts, or failed reads abort the experiment rather than silently returning
+Servo's native value. It makes only `document.hidden` V8-authoritative;
+SpiderMonkey still parses and executes page JavaScript and owns all other DOM
+bindings.
+
+Setting `document.bgColor` can enqueue a customized element's
+`attributeChangedCallback`, which is SpiderMonkey JavaScript. That callback is
+never invoked inside the live V8 setter. It stays on Servo's rooted current or
+backup element queue and runs from Servo's existing microtask checkpoint after
+the V8 frames, C++/Rust callback, authoritative-entry guard, and sidecar borrow
+have all unwound. A defensive native-value short circuit remains for any other
+page-reachable reentry route, but the CEReactions proof now requires that this
+normal mutation path performs a real V8 `Document.hidden` round trip with no
+short-circuit warning. `authoritative_cereactions_proof.html` needs both
+authoritative features and so is not part of `run_proofs.sh`. After building
+with both features, run its focused checks with:
+
+```sh
+support/v8/run_cereactions_proof.sh
+```
 
 An additional non-default experiment makes one tightly scoped classic script
 V8-authoritative:
@@ -115,14 +466,228 @@ V8-authoritative:
 cargo build -p servoshell --features v8-classic-script-authoritative
 ```
 
-Only a parser-inserted, parsing-blocking classic script with the exact
-`data-servo-v8="authoritative"` attribute takes this path. Servo still performs
-the normal HTML fetch, CSP, ordering, and settings-stack work, but V8 alone
-compiles and executes that script. Async, defer, dynamic, module, timer, worker,
-and service-worker scripts remain on SpiderMonkey. The current visible host
-surface is deliberately limited to `window`, `document.hidden`, and
-`document.bgColor`. V8 microtask checkpoint integration is not implemented, so
-this mode must not yet be used for promise- or microtask-dependent scripts.
+Any classic script with the exact `data-servo-v8="authoritative"` attribute
+takes this path, in every execution mode: parser-blocking, deferred, async,
+and dynamically inserted, inline or external. Servo still performs the normal
+HTML fetch, CSP, ordering, and settings-stack work, but V8 alone compiles and
+executes that script.
+
+For testing existing HTML without editing every script element, a stricter
+feature selects every classic `<script>` element, whether or not it carries the
+attribute:
+
+```sh
+cargo build -p servoshell --features v8-all-html-classic-scripts-authoritative
+support/v8/run_all_html_classic_scripts_proof.sh
+```
+
+This remains an experiment rather than a default backend. It affects HTML
+classic script elements only; module scripts, event handlers, `javascript:`
+URLs, and worker scripts keep their existing engine paths. The focused proof
+contains no selection attribute and covers inline, parser-blocking external,
+deferred, async, and promise-reaction execution with exact V8 host-call counts.
+It also schedules unmarked function and source-string timers, which must return
+to the same V8 realm through Servo's timer queue.
+Its `disabled` second mode is the negative control: after building only
+`v8-classic-script-authoritative`, the same unmarked page must execute on
+SpiderMonkey and report zero V8 host calls.
+
+The narrow V8 Window facade now exposes `setTimeout`, `clearTimeout`,
+`setInterval`, and `clearInterval`. Servo remains the source of truth for
+delays, nesting, numeric handles, cancellation, and task dispatch. V8 retains
+function handlers and their arbitrary argument values strongly only while the
+timer is active: one-shots release before invocation, intervals release on
+clear, and realm teardown releases everything synchronously. A timer callback
+re-enters only its originating realm with the current Servo JSContext installed
+for native DOM calls. This avoids copying JavaScript values across engines and
+keeps timing on Servo's existing event loop.
+
+A source-string handler scheduled by V8 stays V8-authoritative automatically.
+The string still passes through Servo's Trusted Types and CSP checks before it
+is scheduled. A source string scheduled by SpiderMonkey can independently opt
+into V8 through the older prologue directive, because that bare handler has no
+script element on which to carry an attribute:
+
+```js
+setTimeout('"use servo-v8"; /* body */', 0);
+```
+
+Like `"use strict"`, that evaluates to a harmless expression statement in an
+engine that does not recognise it, and only a genuine prologue directive counts
+— `"use servo-v8-nope"` does not opt in. The choice is deliberately not
+inherited for SpiderMonkey-created timers; only calls crossing the V8 timer host
+select V8 without a marker.
+
+That completes classic-script coverage on the window script thread. Module
+scripts remain on SpiderMonkey because they are a different creation path, not
+a kind of classic script, and worker and service-worker scripts remain
+SpiderMonkey-owned by design.
+
+Every mode routes through the same create/run pair, so the engine choice does
+not depend on the script kind. Deferred and async scripts do widen the window
+between compiling into the realm and running it: a script is compiled when it
+is created and may not run until much later, by which time the pipeline can
+have exited and taken the realm with it. Both the compile and run sides
+therefore fail the script rather than aborting the process. That is still
+strict — nothing re-runs it on SpiderMonkey.
+
+Two things protect that window, and it is worth knowing which does the work.
+The realm-identity check comparing the compile-time realm against the current
+one is *not* the load-bearing one: a pipeline keeps one realm for its whole
+life, so the ids match even when the global has been replaced underneath. The
+protection that actually fires is HTML's own "can we run script" step, which
+refuses a document that is no longer fully active, plus pipeline-exit ordering
+that destroys the realm before the document is torn down.
+
+`document.open()` was recorded here as a gap, on the assumption that it
+installs a fresh global the realm would not follow. That was wrong, and
+`authoritative_document_open_proof.html` now pins the correct behaviour: HTML
+reuses the same `Document` and `Window`, and so does Servo. `open()` clears the
+children, removes listeners, resets the URL, and builds a new parser, but the
+global — and therefore the realm — is the same object throughout, and the host
+reads through a live `Trusted<Document>` so the new URL is picked up rather
+than cached.
+
+The current visible host
+surface is deliberately limited to `window`, the `console` logging slice,
+`document.hidden`,
+`document.bgColor`, `document.URL`, `document.documentURI`, document metadata
+string getters, `document.visibilityState`, `document.readyState`,
+`document.title`, `document.nodeType`, `document.documentElement`,
+`document.head`, the ParentNode `children`/first/last/count getters, and
+`document.getElementById()`, `document.createElement()`, `document.querySelector()`,
+`document.querySelectorAll()`, `document.getElementsByClassName()`, and
+`document.getElementsByTagName()`.
+Elements returned through that
+surface share a per-realm prototype implementing `localName`, `tagName`, `id`,
+`className`, `hasAttributes()`, `getAttribute()`, `hasAttribute()`, `children`,
+`firstElementChild`, `lastElementChild`, `childElementCount`, `querySelector()`,
+`querySelectorAll()`, `getElementsByClassName()`, `getElementsByTagName()`,
+`closest()`, `matches()`, and
+`webkitMatchesSelector()`. That
+prototype inherits from a shared Node prototype implementing `nodeType`,
+`nodeName`, `isConnected`, `textContent`, and `hasChildNodes()`.
+
+V8's inspector-oriented `console` silently discards output when no inspector
+delegate is attached. The realm replaces it with a native, production-WebIDL-
+pinned slice: `debug`, `error`, `info`, `log`, `trace`, and `warn`. Values are
+rendered with V8's side-effect-free debugging representation while they are
+still local handles; only a level and validated UTF-8 cross the C ABI into a
+realm-owned Servo sink. The sink forwards to the same embedder console channel
+as SpiderMonkey. Other console methods remain absent rather than silently
+doing nothing. Structured DevTools object previews and the remaining console
+state machines (groups, counters, and timers) are future surface.
+
+Servo performs a V8 microtask checkpoint at HTML's "clean up after running
+script" boundary, in `ScriptThread::perform_a_microtask_checkpoint`, before its
+own SpiderMonkey checkpoint. `microtask-checkpoint-design.md` records why the
+drain stays on the isolate's single explicit queue rather than moving to
+per-realm queues, and why V8 drains first.
+
+A job that fails never reaches a `TryCatch` at that boundary. V8 catches an
+uncaught job exception inside its own microtask builtin and reports it to the
+isolate message handler, and a reaction that throws rejects its derived promise
+instead — which is the channel an ordinary `Promise.then` failure takes. The
+bridge installs both an `AddMessageListener` and a `SetPromiseRejectCallback`,
+buffers what they deliver, and Servo pulls it after the drain, so a handler
+attached during the same drain revokes its entry rather than reporting a
+spurious failure. Failures are logged with resource, line, column, and stack.
+
+Each failure is tagged with the realm that produced it — for a rejection, the
+realm that created the promise rather than whichever happened to be entered —
+and Servo maps that realm back to a pipeline so the failure is reported on the
+owning global. A page therefore observes its own failing V8 promise through
+`onerror`, which `authoritative_job_error_proof.html` pins. A failure whose
+realm cannot be determined, or whose pipeline has already gone, still falls
+back to the log because there is no global left to fire on.
+
+Entering that route is guarded by an explicit test-then-set on the script
+thread. `V8AuthoritativeScriptGuard::enter` fails on a flag that is already
+set, and setting the flag is inseparable from arming its reset, so a rejected
+recursive entry can never leave the guard state modified. HTML also allows a
+created script never to run, so the compiled handle is owned by a
+`V8RetainedScript` whose drop discards it. Execution consumes the handle first,
+and discarding is deliberately best effort and infallible: it runs from a drop
+path, and every way it can fail — a disposed sidecar, a realm already
+destroyed, a sidecar borrowed further up the stack — means the handle is
+already gone or is released by realm destruction. Realm and script IDs are
+never reused, so a stale discard cannot free an unrelated handle.
+
+### Prove that V8 alone executed the script
+
+`authoritative_bgcolor_proof.html` starts with a red body and toggles
+`document.bgColor` exactly once per execution, so the final colour counts
+executions rather than merely observing that some engine ran:
+
+```sh
+cargo build -p servoshell --features v8-classic-script-authoritative
+RUST_LOG=warn,script::script_thread=debug \
+  target/debug/servoshell -z -x --hard-fail \
+    -o /tmp/authoritative_bgcolor_proof.png \
+    support/v8/authoritative_bgcolor_proof.html
+```
+
+Every pixel of the screenshot must be `(0, 255, 0)`, and realm teardown must
+report exactly one `Document.bgColor` getter and one setter host call. Adding a
+second identical authoritative script is the control: it reports two getters
+and two setters and renders pure red, which is what a page would show if
+SpiderMonkey had also executed the script.
+
+The proof suite uses that same counting argument:
+
+| Page | Proves |
+| --- | --- |
+| `authoritative_bgcolor_proof.html` | V8 alone executes an inline parser-blocking script |
+| `authoritative_external_proof.html` | the same route covers external scripts |
+| `authoritative_microtask_proof.html` | the task-boundary microtask checkpoint runs, with a live host context |
+| `authoritative_defer_proof.html` | a deferred script runs on V8 after the widest compile-to-run window |
+| `authoritative_async_proof.html` | an async script runs on V8 off the parser's critical path |
+| `authoritative_dynamic_proof.html` | SpiderMonkey can insert a script that V8 then executes |
+| `authoritative_url_proof.html` | `Document.URL` is served by the V8 host, getter-only |
+| `authoritative_visibility_nodetype_proof.html` | the enum and numeric shapes, the latter inherited from `Node` |
+| `authoritative_ready_state_proof.html` | a second enum shape is independently value-pinned and live at parser time |
+| `authoritative_title_proof.html` | ordinary DOMString setter conversion and live title mutation use the generated host |
+| `authoritative_metadata_proof.html` | URL/encoding/content/referrer/date metadata use generated readonly string getters |
+| `authoritative_timer_proof.html` | a string timer handler runs on V8, handed off across a task boundary |
+| `authoritative_native_timers_proof.html` | V8-native functions, strings, arguments, intervals, cancellation, jobs, and errors use Servo scheduling |
+| `authoritative_cross_engine_timer_clear_proof.html` | SpiderMonkey can cancel and release a V8-owned callable through the shared Servo handle map |
+| `authoritative_console_proof.html` | all six supported console levels reach Servoshell with side-effect-free V8 value formatting |
+| `authoritative_realm_surface_proof.html` | the realm exposes no API it cannot implement |
+| `authoritative_document_open_proof.html` | the realm survives `document.open()` |
+| `authoritative_job_error_proof.html` | a page sees its own failing V8 promise via `onerror` |
+| `authoritative_wrapper_identity_proof.html` | a DOM object handed to V8 keeps one stable wrapper |
+| `authoritative_get_element_by_id_proof.html` | the generated DOMString operation preserves conversion, null, and wrapper semantics |
+| `authoritative_element_scalar_proof.html` | common Element scalar reads and mutations use the live Servo DOM with WebIDL prototype semantics |
+| `authoritative_node_scalar_proof.html` | Element wrappers inherit common Node scalars and text mutation through a real Node prototype |
+| `authoritative_parent_node_proof.html` | Document and Element traversal share stable wrappers and update after live child mutation |
+| `authoritative_query_selector_proof.html` | Document and Element selector queries use Servo's parser, V8 DOMException, and stable wrappers |
+| `authoritative_element_selector_methods_proof.html` | Element matching and closest operations preserve conversion, SyntaxError, and identity semantics |
+| `authoritative_query_selector_all_proof.html` | static rooted NodeLists survive real tree mutation and expose indexed/iterable WebIDL behavior |
+| `authoritative_children_collection_proof.html` | live SameObject HTMLCollections track tree/name mutation with indexed and named legacy properties |
+| `authoritative_get_elements_by_class_name_proof.html` | Document/Element class queries produce independently rooted live HTMLCollections with correct scope, conversion, identity, and mutation behavior |
+| `authoritative_get_elements_by_tag_name_proof.html` | Document/Element qualified-name queries produce fresh live HTMLCollections with HTML case folding, SVG case sensitivity, scope, identity, and mutation behavior |
+| `authoritative_element_remove_proof.html` | Element.remove uses Servo's ChildNode algorithm, updates live children while preserving static NodeList identity, and is unscopable |
+| `authoritative_element_sibling_proof.html` | Element-only sibling traversal skips text nodes, preserves wrapper identity, and updates after Element.remove |
+| `authoritative_element_namespace_proof.html` | HTML and inline SVG Element namespaceURI and null prefix accessors preserve descriptors, brands, and nullable-string values |
+| `authoritative_parent_element_proof.html` | inherited Node.parentElement stays on Node.prototype, preserves parent identity, and becomes null after Element.remove |
+| `authoritative_attribute_namespace_proof.html` | HTML/SVG namespace-aware attribute reads preserve receiver brands, ordered conversion, nullable values, and XLink distinction |
+| `authoritative_attribute_names_proof.html` | getAttributeNames copies ordered HTML/SVG names into fresh mutable snapshots, including current parsed-XLink local-name parity |
+| `authoritative_node_mutation_proof.html` | all four Element-backed Node mutations call Servo's production algorithms, preserve wrapper identity and live/static views, map DOMExceptions into V8, and leave a visible rendered Hello |
+| `authoritative_attribute_mutation_proof.html` | toggleAttribute/removeAttribute use Servo's production attribute machinery with exact optional-boolean conversion, V8-owned InvalidCharacterError, and cross-engine DOM visibility |
+| `authoritative_create_element_proof.html` | Document.createElement preserves descriptor/brand/conversion order, dictionary/string union behavior, HTML normalization, fresh wrappers, fail-closed matching custom elements, and a rendered Hello screenshot |
+| `authoritative_document_fragment_proof.html` | Document.createDocumentFragment preserves its exact Document method surface and dynamic Node identity; fragment insertion splices production children, preserves the returned fragment wrapper, maps mutation errors in V8, and is visible to SpiderMonkey |
+| `authoritative_create_text_node_proof.html` | Document.createTextNode preserves receiver/argument conversion ordering and fresh Text wrappers; generic Node fragment/Element insertion preserves identity and the final Text is visible to SpiderMonkey |
+| `authoritative_create_comment_proof.html` | Document.createComment preserves receiver/argument conversion ordering, Comment/CharacterData/Node inheritance and tags, generic insertion identity, and SpiderMonkey visibility of a Comment plus Text sibling |
+| `authoritative_character_data_proof.html` | CharacterData.data and length preserve shared Text/Comment inheritance, brand-before-conversion ordering, LegacyNullToEmptyString and UTF-16 semantics, generic Node identity, and cross-engine visibility of live Comment/Text mutation |
+| `authoritative_character_data_substring_proof.html` | CharacterData.substringData preserves its shared prototype, required and ordered unsigned-long conversion, UTF-16 slicing, IndexSizeError shape, owned-result safety, and final cross-engine DOM visibility |
+| `authoritative_character_data_append_proof.html` | CharacterData.appendData preserves its shared prototype, required DOMString conversion and exception ordering, synchronous live mutation, generic Node identity, and final cross-engine DOM visibility |
+| `authoritative_match_media_proof.html` | Window.matchMedia and MediaQueryList.matches preserve the v48 WebIDL surface, conversion/brand ordering, fresh wrappers, viewport values, and a cross-engine DOM marker |
+
+`support/v8/run_proofs.sh` runs all of them and checks both signals each one
+depends on, plus two cases it generates rather than commits: the
+double-execution control, and a 51-script page alternating direct and
+microtask-deferred sets that stresses the reentry guard across many task
+boundaries.
 
 Run with a debug log filter to see each source accepted by V8:
 
@@ -140,13 +705,14 @@ cargo check -p servoshell
 Because `servo-v8` is a workspace member, explicit `--workspace` checks still
 build it and therefore require the sibling V8 artifacts. Use the ordinary
 Servoshell package command above when checking a tree without V8 provisioned.
-The current exported C ABI is version 7 and remains experimental. The original
+The current exported C ABI is version 48 and remains experimental. The original
 Runtime compile/eval APIs retain a default context for the standalone binding
 smoke tests; Servo's compile shadow uses the pipeline-selected realm APIs. The
 realm API can also retain an opaque compiled classic-script handle and consume
 it during one later execution. That execution deliberately does not perform an
-implicit V8 microtask checkpoint; task-boundary integration remains Servo's
-responsibility.
+implicit V8 microtask checkpoint. Draining is a separate runtime-level call,
+because the queue is isolate-wide rather than realm-scoped, and Servo makes it
+at the task boundary.
 
 ## Verify TurboLev
 
@@ -162,6 +728,7 @@ trace_dir="$(mktemp -d /tmp/v8-turbolev-trace.XXXXXX)"
   --turbolev --turbofan --maglev --allow-natives-syntax \
   --no-concurrent-recompilation --trace-turbo --trace-turbo-filter=tlv_probe \
   --trace-turbo-path="$trace_dir" \
+  --trace-turbo-cfg-file="$trace_dir/turbo.cfg" \
   support/v8/turbolev_probe.js
 rg -n '"name":"V8\.TFTurboshaftTurbolevGraphBuilding"' \
   "$trace_dir"/*.json

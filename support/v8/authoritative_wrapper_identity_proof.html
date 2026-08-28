@@ -1,0 +1,78 @@
+<!doctype html>
+<!--
+Runtime proof that a DOM object handed to V8 has a stable wrapper.
+
+document.documentElement and document.head are distinct DOM objects sharing the
+per-realm wrapper cache. Reading either element twice must produce the same
+JavaScript object, not merely an equal one -- and the test for that is a
+property set on each wrapper surviving a re-read, which equal-but-distinct
+objects could not manage.
+
+The wrapper holds a Trusted<Element>, which is the only cross-heap edge in the
+design: strong from cppgc into SpiderMonkey, with nothing pointing back, so no
+cross-heap cycle can form.
+
+The script throws unless every property holds, so red means a broken wrapper
+rather than merely that nothing ran.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative wrapper identity proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      var first = document.documentElement;
+      if (first === null || typeof first !== "object") {
+        throw new Error("documentElement was not an object: " + first);
+      }
+      if (first !== document.documentElement) {
+        throw new Error("wrapper identity is not stable across reads");
+      }
+      if (first === document) {
+        throw new Error("the element wrapper must not be the document facade");
+      }
+      if (first.tagName !== "HTML") {
+        throw new Error("unexpected tagName: " + first.tagName);
+      }
+      // An expando survives only if the second read returns the same object.
+      first.servoMarker = 41;
+      if (document.documentElement.servoMarker !== 41) {
+        throw new Error("expando lost, so a second wrapper was created");
+      }
+      var head = document.head;
+      if (head === null || head.tagName !== "HEAD") {
+        throw new Error("unexpected document.head: " + head);
+      }
+      if (head === first) {
+        throw new Error("distinct DOM objects shared one wrapper");
+      }
+      if (head !== document.head) {
+        throw new Error("head wrapper identity is not stable across reads");
+      }
+      head.servoHeadMarker = 23;
+      if (document.head.servoHeadMarker !== 23) {
+        throw new Error("head expando lost on a second read");
+      }
+      // tagName is brand-checked, like every other host accessor.
+      var descriptor =
+        Object.getOwnPropertyDescriptor(Object.getPrototypeOf(first), "tagName");
+      if (Object.hasOwn(first, "tagName")) {
+        throw new Error("tagName was installed as an own property");
+      }
+      var brandChecked = false;
+      try {
+        descriptor.get.call({});
+      } catch (error) {
+        brandChecked = error instanceof TypeError;
+      }
+      if (!brandChecked) {
+        throw new Error("tagName accepted a foreign receiver");
+      }
+      document.bgColor =
+        document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

@@ -1,0 +1,102 @@
+<!doctype html>
+<!--
+Runtime proof for the generated ordinary writable DOMString shape.
+
+Unlike bgColor's [LegacyNullToEmptyString] conversion, Document.title applies
+ordinary ToString, so null becomes "null". The production setter must mutate
+Servo's live Document without entering SpiderMonkey beneath the V8 callback.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>before</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      var descriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document),
+        "title",
+      );
+      if (
+        Object.hasOwn(document, "title") ||
+        !descriptor ||
+        typeof descriptor.get !== "function" ||
+        typeof descriptor.set !== "function" ||
+        !descriptor.enumerable ||
+        !descriptor.configurable ||
+        descriptor.get.name !== "get title" ||
+        descriptor.set.name !== "set title" ||
+        descriptor.get.length !== 0 ||
+        descriptor.set.length !== 1
+      ) {
+        throw new Error("title descriptor is wrong");
+      }
+
+      var brandStringified = false;
+      var rejectedWrongGetterBrand = false;
+      var rejectedWrongSetterBrand = false;
+      try {
+        descriptor.get.call({});
+      } catch (error) {
+        rejectedWrongGetterBrand = error instanceof TypeError;
+      }
+      try {
+        descriptor.set.call({}, {
+          toString() {
+            brandStringified = true;
+            return "bad";
+          },
+        });
+      } catch (error) {
+        rejectedWrongSetterBrand = error instanceof TypeError;
+      }
+      if (
+        !rejectedWrongGetterBrand ||
+        !rejectedWrongSetterBrand ||
+        brandStringified
+      ) {
+        throw new Error("title brand check or conversion order is wrong");
+      }
+
+      var conversionError = new Error("title conversion sentinel");
+      var preservedConversionError = false;
+      try {
+        document.title = {
+          toString() {
+            throw conversionError;
+          },
+        };
+      } catch (error) {
+        preservedConversionError = error === conversionError;
+      }
+      var rejectedSymbol = false;
+      try {
+        document.title = Symbol("title");
+      } catch (error) {
+        rejectedSymbol = error instanceof TypeError;
+      }
+      if (!preservedConversionError || !rejectedSymbol) {
+        throw new Error("title did not preserve conversion failures");
+      }
+
+      document.title = null;
+      if (document.title !== "null") {
+        throw new Error("title incorrectly used legacy null conversion");
+      }
+      var conversions = 0;
+      document.title = {
+        toString() {
+          conversions++;
+          return "V8 title ✓";
+        },
+      };
+      if (conversions !== 1 || document.title !== "V8 title ✓") {
+        throw new Error("title mutation or conversion count is wrong");
+      }
+
+      document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+    </script>
+  </body>
+</html>

@@ -1,0 +1,141 @@
+<!doctype html>
+<!--
+Browser proof for ABI v43's Document.createTextNode() and Text-kind generic
+Node host. The authoritative script pins Web IDL conversion and receiver
+ordering, Text identity/scalars/brands, fragment splicing, and Element
+insertion. Its SpiderMonkey follow-up validates the final production tree.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative Text creation proof</title>
+    <style>
+      body { color: #101010; font: 48px/1.2 sans-serif; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const documentPrototype = Object.getPrototypeOf(document);
+      const descriptor = Object.getOwnPropertyDescriptor(
+        documentPrototype, "createTextNode",
+      );
+      if (
+        Object.hasOwn(document, "createTextNode") || !descriptor ||
+        typeof descriptor.value !== "function" ||
+        descriptor.value.name !== "createTextNode" || descriptor.value.length !== 1 ||
+        !descriptor.writable || !descriptor.enumerable || !descriptor.configurable
+      ) {
+        throw new Error("bad Document createTextNode descriptor");
+      }
+
+      let brandConversionTouched = false;
+      let wrongDocumentBrand = false;
+      try {
+        descriptor.value.call({}, {
+          toString() {
+            brandConversionTouched = true;
+            return "wrong";
+          },
+        });
+      } catch (error) {
+        wrongDocumentBrand = error instanceof TypeError;
+      }
+      if (!wrongDocumentBrand || brandConversionTouched) {
+        throw new Error("createTextNode did not brand-check before conversion");
+      }
+      let missing = false;
+      try { descriptor.value.call(document); } catch (error) {
+        missing = error instanceof TypeError;
+      }
+      let symbol = false;
+      try { document.createTextNode(Symbol("text")); } catch (error) {
+        symbol = error instanceof TypeError;
+      }
+      const thrown = new Error("createTextNode conversion");
+      let throwingToString = false;
+      try {
+        document.createTextNode({ toString() { throw thrown; } });
+      } catch (error) {
+        throwingToString = error === thrown;
+      }
+      const surplus = document.createTextNode("surplus", "ignored");
+      if (!missing || !symbol || !throwingToString || surplus.textContent !== "surplus") {
+        throw new Error("createTextNode Web IDL conversion is wrong");
+      }
+
+      const text = document.createTextNode("Hello");
+      const distinct = document.createTextNode("Hello");
+      const fragment = document.createDocumentFragment();
+      const target = document.querySelector("#visible-target");
+      const elementPrototype = Object.getPrototypeOf(target);
+      const textPrototype = Object.getPrototypeOf(text);
+      const characterDataPrototype = Object.getPrototypeOf(textPrototype);
+      const nodePrototype = Object.getPrototypeOf(characterDataPrototype);
+      const textTag = Object.getOwnPropertyDescriptor(
+        textPrototype, Symbol.toStringTag,
+      );
+      const characterDataTag = Object.getOwnPropertyDescriptor(
+        characterDataPrototype, Symbol.toStringTag,
+      );
+      const appendChildDescriptor = Object.getOwnPropertyDescriptor(
+        nodePrototype, "appendChild",
+      );
+      if (
+        text === distinct || text.nodeType !== 3 || text.nodeName !== "#text" ||
+        text.textContent !== "Hello" || text.parentElement !== null || text.isConnected ||
+        Object.getPrototypeOf(distinct) !== textPrototype ||
+        Object.getPrototypeOf(Object.getPrototypeOf(target)) !== nodePrototype ||
+        Object.prototype.toString.call(text) !== "[object Text]" ||
+        !textTag || textTag.value !== "Text" || textTag.writable ||
+        textTag.enumerable || !textTag.configurable ||
+        !characterDataTag || characterDataTag.value !== "CharacterData" ||
+        characterDataTag.writable || characterDataTag.enumerable ||
+        !characterDataTag.configurable ||
+        typeof Text !== "undefined" || typeof CharacterData !== "undefined" ||
+        !appendChildDescriptor || appendChildDescriptor.value !== nodePrototype.appendChild ||
+        appendChildDescriptor.value.name !== "appendChild" ||
+        appendChildDescriptor.value.length !== 1 ||
+        !appendChildDescriptor.writable || !appendChildDescriptor.enumerable ||
+        !appendChildDescriptor.configurable
+      ) {
+        throw new Error("Text has the wrong Node surface or identity");
+      }
+      let wrongElementBrand = false;
+      try { elementPrototype.getAttribute.call(text, "id"); } catch (error) {
+        wrongElementBrand = error instanceof TypeError;
+      }
+      if (!wrongElementBrand) {
+        throw new Error("Text accidentally passed the Element brand");
+      }
+
+      if (
+        nodePrototype.appendChild.call(fragment, text) !== text ||
+        !fragment.hasChildNodes() || text.parentElement !== null ||
+        target.appendChild(fragment) !== fragment || fragment.hasChildNodes() ||
+        text.parentElement !== target || !text.isConnected ||
+        target.appendChild(surplus) !== surplus || surplus.parentElement !== target ||
+        target.textContent !== "Hellosurplus"
+      ) {
+        throw new Error("Text/DocumentFragment insertion did not use Servo's production tree");
+      }
+      // Keep the final visible proof exactly "Hello" while retaining the
+      // direct Element.appendChild Text identity assertion above.
+      surplus.textContent = "";
+      document.documentElement.id = "v43-text-pass";
+    </script>
+    <script>
+      // SpiderMonkey sees the Text nodes created and placed by V8 in the one
+      // production Servo DOM tree before it supplies the final pass signal.
+      const target = document.getElementById("visible-target");
+      if (
+        document.documentElement.id === "v43-text-pass" && target &&
+        target.textContent === "Hello" && target.firstChild &&
+        target.firstChild.nodeType === 3 && target.firstChild.nodeValue === "Hello"
+      ) {
+        document.bgColor = "lime";
+        console.log("RESULT createTextNode v43 PASS text=Hello");
+      }
+    </script>
+  </body>
+</html>

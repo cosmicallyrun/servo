@@ -1,0 +1,115 @@
+<!doctype html>
+<!--
+Browser proof for ABI v42's generic Node host and
+Document.createDocumentFragment(). The authoritative script verifies the exact
+Document method surface, the DocumentFragment/Node brands, wrapper identity,
+fragment splicing, and V8-owned DOMException path. Its SpiderMonkey follow-up
+independently checks the final Servo tree before making the page green.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative DocumentFragment proof</title>
+    <style>
+      body { color: #101010; font: 48px/1.2 sans-serif; }
+      #fixture { display: none; }
+    </style>
+  </head>
+  <body bgcolor="red">
+    <main id="fixture"><section id="target"></section></main>
+    <main id="visible-target"></main>
+    <script data-servo-v8="authoritative">
+      const descriptor = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(document), "createDocumentFragment",
+      );
+      if (
+        Object.hasOwn(document, "createDocumentFragment") || !descriptor ||
+        typeof descriptor.value !== "function" ||
+        descriptor.value.name !== "createDocumentFragment" ||
+        descriptor.value.length !== 0 || !descriptor.writable ||
+        !descriptor.configurable || !descriptor.enumerable
+      ) {
+        throw new Error("bad Document createDocumentFragment descriptor");
+      }
+      let wrongDocumentBrand = false;
+      try { descriptor.value.call({}); } catch (error) {
+        wrongDocumentBrand = error instanceof TypeError;
+      }
+      if (!wrongDocumentBrand) {
+        throw new Error("createDocumentFragment accepted a wrong Document receiver");
+      }
+
+      const fragment = document.createDocumentFragment();
+      const distinct = document.createDocumentFragment();
+      const ignoredArguments = document.createDocumentFragment("ignored");
+      const target = document.querySelector("#target");
+      const visibleTarget = document.querySelector("#visible-target");
+      const elementPrototype = Object.getPrototypeOf(target);
+      const fragmentPrototype = Object.getPrototypeOf(fragment);
+      const nodePrototype = Object.getPrototypeOf(fragmentPrototype);
+      const appendChildDescriptor = Object.getOwnPropertyDescriptor(
+        nodePrototype, "appendChild",
+      );
+      if (
+        fragment === distinct || fragment === ignoredArguments ||
+        ignoredArguments.nodeType !== 11 || fragment.nodeType !== 11 ||
+        fragment.nodeName !== "#document-fragment" || fragment.isConnected ||
+        fragment.parentElement !== null ||
+        Object.getPrototypeOf(distinct) !== fragmentPrototype ||
+        Object.getPrototypeOf(Object.getPrototypeOf(target)) !== nodePrototype ||
+        !appendChildDescriptor ||
+        appendChildDescriptor.value !== nodePrototype.appendChild ||
+        appendChildDescriptor.value.name !== "appendChild" ||
+        appendChildDescriptor.value.length !== 1 ||
+        !appendChildDescriptor.writable || !appendChildDescriptor.enumerable ||
+        !appendChildDescriptor.configurable
+      ) {
+        throw new Error("DocumentFragment has the wrong Node surface or brand");
+      }
+      let wrongElementBrand = false;
+      try { elementPrototype.getAttribute.call(fragment, "id"); } catch (error) {
+        wrongElementBrand = error instanceof TypeError;
+      }
+      if (!wrongElementBrand) {
+        throw new Error("DocumentFragment accidentally passed the Element brand");
+      }
+
+      const child = document.createElement("span");
+      child.textContent = "Hello";
+      if (
+        nodePrototype.appendChild.call(fragment, child) !== child ||
+        !fragment.hasChildNodes() || child.parentElement !== null ||
+        target.appendChild(fragment) !== fragment || fragment.hasChildNodes() ||
+        child.parentElement !== target || target.firstElementChild !== child
+      ) {
+        throw new Error("DocumentFragment insertion did not splice the production tree");
+      }
+
+      let hierarchy = false;
+      try { nodePrototype.appendChild.call(fragment, fragment); } catch (error) {
+        hierarchy = error instanceof DOMException &&
+          error.name === "HierarchyRequestError" && error.code === 3;
+      }
+      if (!hierarchy) {
+        throw new Error("generic Node mutation did not return a V8 DOMException");
+      }
+
+      // Leave identity and the rendered child in Servo's one production tree.
+      visibleTarget.appendChild(child);
+      document.documentElement.id = "v42-fragment-pass";
+    </script>
+    <script>
+      // A normal SpiderMonkey script must see the V8-created, then spliced,
+      // production node and must be able to make the final pass signal.
+      const child = document.querySelector("#visible-target > span");
+      if (
+        document.documentElement.id === "v42-fragment-pass" &&
+        child && child.textContent === "Hello" && child.parentElement.id === "visible-target" &&
+        document.querySelector("#target").childElementCount === 0
+      ) {
+        document.bgColor = "lime";
+        console.log("RESULT documentFragment v42 PASS text=Hello");
+      }
+    </script>
+  </body>
+</html>

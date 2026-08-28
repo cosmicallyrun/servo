@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+Runtime proof that Servo performs a V8 microtask checkpoint at HTML's task
+boundary.
+
+The body starts red and the authoritative script touches the DOM only from
+inside a promise reaction, so nothing observable happens unless the checkpoint
+runs. Before checkpoint integration this page rendered red with zero bgColor
+host calls, because the retained-script run path deliberately does not
+checkpoint.
+
+This also exercises the host context during the drain: the reaction calls a
+native Document host, which fails unless the bridge installed the ephemeral
+host context on the realm for the duration of the checkpoint.
+
+Build and run:
+
+  cargo build -p servoshell --features v8-classic-script-authoritative
+  RUST_LOG=warn,script::script_thread=debug \
+    target/debug/servoshell -z -x --hard-fail \
+      -o /tmp/authoritative_microtask_proof.png \
+      support/v8/authoritative_microtask_proof.html
+
+Every pixel must be lime, and realm teardown must report exactly one bgColor
+getter and one bgColor setter host call.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8-authoritative microtask checkpoint proof</title>
+  </head>
+  <body bgcolor="red">
+    <script data-servo-v8="authoritative">
+      if (globalThis !== window ||
+          window.window !== window ||
+          window.document !== document) {
+        throw new Error("bad identity");
+      }
+      Promise.resolve().then(() => {
+        document.bgColor =
+          document.bgColor === "lime" ? "red" : "lime";
+      });
+    </script>
+  </body>
+</html>

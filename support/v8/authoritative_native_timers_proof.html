@@ -1,0 +1,97 @@
+<!doctype html>
+<!--
+Runtime proof for the V8 realm's native timer globals.
+
+Servo owns delays, nesting, numeric handles, cancellation, and task dispatch.
+V8 owns each callable and arbitrary argument list until the timer fires or is
+cleared. This page covers function and source-string handlers, arguments,
+cross-alias cancellation, intervals that clear themselves, a timer-created
+promise reaction, and exception reporting back to the owning Servo Window.
+
+Run via support/v8/run_proofs.sh.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>V8 native timer globals proof</title>
+  </head>
+  <body bgcolor="red">
+    <script>
+      window.addEventListener("error", function (event) {
+        if (/native timer boom/.test(String(event.message))) {
+          document.title += "|error";
+          event.preventDefault();
+        }
+      });
+    </script>
+    <script data-servo-v8="authoritative">
+      const names = ["setTimeout", "clearTimeout", "setInterval", "clearInterval"];
+      const lengths = [1, 0, 1, 0];
+      if (!names.every((name, index) => {
+        const descriptor = Object.getOwnPropertyDescriptor(window, name);
+        return descriptor && !descriptor.enumerable && descriptor.writable &&
+          descriptor.configurable && descriptor.value.name === name &&
+          descriptor.value.length === lengths[index];
+      })) {
+        throw new Error("bad native timer descriptors");
+      }
+
+      let functionResult = 0;
+      let functionThis = false;
+      setTimeout(function (left, right) {
+        functionThis = this === window;
+        functionResult = left + right;
+        document.title += "|function";
+      }, 0, 19, 23);
+
+      setTimeout('document.title += "|string";', 0);
+      let conversions = 0;
+      setTimeout({
+        toString() {
+          conversions++;
+          return 'document.title += "|object-string";';
+        }
+      }, 0);
+      setTimeout(() => {
+        Promise.resolve().then(() => document.title += "|microtask");
+      }, 0);
+
+      const canceled = setTimeout(() => {
+        document.title += "|canceled-fired";
+        document.bgColor = "blue";
+      }, 0);
+      clearInterval(canceled);
+
+      let intervalCount = 0;
+      const finish = () => {
+        const title = document.title;
+        const passed = functionThis && functionResult === 42 &&
+          conversions === 1 && intervalCount === 3 &&
+          title.includes("|function") && title.includes("|string") &&
+          title.includes("|object-string") && title.includes("|microtask") &&
+          title.includes("|interval") && title.includes("|error") &&
+          !title.includes("|canceled-fired");
+        if (!passed) {
+          document.bgColor = "blue";
+          throw new Error("native timer proof incomplete: " + title);
+        }
+        document.bgColor = document.bgColor === "lime" ? "red" : "lime";
+      };
+      const interval = setInterval(increment => {
+        intervalCount += increment;
+        if (intervalCount === 3) {
+          clearTimeout(interval);
+          document.title += "|interval";
+          // A fire batch excludes newly installed timers, so this runs in a
+          // later task after the promise checkpoint from the earlier callback.
+          setTimeout(finish, 0);
+        }
+      }, 0, 1);
+
+      setTimeout(() => {
+        throw new Error("native timer boom");
+      }, 0);
+
+    </script>
+  </body>
+</html>
